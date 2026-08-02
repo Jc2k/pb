@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{delete, get, patch, post};
@@ -9,7 +9,7 @@ use base64::Engine as _;
 use futures::StreamExt;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -199,6 +199,7 @@ pub struct SessionListItem {
     pub workdir: Option<String>,
     pub handoff_outcome: Option<HandoffOutcome>,
     pub pending_question: Option<PendingQuestionView>,
+    pub started_at_ms: u64,
     pub updated_at_ms: u64,
     pub metrics: Option<SessionMetricsSnapshot>,
     pub usage_records: Vec<SessionMetricsSnapshot>,
@@ -313,6 +314,7 @@ pub struct SessionDetails {
     pub handoff_outcome: Option<HandoffOutcome>,
     pub pending_question: Option<PendingQuestionView>,
     pub events: Vec<EventEnvelope>,
+    pub started_at_ms: u64,
     pub updated_at_ms: u64,
     pub metrics: Option<SessionMetricsSnapshot>,
     pub usage_records: Vec<SessionMetricsSnapshot>,
@@ -437,6 +439,7 @@ struct SessionState {
     accepting_user_messages: Arc<AtomicBool>,
     pause_token: Arc<AtomicBool>,
     cancel_token: Arc<AtomicBool>,
+    started_at_ms: u64,
     updated_at_ms: u64,
 }
 
@@ -977,6 +980,7 @@ async fn start_session_inner(
         accepting_user_messages: Arc::new(AtomicBool::new(false)),
         pause_token: Arc::new(AtomicBool::new(false)),
         cancel_token: Arc::new(AtomicBool::new(false)),
+        started_at_ms: now,
         updated_at_ms: now,
     };
 
@@ -1149,6 +1153,7 @@ async fn start_goal_inner(
         accepting_user_messages: Arc::new(AtomicBool::new(false)),
         pause_token: Arc::new(AtomicBool::new(false)),
         cancel_token: Arc::new(AtomicBool::new(false)),
+        started_at_ms: now,
         updated_at_ms: now,
     };
     publish_goal_started(&mut session, &checkpoint);
@@ -2936,6 +2941,7 @@ async fn list_sessions(
                     .map(|p| p.to_string_lossy().into_owned()),
                 handoff_outcome: latest_handoff_outcome(session),
                 pending_question: session.pending_question.as_ref().map(pending_question_view),
+                started_at_ms: session.started_at_ms,
                 updated_at_ms: session.updated_at_ms,
                 metrics: session.metrics.clone(),
                 usage_records: session_usage_records(session),
@@ -2986,6 +2992,7 @@ async fn get_session(
         handoff_outcome: latest_handoff_outcome(session),
         pending_question: session.pending_question.as_ref().map(pending_question_view),
         events,
+        started_at_ms: session.started_at_ms,
         updated_at_ms: session.updated_at_ms,
         metrics: session.metrics.clone(),
         usage_records: session_usage_records(session),
@@ -3275,28 +3282,22 @@ struct WebEventSink {
     terminal_precursor_keys: Vec<String>,
 }
 
-impl EventSink for WebEventSink {
-    fn supports_user_questions(&self) -> bool {
-        true
-    }
-
-    fn emit(&mut self, event: AgentEvent) {
-        self.emit_superseding(event, Vec::new());
-    }
-
-    fn emit_superseding(&mut self, event: AgentEvent, supersedes: Vec<String>) {
+impl WebEventSink {
+    fn emit_timestamped(&mut self, event: AgentEvent, supersedes: Vec<String>) -> String {
+        let envelope = EventEnvelope::with_timestamp(event);
+        let entry_key = envelope.transcript.entry_key.clone();
         if let AgentEvent::Started {
             workspace,
             focus_root,
             branch,
             ..
-        } = &event
+        } = &envelope.event
         {
             self.persisted_workdir =
                 Some(PathBuf::from(focus_root.as_deref().unwrap_or(workspace)));
             self.persisted_branch = Some(branch.clone());
         }
-        if let Some(metrics) = SessionMetricsSnapshot::from_event(&event) {
+        if let Some(metrics) = SessionMetricsSnapshot::from_event(&envelope.event) {
             if let Ok(mut records) = self.usage_records.lock() {
                 records.push(metrics.clone());
             }
@@ -3326,7 +3327,7 @@ impl EventSink for WebEventSink {
                 }
             });
         }
-        if let AgentEvent::SessionTitle { title, .. } = &event {
+        if let AgentEvent::SessionTitle { title, .. } = &envelope.event {
             let title = title.trim().to_string();
             if !title.is_empty() {
                 tokio::runtime::Handle::current().block_on(async {
@@ -3338,7 +3339,7 @@ impl EventSink for WebEventSink {
                 });
             }
         }
-        publish_event_linked(&self.sender, &self.history, event, supersedes);
+        publish_event_envelope_linked(&self.sender, &self.history, envelope, supersedes);
         if self.goal.is_some() {
             self.goal = tokio::runtime::Handle::current().block_on(async {
                 let sessions = self.state.sessions.lock().await;
@@ -3370,11 +3371,29 @@ impl EventSink for WebEventSink {
             self.multi_task.clone(),
             self.completed_multi_tasks.clone(),
         );
+        entry_key
+    }
+}
+
+impl EventSink for WebEventSink {
+    fn supports_user_questions(&self) -> bool {
+        true
+    }
+
+    fn emit(&mut self, event: AgentEvent) {
+        self.emit_superseding(event, Vec::new());
+    }
+
+    fn emit_keyed(&mut self, event: AgentEvent) -> String {
+        self.emit_timestamped(event, Vec::new())
+    }
+
+    fn emit_superseding(&mut self, event: AgentEvent, supersedes: Vec<String>) {
+        self.emit_timestamped(event, supersedes);
     }
 
     fn emit_terminal_precursor(&mut self, event: AgentEvent) {
-        let entry_key = crate::events::event_entry_key(&event);
-        self.emit(event);
+        let entry_key = self.emit_timestamped(event, Vec::new());
         self.terminal_precursor_keys.push(entry_key);
     }
 
@@ -4988,24 +5007,68 @@ fn publish_goal_failed(session: &SessionState, checkpoint: &crate::goal::GoalChe
 async fn session_events(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
+    headers: HeaderMap,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    let receiver = {
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let (receiver, replay) = {
         let sessions = state.sessions.lock().await;
         let session = sessions.get(&id).ok_or(StatusCode::NOT_FOUND)?;
-        session.sender.subscribe()
+        let receiver = session.sender.subscribe();
+        let history = session.history.lock().map_err(|_| StatusCode::CONFLICT)?;
+        let start = session_replay_start(&history, last_event_id.as_deref());
+        (receiver, history[start..].to_vec())
     };
 
-    let stream = BroadcastStream::new(receiver).filter_map(|message| async move {
-        match message {
-            Ok(envelope) => {
+    let delivered = Arc::new(StdMutex::new(
+        replay
+            .iter()
+            .map(|envelope| envelope.transcript.entry_key.clone())
+            .collect::<HashSet<_>>(),
+    ));
+    let replay = futures::stream::iter(replay.into_iter().filter_map(|envelope| {
+        let data = serde_json::to_string(&envelope).ok()?;
+        Some(Ok(Event::default()
+            .id(envelope.transcript.entry_key)
+            .data(data)))
+    }));
+    let live_delivered = Arc::clone(&delivered);
+    let live = BroadcastStream::new(receiver)
+        .take_while(|message| futures::future::ready(message.is_ok()))
+        .filter_map(move |message| {
+            let delivered = Arc::clone(&live_delivered);
+            async move {
+                let envelope = message.ok()?;
+                let entry_key = envelope.transcript.entry_key.clone();
+                let is_new = delivered
+                    .lock()
+                    .map(|mut delivered| delivered.insert(entry_key.clone()))
+                    .unwrap_or(false);
+                if !is_new {
+                    return None;
+                }
                 let data = serde_json::to_string(&envelope).ok()?;
-                Some(Ok(Event::default().data(data)))
+                Some(Ok(Event::default().id(entry_key).data(data)))
             }
-            Err(_) => None,
-        }
-    });
+        });
+    let stream = replay.chain(live);
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+fn session_replay_start(history: &[EventEnvelope], last_event_id: Option<&str>) -> usize {
+    last_event_id
+        .and_then(|entry_key| {
+            history
+                .iter()
+                .rposition(|envelope| envelope.transcript.entry_key == entry_key)
+                .map(|index| index + 1)
+        })
+        .unwrap_or_else(|| history.len().saturating_sub(SESSION_HISTORY_RESPONSE_LIMIT))
 }
 
 async fn spawn_unix_rpc_server(
@@ -5425,6 +5488,7 @@ fn session_from_persisted(mut persisted: PersistedSession) -> (String, SessionSt
             accepting_user_messages: Arc::new(AtomicBool::new(false)),
             pause_token: Arc::new(AtomicBool::new(false)),
             cancel_token: Arc::new(AtomicBool::new(false)),
+            started_at_ms: persisted.started_at_ms,
             updated_at_ms: persisted.updated_at_ms,
         },
     )
@@ -5560,6 +5624,7 @@ async fn session_list_snapshot(state: &AppState) -> Vec<SessionListItem> {
                     .map(|p| p.to_string_lossy().into_owned()),
                 handoff_outcome: latest_handoff_outcome(session),
                 pending_question: session.pending_question.as_ref().map(pending_question_view),
+                started_at_ms: session.started_at_ms,
                 updated_at_ms: session.updated_at_ms,
                 metrics: session.metrics.clone(),
                 usage_records: session_usage_records(session),
@@ -5618,6 +5683,7 @@ async fn session_details_snapshot(state: &AppState, id: &str) -> Option<SessionD
         handoff_outcome: latest_handoff_outcome(session),
         pending_question: session.pending_question.as_ref().map(pending_question_view),
         events,
+        started_at_ms: session.started_at_ms,
         updated_at_ms: session.updated_at_ms,
         metrics: session.metrics.clone(),
         usage_records: session_usage_records(session),
@@ -5794,15 +5860,26 @@ fn publish_event_linked(
     event: AgentEvent,
     supersedes: Vec<String>,
 ) {
-    let mut envelope = EventEnvelope::with_timestamp(event);
+    let envelope = EventEnvelope::with_timestamp(event);
+    publish_event_envelope_linked(sender, history, envelope, supersedes);
+}
+
+fn publish_event_envelope_linked(
+    sender: &broadcast::Sender<EventEnvelope>,
+    history: &StdMutex<Vec<EventEnvelope>>,
+    mut envelope: EventEnvelope,
+    supersedes: Vec<String>,
+) {
     envelope.transcript.supersedes = supersedes;
     if let Ok(mut entries) = history.lock() {
         envelope.refresh_projections(&entries);
         let _ = sender.send(envelope.clone());
         entries.push(envelope);
         if entries.len() > MAX_HISTORY_EVENTS {
-            let overflow = entries.len() - MAX_HISTORY_EVENTS;
-            entries.drain(..overflow);
+            *entries = session_store::trim_event_history(
+                std::mem::take(&mut *entries),
+                MAX_HISTORY_EVENTS,
+            );
         }
     } else {
         let _ = sender.send(envelope);
@@ -5833,6 +5910,44 @@ mod workflow_tests {
             }]
         );
         assert!(pending_user_messages_from_events(&[queued, applied]).is_empty());
+    }
+
+    #[test]
+    fn event_replay_resumes_after_a_known_cursor_and_falls_back_to_a_snapshot() {
+        let history = (0..305)
+            .map(|index| {
+                EventEnvelope::new(AgentEvent::UserMessage {
+                    message_id: format!("message-{index}"),
+                    message: format!("message {index}"),
+                    timestamp_ms: Some(index),
+                })
+            })
+            .collect::<Vec<_>>();
+        let cursor = history[200].transcript.entry_key.as_str();
+
+        assert_eq!(session_replay_start(&history, Some(cursor)), 201);
+        assert_eq!(session_replay_start(&history, Some("missing")), 5);
+        assert_eq!(session_replay_start(&history, None), 5);
+    }
+
+    #[test]
+    fn timestamped_publication_preserves_the_stream_and_history_entry_key() {
+        let (sender, mut receiver) = broadcast::channel(4);
+        let history = StdMutex::new(Vec::new());
+        let envelope = EventEnvelope::with_timestamp(AgentEvent::UserMessage {
+            message_id: "message-1".to_string(),
+            message: "Keep the boundary exact.".to_string(),
+            timestamp_ms: None,
+        });
+        let entry_key = envelope.transcript.entry_key.clone();
+
+        publish_event_envelope_linked(&sender, &history, envelope, vec!["older-entry".to_string()]);
+
+        let streamed = receiver.try_recv().unwrap();
+        let history = history.lock().unwrap();
+        assert_eq!(streamed.transcript.entry_key, entry_key);
+        assert_eq!(history[0].transcript.entry_key, entry_key);
+        assert_eq!(history[0].transcript.supersedes, vec!["older-entry"]);
     }
 
     #[tokio::test]

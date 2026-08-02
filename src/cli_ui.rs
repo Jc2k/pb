@@ -539,8 +539,13 @@ pub fn render_event(envelope: &EventEnvelope) {
             if !power_summary.trim().is_empty() {
                 print_block("session power", power_summary);
             }
-            if !commits.trim().is_empty() {
-                print_block("session commits", commits);
+            if !commits.is_empty() {
+                let commits = commits
+                    .iter()
+                    .map(|commit| format!("{} {}", commit.oid, commit.subject))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                print_block("session commits", &commits);
             }
             if !diff_stat.trim().is_empty() {
                 print_block("diff stat from main", diff_stat);

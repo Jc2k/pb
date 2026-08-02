@@ -5,6 +5,7 @@ import {
   latestGoalChangeRequest,
   latestPendingDeliveryProposal,
   latestPendingGoalProposal,
+  mergeEventHistory,
   readyEvidenceLabel,
   workflowOutcomeLabel,
   workflowProgressLabel,
@@ -17,11 +18,12 @@ import type { EventEnvelope } from "../types/index.ts";
 let testEventIndex = 0;
 function eventEnvelopeDefaults(): Pick<
   EventEnvelope,
-  "chatter" | "transcript"
+  "chatter" | "evidence" | "transcript"
 > {
   testEventIndex += 1;
   return {
     chatter: [],
+    evidence: [],
     transcript: {
       visibility: "visible",
       kind: "conversation",
@@ -45,11 +47,50 @@ function cssRule(css: string, selector: string): string {
   return css.slice(start, end);
 }
 
+Deno.test("event history merges stream and snapshot data by stable entry key", () => {
+  const started: EventEnvelope = {
+    ...eventEnvelopeDefaults(),
+    version: "v3",
+    event: {
+      type: "started",
+      task: "Review the boundary",
+      model: "local-model",
+      workspace: "/tmp/project",
+      focus_root: "/tmp/project",
+      branch: "main",
+      attachments: [],
+      profile: "build",
+    },
+  };
+  const streamed: EventEnvelope = {
+    ...eventEnvelopeDefaults(),
+    version: "v3",
+    event: {
+      type: "user_message",
+      message_id: "message-1",
+      message: "Done",
+    },
+  };
+  const corrected = {
+    ...streamed,
+    transcript: { ...streamed.transcript, summary_redundant: true },
+  };
+
+  const merged = mergeEventHistory(
+    [started, streamed],
+    [corrected],
+  );
+
+  equal(merged.length, 2);
+  equal(merged[0], started);
+  equal(merged[1], corrected);
+});
+
 Deno.test("delivery proposal remains conversational until an explicit Build turn", () => {
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v2",
+      version: "v3",
       event: {
         type: "delivery_proposed",
         proposal_id: "proposal-1",
@@ -62,7 +103,7 @@ Deno.test("delivery proposal remains conversational until an explicit Build turn
 
   events.push({
     ...eventEnvelopeDefaults(),
-    version: "v2",
+    version: "v3",
     event: {
       type: "conversation_turn_started",
       turn_id: "turn-2",
@@ -74,7 +115,7 @@ Deno.test("delivery proposal remains conversational until an explicit Build turn
 
   events.push({
     ...eventEnvelopeDefaults(),
-    version: "v2",
+    version: "v3",
     event: {
       type: "conversation_turn_started",
       turn_id: "turn-3",
@@ -88,7 +129,7 @@ Deno.test("delivery proposal remains conversational until an explicit Build turn
 Deno.test("goal proposal stays read-only until a durable goal starts", () => {
   const events: EventEnvelope[] = [{
     ...eventEnvelopeDefaults(),
-    version: "v2",
+    version: "v3",
     event: {
       type: "goal_proposed",
       proposal_id: "goal-proposal-1",
@@ -100,7 +141,7 @@ Deno.test("goal proposal stays read-only until a durable goal starts", () => {
   equal(latestPendingGoalProposal(events)?.objective, "Ship goal mode");
   events.push({
     ...eventEnvelopeDefaults(),
-    version: "v2",
+    version: "v3",
     event: {
       type: "goal_started",
       goal_id: "goal-1",
@@ -114,7 +155,7 @@ Deno.test("goal proposal stays read-only until a durable goal starts", () => {
 Deno.test("model goal change requests remain pending only until a user path resolves them", () => {
   const events: EventEnvelope[] = [{
     ...eventEnvelopeDefaults(),
-    version: "v2",
+    version: "v3",
     event: {
       type: "goal_change_requested",
       goal_id: "goal-1",
@@ -125,7 +166,7 @@ Deno.test("model goal change requests remain pending only until a user path reso
   equal(latestGoalChangeRequest(events)?.kind, "budget");
   events.push({
     ...eventEnvelopeDefaults(),
-    version: "v2",
+    version: "v3",
     event: { type: "goal_resumed", goal_id: "goal-1" },
   });
   equal(latestGoalChangeRequest(events), undefined);
@@ -485,7 +526,7 @@ Deno.test("session workspace prioritizes chat and shows work details only when u
   ok(!page.includes("workflow-progress"));
   ok(page.includes("taskPlanningTranscript.attempts.length > 0"));
   ok(page.includes("Branch: {session.branch}"));
-  ok(page.includes('event.event.type === "started"'));
+  ok(page.includes("const sessionStartMs = session.started_at_ms"));
   ok(component.includes("assistant-message assistant-transcript"));
   ok(component.includes("<strong>You</strong>"));
   ok(!component.includes("Session request"));
@@ -537,7 +578,24 @@ Deno.test("handoff feedback renders as a teammate with expandable evidence", asy
   ok(component.includes("What I ran"));
   ok(component.includes("check.command"));
   ok(component.includes("summary.affected_components"));
-  ok(component.includes("start.event.focus_root"));
+  ok(page.includes("focusRoot={session.workdir}"));
+  ok(component.includes("envelope.evidence.flatMap"));
+  ok(!component.includes("evidence_ids"));
+  ok(!component.includes('startsWith("check:")'));
+  ok(!component.includes('startsWith("commit:")'));
   ok(css.includes(".team-message"));
   ok(!component.toLowerCase().includes("contract verified"));
+});
+
+Deno.test("session transport opens first and lets EventSource reconnect with deduplication", async () => {
+  const page = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");
+  const routeEffect = page.slice(page.indexOf("setEvents([]);"));
+
+  ok(
+    routeEffect.indexOf("openEvents(sessionId);") <
+      routeEffect.indexOf("void fetchSession();"),
+  );
+  ok(page.includes("mergeEventHistory(previous, [parsed])"));
+  ok(page.includes("mergeEventHistory(details.events, previous)"));
+  ok(!page.includes("src.onerror"));
 });

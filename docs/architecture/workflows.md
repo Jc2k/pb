@@ -503,7 +503,7 @@ Tool schemas are derived from this matrix for every stage. A request-level allow
 policy can narrow the set further. Neither can broaden it.
 The legacy model-owned `todo`, `git_commit`, and `git_revert` schemas are retired from every current
 surface. The accepted plan, typed stage artifacts, checkpoint, deterministic checks, and managed
-commit already own that state and authority. Incompatible pre-v2 sessions are not restored, and no
+commit already own that state and authority. Incompatible pre-v3 sessions are not restored, and no
 current allowlist or policy can revive the retired tools.
 
 ## Agent-tool runtime contract
@@ -728,10 +728,10 @@ the production controller-block arm. The controller records actual origin, exact
 coverage, fingerprints, and content-derived action identity. Model tools and controller actions
 remain distinct durable events. Each new model tool event also records the active profile
 character. Controller actions and deterministic corrections record Trinity Walker as the workflow
-steward plus the profile she is assisting when that context is available. The v2 contract requires
+steward plus the profile she is assisting when that context is available. The v3 contract requires
 an actor on every model tool, controller action, model invocation, and deterministic correction.
 
-Every v2 tool call and result carries a required stable call id and batch id. Each result also carries
+Every v3 tool call and result carries a required stable call id and batch id. Each result also carries
 a required typed outcome (`succeeded`, `failed`, `rejected`, `timed_out`, `cancelled`, or
 `cache_replay`) and measured duration. Consumers correlate by call id even when parallel results
 arrive out of order or a correction occurs between call and result; records missing that identity or
@@ -803,21 +803,32 @@ Every tool call and result also carries a required durable call ID and batch ID.
 typed outcome and measured duration, so replay and browser grouping correlate exact calls without a
 tool-name or actor fallback. Current session list/detail responses always include their nullable
 state fields and empty collections explicitly, including pending questions and per-turn usage
-records; the TypeScript contract does not model those server fields as optionally omitted.
+records. They also carry the durable session start time directly; the browser does not derive it
+from a bounded event window. The TypeScript contract does not model those server fields as
+optionally omitted.
 
 Error events likewise carry a required concise summary and a separate required diagnostic detail.
 Consumers render that split directly instead of extracting a heading from diagnostic prose.
 
 The daemon persists the complete envelope and current session state as authored, and replay treats
-both as authoritative. There is no replay hydration, v1 projection reconstruction, or recovery of
+both as authoritative. There is no replay hydration, old projection reconstruction, or recovery of
 missing status, title, metrics, usage windows, or pending messages from adjacent events. Persisted
-sessions carry the matching v2 session schema and malformed or incompatible notes are skipped during
-restoration rather than migrated. Terminal,
+sessions carry the matching v3 session schema and malformed or incompatible notes are skipped during
+restoration rather than migrated. Event envelopes carry server-authored chatter, typed embedded
+check/commit evidence for team messages, and structured commit summaries. Session restoration
+validates projection shape and unique transcript entry keys before admitting a note.
+
+The live event endpoint subscribes before taking its history snapshot, assigns each SSE record the
+durable transcript entry key, and resumes after `Last-Event-ID`. A lagged subscriber is disconnected
+so the browser's normal EventSource reconnection can replay from that cursor. The React client merges
+the HTTP snapshot and stream by entry key, so neither their arrival order nor reconnection creates a
+gap or duplicate. Terminal,
 harness, and web consumers therefore render the same Trinity-authored messages; the browser owns
 only visual layout and optional local-username addressing. It does not parse raw controller JSON,
 recognize event-name prefixes for cache invalidation, compare diagnostic summary wording, scan later
-events for an unrelated handoff, or correlate raw tool arguments to invent or deduplicate teammate
-speech. Raw event fields remain intact as machine-readable evidence and progressive detail.
+events for an unrelated handoff, parse string prefixes to resolve evidence, interpret commit-log
+text, or correlate raw tool arguments to invent or deduplicate teammate speech. Raw event fields
+remain intact as machine-readable evidence and progressive detail.
 
 The web UI gives every Trinity-owned row the same restrained lilac identity treatment on provenance,
 information affordances, and a narrow surface accent; avatars remain unoutlined. Other named

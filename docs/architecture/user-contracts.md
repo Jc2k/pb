@@ -309,13 +309,16 @@ and it cannot supply an approval, check result, review judgment, or semantic com
 In user-facing transcripts, Trinity Walker may speak for this deterministic workflow stewardship,
 but the durable event continues to record controller origin, the assisting profile, and its receipt.
 Model-requested actions are attributed to that profile's character. The presentation labels these
-origins **Model** and **Harness**. The v2 event contract requires the producer to identify every
+origins **Model** and **Harness**. The v3 event contract requires the producer to identify every
 model invocation, tool action, controller action, and deterministic correction; consumers never
 borrow a character from adjacent chat. Harness validation messages summarize the teammate mistake
 in plain language and keep the durable structured evidence in a hover-information or
 touch-long-press detail sheet. The ordinary message does not expose temporary workspace paths.
 Tool results name the exact durable call and batch they answer and provide a typed outcome and
-duration; consumers do not correlate repeated calls by tool name or nearby actor.
+duration; consumers do not correlate repeated calls by tool name or nearby actor. Team messages cite
+checks and commits with tagged references, and the envelope embeds the matching typed evidence for
+terminal, harness, and web renderers. Session summaries expose commits as structured object IDs and
+subjects rather than asking consumers to parse Git log text.
 Trinity's visible copy is event-specific: proactive evidence says which code Trinity inspected, and
 failures say which artifact, tool, repeated action, diagnostic, or terminal condition needs
 attention. Visible copy does not expose prompt/context transfer or tell a teammate to ask the

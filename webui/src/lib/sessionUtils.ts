@@ -160,27 +160,6 @@ export function buildActionTimeline(
   return items;
 }
 
-export function trustedSessionSummaryCommitLines(
-  commits: string | undefined,
-  events: EventEnvelope[],
-): string[] {
-  const lines = commits?.trim()
-    ? commits.trim().split("\n").filter(Boolean)
-    : [];
-  if (lines.length === 0) return [];
-
-  const isStrictWorkflow = events.some((envelope) =>
-    envelope.event.type === "workflow_started"
-  );
-  if (!isStrictWorkflow) return lines;
-
-  const hasCommitReceipt = events.some((envelope) =>
-    envelope.event.type === "commit_result" && envelope.event.success &&
-    (envelope.event.created || envelope.event.reused || envelope.event.oid)
-  );
-  return hasCommitReceipt ? lines : [];
-}
-
 function addToolSummaryItem(
   summaries: Record<string, ToolSummary>,
   call: EventEnvelope,

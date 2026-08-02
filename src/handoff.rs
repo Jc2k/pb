@@ -7,8 +7,8 @@ use anyhow::{Context, Result, bail};
 use crate::agent_core::EventSink;
 use crate::checks::{CheckRunSummary, EvidenceSource, WorkspaceCheckRuntime, plan_checks};
 use crate::events::{
-    AgentEvent, AutomationActor, HandoffCheckSummary, HandoffOutcome, HandoffSummary, TeamActor,
-    TeamMessageTone,
+    AgentEvent, AutomationActor, EvidenceRef, HandoffCheckSummary, HandoffOutcome, HandoffSummary,
+    TeamActor, TeamMessageTone,
 };
 use crate::session_store::now_millis;
 use crate::workspace::{RepositoryContext, WorkspaceGraph};
@@ -79,7 +79,7 @@ pub fn run_handoff(
             message: "There’s no repository change to hand off, so I don’t have anything to test or commit."
                 .to_string(),
             detail: None,
-            evidence_ids: Vec::new(),
+            evidence: Vec::new(),
             nesting_depth: event_nesting_depth,
             timestamp_ms: Some(now_millis()),
         });
@@ -104,7 +104,7 @@ pub fn run_handoff(
                 natural_list(&labels)
             ),
             detail: None,
-            evidence_ids: Vec::new(),
+            evidence: Vec::new(),
             nesting_depth: event_nesting_depth,
             timestamp_ms: Some(now_millis()),
         }))
@@ -140,7 +140,7 @@ pub fn run_handoff(
                     "I couldn’t run the affected checks because their environment is unavailable. The team may need help setting it up before we can finish. {detail}"
                 ),
                 detail: Some(detail.clone()),
-                evidence_ids: Vec::new(),
+                evidence: Vec::new(),
                 nesting_depth: event_nesting_depth,
                 timestamp_ms: Some(now_millis()),
             }, progress_entry_key.iter().cloned().collect());
@@ -149,10 +149,12 @@ pub fn run_handoff(
         }
     };
     let checks = handoff_check_summaries(&plan.checks, &run);
-    let mut evidence_ids = plan
+    let mut evidence = plan
         .checks
         .iter()
-        .map(|id| format!("check:{id}"))
+        .map(|check_id| EvidenceRef::Check {
+            check_id: check_id.clone(),
+        })
         .collect::<Vec<_>>();
 
     if run.all_succeeded() {
@@ -180,7 +182,7 @@ pub fn run_handoff(
                         "Everything affected passed, but I couldn’t create a safe commit. I left the workspace intact: {detail}"
                     ),
                     detail: Some(detail.clone()),
-                    evidence_ids,
+                    evidence,
                     nesting_depth: event_nesting_depth,
                     timestamp_ms: Some(now_millis()),
                 }, progress_entry_key.iter().cloned().collect());
@@ -194,7 +196,9 @@ pub fn run_handoff(
             HandoffOutcome::Ready
         };
         if let Some(commit) = &commit {
-            evidence_ids.push(format!("commit:{}", commit.oid));
+            evidence.push(EvidenceRef::Commit {
+                oid: commit.oid.clone(),
+            });
         }
         let summary = HandoffSummary {
             outcome,
@@ -227,7 +231,7 @@ pub fn run_handoff(
                 handoff: Some(summary.clone()),
                 message,
                 detail: None,
-                evidence_ids,
+                evidence,
                 nesting_depth: event_nesting_depth,
                 timestamp_ms: Some(now_millis()),
             },
@@ -285,7 +289,7 @@ pub fn run_handoff(
                 natural_list(&failed.iter().map(String::as_str).collect::<Vec<_>>())
             ),
             detail: Some(feedback.clone()),
-            evidence_ids,
+            evidence,
             nesting_depth: event_nesting_depth,
             timestamp_ms: Some(now_millis()),
         },

@@ -391,7 +391,7 @@ export type AgentEvent =
     handoff?: HandoffSummary;
     message: string;
     detail?: string;
-    evidence_ids: string[];
+    evidence: EvidenceRef[];
     nesting_depth?: number;
     timestamp_ms?: number;
   }
@@ -687,7 +687,7 @@ export type AgentEvent =
   | {
     type: "session_summary";
     branch: string;
-    commits: string;
+    commits: HandoffCommitSummary[];
     reached_final: boolean;
     contract_status: "unspecified" | "unsatisfied" | "satisfied";
     verified_completed: boolean;
@@ -765,6 +765,38 @@ export interface EventChatter {
   audience: ChatterAudience;
 }
 
+export type EvidenceRef =
+  | { kind: "check"; check_id: string }
+  | { kind: "commit"; oid: string };
+
+export interface CheckEvidence {
+  check_id: string;
+  exit_status: number;
+  success: boolean;
+  timed_out: boolean;
+  output: string;
+  duration_ms: number;
+  command?: string;
+  cwd?: string;
+  executor?: string;
+  reused: boolean;
+  skip_reason?: string;
+}
+
+export interface CommitEvidence {
+  success: boolean;
+  created: boolean;
+  reused: boolean;
+  oid?: string;
+  subject?: string;
+  changed_paths: string[];
+  detail: string;
+}
+
+export type EventEvidence =
+  | { kind: "check"; value: CheckEvidence }
+  | { kind: "commit"; value: CommitEvidence };
+
 export type TranscriptVisibility = "visible" | "evidence_only" | "activity";
 
 export type TranscriptKind =
@@ -816,9 +848,14 @@ export interface HandoffSummary {
   outcome: HandoffOutcome;
   affected_components: string[];
   checks: { check_id: string; status: string }[];
-  commit?: { oid: string; subject: string };
+  commit?: HandoffCommitSummary;
   changed_paths: string[];
   detail?: string;
+}
+
+export interface HandoffCommitSummary {
+  oid: string;
+  subject: string;
 }
 
 export interface SessionAttachment {
@@ -863,9 +900,10 @@ export interface SessionMetricsSnapshot {
 }
 
 export interface EventEnvelope {
-  version: "v2";
+  version: "v3";
   event: AgentEvent;
   chatter: EventChatter[];
+  evidence: EventEvidence[];
   transcript: TranscriptMetadata;
 }
 
@@ -1355,6 +1393,7 @@ export interface SessionItem {
     question: string;
     choices: string[];
   } | null;
+  started_at_ms: number;
   updated_at_ms: number;
   metrics: SessionMetricsSnapshot | null;
   usage_records: SessionMetricsSnapshot[];
@@ -1385,6 +1424,7 @@ export interface SessionDetails {
     choices: string[];
   } | null;
   events: EventEnvelope[];
+  started_at_ms: number;
   updated_at_ms: number;
   metrics: SessionMetricsSnapshot | null;
   usage_records: SessionMetricsSnapshot[];

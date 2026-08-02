@@ -3458,7 +3458,7 @@ fn run_agent_inner<S: EventSink>(
             handoff: Some(handoff.clone()),
             message: "The task stopped before handoff.".to_string(),
             detail: Some(format!("termination reason: {termination_reason}")),
-            evidence_ids: Vec::new(),
+            evidence: Vec::new(),
             nesting_depth: None,
             timestamp_ms: Some(now_millis()),
         });
@@ -3469,7 +3469,7 @@ fn run_agent_inner<S: EventSink>(
         });
     }
 
-    let (commits, diff_stat, diff) = if args.repository_less {
+    let (commit_log, diff_stat, diff) = if args.repository_less {
         (String::new(), String::new(), String::new())
     } else if let Some(repository) = repository_context.as_ref() {
         (
@@ -3487,6 +3487,7 @@ fn run_agent_inner<S: EventSink>(
             git_diff_from_main(&workspace_root).unwrap_or_default(),
         )
     };
+    let commits = parse_commit_summaries(&commit_log);
     let total_tokens = outcome
         .metrics
         .prompt_tokens
@@ -6852,7 +6853,7 @@ fn run_proactive_lsp_pass(
                 "Automatic language-server diagnostics were skipped within their safety bound."
                     .to_string(),
             detail: Some(truncate_chars(&format!("{error:#}"), 1_000)),
-            evidence_ids: Vec::new(),
+            evidence: Vec::new(),
             nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
             timestamp_ms: Some(now_millis()),
         });
@@ -6994,7 +6995,7 @@ fn run_proactive_lsp_pass(
             message: "Automatic language-server evidence was incomplete; ordinary checks remain authoritative."
                 .to_string(),
             detail: Some(truncate_chars(&details.join("\n"), 4_000)),
-            evidence_ids: Vec::new(),
+            evidence: Vec::new(),
             nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
             timestamp_ms: Some(now_millis()),
         });
@@ -8673,7 +8674,7 @@ fn run_agent_steps(
                                 .to_string()
                         },
                         detail: Some(feedback.clone()),
-                        evidence_ids: Vec::new(),
+                        evidence: Vec::new(),
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
@@ -8761,10 +8762,12 @@ fn run_agent_steps(
                                             .to_string()
                                     },
                                     detail: exhausted.detail.clone(),
-                                    evidence_ids: exhausted
+                                    evidence: exhausted
                                         .checks
                                         .iter()
-                                        .map(|check| format!("check:{}", check.check_id))
+                                        .map(|check| crate::events::EvidenceRef::Check {
+                                            check_id: check.check_id.clone(),
+                                        })
                                         .collect(),
                                     nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                                     timestamp_ms: Some(now_millis()),
@@ -8890,7 +8893,7 @@ fn run_agent_steps(
                             message: "The checks are done, but some task requirements are still missing. This needs another pass."
                                 .to_string(),
                             detail: Some(feedback.clone()),
-                            evidence_ids: Vec::new(),
+                            evidence: Vec::new(),
                             nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                             timestamp_ms: Some(now_millis()),
                         });
@@ -9973,7 +9976,7 @@ fn run_final_grace(
                         message: "The checks are done, but some task requirements are still missing. This needs another pass."
                             .to_string(),
                         detail: Some(feedback.clone()),
-                        evidence_ids: Vec::new(),
+                        evidence: Vec::new(),
                         nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
                         timestamp_ms: Some(now_millis()),
                     });
@@ -26215,6 +26218,20 @@ fn git_log_since_baseline(workdir: &Path, baseline_head: Option<&str>) -> Result
     }
 }
 
+fn parse_commit_summaries(log: &str) -> Vec<crate::events::HandoffCommitSummary> {
+    log.lines()
+        .filter_map(|line| {
+            let (oid, subject) = line.trim().split_once(' ')?;
+            (!oid.is_empty() && !subject.trim().is_empty()).then(|| {
+                crate::events::HandoffCommitSummary {
+                    oid: oid.to_string(),
+                    subject: subject.trim().to_string(),
+                }
+            })
+        })
+        .collect()
+}
+
 fn run_session_changes(arguments: &Value, workspace_root: &Path) -> Result<String> {
     let path = arguments.get("path").and_then(Value::as_str);
     let commits = arguments.get("commits").and_then(Value::as_str);
@@ -26274,7 +26291,7 @@ fn summarize_session_change(
 ) -> Option<SessionChangeSummary> {
     let mut task = session.task.as_str();
     let mut summary = "";
-    let mut commits = "";
+    let mut commits: &[crate::events::HandoffCommitSummary] = &[];
     let mut diff_stat = "";
     let mut touched_paths = Vec::new();
     for envelope in &session.events {
@@ -26295,8 +26312,13 @@ fn summarize_session_change(
             _ => {}
         }
     }
+    let commit_text = commits
+        .iter()
+        .map(|commit| format!("{} {}", commit.oid, commit.subject))
+        .collect::<Vec<_>>()
+        .join("\n");
     let haystack = format!(
-        "{task}\n{summary}\n{commits}\n{diff_stat}\n{}",
+        "{task}\n{summary}\n{commit_text}\n{diff_stat}\n{}",
         touched_paths.join("\n")
     );
     if let Some(path) = path_filter
@@ -26309,7 +26331,11 @@ fn summarize_session_change(
             .split(|ch: char| !ch.is_ascii_hexdigit())
             .filter(|part| part.len() >= 7)
             .collect::<Vec<_>>();
-        if !hashes.is_empty() && !hashes.iter().any(|hash| commits.contains(hash)) {
+        if !hashes.is_empty()
+            && !hashes
+                .iter()
+                .any(|hash| commits.iter().any(|commit| commit.oid.contains(hash)))
+        {
             return None;
         }
     }
@@ -26323,10 +26349,10 @@ fn summarize_session_change(
     if !summary.trim().is_empty() {
         text.push_str(&format!("  summary: {}\n", one_line(summary, 360)));
     }
-    if !commits.trim().is_empty() {
+    if !commits.is_empty() {
         text.push_str("  commits:\n");
-        for line in commits.lines().take(5) {
-            text.push_str(&format!("    {line}\n"));
+        for commit in commits.iter().take(5) {
+            text.push_str(&format!("    {} {}\n", commit.oid, commit.subject));
         }
     }
     if !diff_stat.trim().is_empty() {

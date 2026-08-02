@@ -1,10 +1,24 @@
 /// <reference lib="deno.ns" />
 import { equal, ok } from "node:assert/strict";
+import { LatestRequest } from "../lib/hooks.ts";
 import { nextProjectNotificationPreference } from "./ProjectsPage.tsx";
 
 Deno.test("nextProjectNotificationPreference flips the project notification setting", () => {
   equal(nextProjectNotificationPreference({ notify_on_finish: false }), true);
   equal(nextProjectNotificationPreference({ notify_on_finish: true }), false);
+});
+
+Deno.test("latest request ownership aborts and rejects stale responses", () => {
+  const requests = new LatestRequest();
+  const first = requests.start();
+  const second = requests.start();
+
+  equal(first.signal.aborted, true);
+  equal(requests.owns(first), false);
+  equal(requests.owns(second), true);
+  requests.abort();
+  equal(second.signal.aborted, true);
+  equal(requests.owns(second), false);
 });
 
 Deno.test("project index uses the shared workspace frame", async () => {
@@ -55,4 +69,11 @@ Deno.test("project pages distinguish loading and API failures from empty state",
   ok(page.includes("projectsError && projects.length > 0"));
   ok(hooks.includes("Project request failed"));
   ok(hooks.includes("Session request failed"));
+  ok(hooks.includes("sessionsRequest.current.start()"));
+  ok(hooks.includes("projectsRequest.current.start()"));
+  ok(page.includes("usageRequest.current.start()"));
+  ok(page.includes("marketplaceRequest.current.start()"));
+  ok(page.includes("installedRequest.current.start()"));
+  ok(page.includes('setInstalledError("")'));
+  ok(page.includes('setMarketplaceError("")'));
 });

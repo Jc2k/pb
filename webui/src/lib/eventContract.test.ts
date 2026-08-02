@@ -91,6 +91,7 @@ Deno.test("Rust and TypeScript expose the same event and profile variants", asyn
   for (
     const required of [
       "chatter: EventChatter[]",
+      "evidence: EventEvidence[]",
       "transcript: TranscriptMetadata",
       "entry_key: string",
       "supersedes: string[]",
@@ -103,17 +104,19 @@ Deno.test("Rust and TypeScript expose the same event and profile variants", asyn
       "detail: string",
       "call_id: string",
       "batch_id: string",
-      "evidence_ids: string[]",
+      "evidence: EvidenceRef[]",
+      "commits: HandoffCommitSummary[]",
+      "started_at_ms: number",
       "usage_records: SessionMetricsSnapshot[]",
     ]
   ) {
     if (!types.includes(required)) {
-      throw new Error(`missing required v2 event field: ${required}`);
+      throw new Error(`missing required v3 event field: ${required}`);
     }
   }
 });
 
-Deno.test("v2 consumers do not reconstruct omitted server state", async () => {
+Deno.test("v3 consumers do not reconstruct omitted server state", async () => {
   const [helpers, session, energy] = await Promise.all([
     Deno.readTextFile("webui/src/lib/helpers.ts"),
     Deno.readTextFile("webui/src/components/Session.tsx"),
@@ -132,13 +135,13 @@ Deno.test("v2 consumers do not reconstruct omitted server state", async () => {
   ) {
     if (helpers.includes(workaround) || session.includes(workaround)) {
       throw new Error(
-        `v2 UI still reconstructs server state with: ${workaround}`,
+        `v3 UI still reconstructs server state with: ${workaround}`,
       );
     }
   }
   if (energy.includes("legacy") || energy.includes("llm_energy_kwh ??")) {
     throw new Error(
-      "v2 energy totals still contain a legacy snapshot fallback",
+      "v3 energy totals still contain a legacy snapshot fallback",
     );
   }
 });

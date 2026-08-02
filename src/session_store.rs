@@ -13,7 +13,7 @@ const NOTES_NAMESPACE: &str = "refs/notes/pb/sessions";
 const MAX_RESTORED_HISTORY_EVENTS: usize = 1_000;
 const SESSION_GIT_NAME: &str = "pb";
 const SESSION_GIT_EMAIL: &str = "pb@localhost";
-pub const SESSION_SCHEMA_VERSION: &str = "v2";
+pub const SESSION_SCHEMA_VERSION: &str = "v3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +37,7 @@ pub struct PersistedSession {
     pub request_template: AgentRequest,
     pub running: bool,
     pub status: SessionStatus,
+    pub started_at_ms: u64,
     pub updated_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<SessionMetricsSnapshot>,
@@ -64,6 +65,19 @@ impl PersistedSession {
         status: SessionStatus,
         events: Vec<EventEnvelope>,
     ) -> Self {
+        let now = now_millis();
+        let started_at_ms = events
+            .iter()
+            .find_map(|envelope| match &envelope.event {
+                AgentEvent::Started { timestamp_ms, .. } => *timestamp_ms,
+                _ => None,
+            })
+            .or_else(|| {
+                session_id
+                    .strip_prefix("session-")
+                    .and_then(|timestamp| timestamp.parse().ok())
+            })
+            .unwrap_or(now);
         let usage_records = events
             .iter()
             .filter_map(|envelope| SessionMetricsSnapshot::from_event(&envelope.event))
@@ -78,7 +92,8 @@ impl PersistedSession {
             request_template,
             running,
             status,
-            updated_at_ms: now_millis(),
+            started_at_ms,
+            updated_at_ms: now,
             metrics: latest_session_metrics(&events),
             usage_records,
             workflow: None,
@@ -238,6 +253,19 @@ fn parse_session(payload: &str) -> Result<PersistedSession> {
     }
     let session: PersistedSession =
         serde_json::from_value(value).context("failed to parse session note")?;
+    let mut entry_keys = HashSet::new();
+    for (index, envelope) in session.events.iter().enumerate() {
+        envelope
+            .validate_persisted()
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("session event {index} has invalid server projections"))?;
+        if !entry_keys.insert(envelope.transcript.entry_key.as_str()) {
+            bail!(
+                "session event {index} repeats transcript entry key '{}'",
+                envelope.transcript.entry_key
+            );
+        }
+    }
     if let Some(goal) = session.goal.as_ref() {
         goal.validate()
             .context("active goal checkpoint is invalid")?;
@@ -286,12 +314,35 @@ pub fn latest_session_title(events: &[EventEnvelope]) -> Option<String> {
         })
 }
 
-fn trim_events(mut events: Vec<EventEnvelope>) -> Vec<EventEnvelope> {
-    if events.len() > MAX_RESTORED_HISTORY_EVENTS {
-        let overflow = events.len() - MAX_RESTORED_HISTORY_EVENTS;
-        events.drain(..overflow);
+fn trim_events(events: Vec<EventEnvelope>) -> Vec<EventEnvelope> {
+    trim_event_history(events, MAX_RESTORED_HISTORY_EVENTS)
+}
+
+pub(crate) fn trim_event_history(
+    mut events: Vec<EventEnvelope>,
+    maximum: usize,
+) -> Vec<EventEnvelope> {
+    if events.len() <= maximum {
+        return events;
     }
-    events
+    if maximum == 0 {
+        return Vec::new();
+    }
+    if matches!(
+        events.first().map(|entry| &entry.event),
+        Some(AgentEvent::Started { .. })
+    ) {
+        let started = events.remove(0);
+        let keep_tail = maximum - 1;
+        let overflow = events.len().saturating_sub(keep_tail);
+        events.drain(..overflow);
+        events.insert(0, started);
+        events
+    } else {
+        let overflow = events.len() - maximum;
+        events.drain(..overflow);
+        events
+    }
 }
 
 fn workspace_root(session: &PersistedSession) -> Option<PathBuf> {
@@ -800,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_session_without_v2_schema_is_rejected() {
+    fn persisted_session_without_v3_schema_is_rejected() {
         let dir = init_repo();
         let session = PersistedSession::from_parts(
             "old-session".to_string(),
@@ -819,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_v2_session_requires_authoritative_state_fields() {
+    fn persisted_v3_session_requires_authoritative_state_fields() {
         let dir = init_repo();
         let session = PersistedSession::from_parts(
             "malformed-session".to_string(),
@@ -832,14 +883,132 @@ mod tests {
         );
         let value = serde_json::to_value(session).unwrap();
 
-        for field in ["status", "usage_records", "pending_user_messages"] {
+        for field in [
+            "status",
+            "started_at_ms",
+            "usage_records",
+            "pending_user_messages",
+        ] {
             let mut missing = value.clone();
             missing.as_object_mut().unwrap().remove(field);
             assert!(
                 parse_session(&serde_json::to_string(&missing).unwrap()).is_err(),
-                "v2 session unexpectedly accepted without {field}"
+                "v3 session unexpectedly accepted without {field}"
             );
         }
+    }
+
+    #[test]
+    fn persisted_v2_sessions_are_rejected_without_migration() {
+        let dir = init_repo();
+        let session = PersistedSession::from_parts(
+            "old-session".to_string(),
+            request(dir.path()),
+            Some("pb/test".to_string()),
+            Some(dir.path().to_path_buf()),
+            false,
+            SessionStatus::Completed,
+            Vec::new(),
+        );
+        let mut value = serde_json::to_value(session).unwrap();
+        value["schema_version"] = serde_json::Value::String("v2".to_string());
+
+        let error = parse_session(&serde_json::to_string(&value).unwrap()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported session schema 'v2'")
+        );
+    }
+
+    #[test]
+    fn started_time_is_persisted_independently_of_trimmed_event_history() {
+        let dir = init_repo();
+        let started = EventEnvelope::new(AgentEvent::Started {
+            task: "Review the boundary".to_string(),
+            model: "local-model".to_string(),
+            profile: crate::agent_core::AgentProfile::Review,
+            workspace: dir.path().to_string_lossy().into_owned(),
+            focus_root: Some(dir.path().to_string_lossy().into_owned()),
+            branch: "pb/test".to_string(),
+            attachments: Vec::new(),
+            timestamp_ms: Some(42),
+        });
+        let session = PersistedSession::from_parts(
+            "session-100".to_string(),
+            request(dir.path()),
+            Some("pb/test".to_string()),
+            Some(dir.path().to_path_buf()),
+            false,
+            SessionStatus::Completed,
+            vec![started],
+        );
+
+        assert_eq!(session.started_at_ms, 42);
+    }
+
+    #[test]
+    fn trimmed_history_preserves_the_started_anchor() {
+        let started = EventEnvelope::new(AgentEvent::Started {
+            task: "Review the boundary".to_string(),
+            model: "local-model".to_string(),
+            profile: crate::agent_core::AgentProfile::Review,
+            workspace: "/workspace".to_string(),
+            focus_root: Some("/workspace".to_string()),
+            branch: "pb/test".to_string(),
+            attachments: Vec::new(),
+            timestamp_ms: Some(1),
+        });
+        let events = vec![
+            started,
+            EventEnvelope::new(AgentEvent::SessionTitle {
+                title: "one".to_string(),
+                timestamp_ms: Some(2),
+            }),
+            EventEnvelope::new(AgentEvent::SessionTitle {
+                title: "two".to_string(),
+                timestamp_ms: Some(3),
+            }),
+        ];
+
+        let trimmed = trim_event_history(events, 2);
+        assert!(matches!(trimmed[0].event, AgentEvent::Started { .. }));
+        assert!(matches!(
+            &trimmed[1].event,
+            AgentEvent::SessionTitle { title, .. } if title == "two"
+        ));
+    }
+
+    #[test]
+    fn session_parser_rejects_invalid_projection_shapes_and_duplicate_entry_keys() {
+        let dir = init_repo();
+        let correction = EventEnvelope::new(AgentEvent::Correction {
+            kind: crate::events::CorrectionKind::RepositoryEvidence,
+            message: "detail".to_string(),
+            summary: "Repository evidence".to_string(),
+            actor: crate::events::TeamActor::workflow_steward(),
+            assisting_profile: Some(crate::agent_core::AgentProfile::Review),
+            nesting_depth: None,
+            timestamp_ms: Some(1),
+        });
+        let session = PersistedSession::from_parts(
+            "malformed-projections".to_string(),
+            request(dir.path()),
+            Some("pb/test".to_string()),
+            Some(dir.path().to_path_buf()),
+            false,
+            SessionStatus::Completed,
+            vec![correction.clone()],
+        );
+
+        let mut invalid_projection = serde_json::to_value(&session).unwrap();
+        invalid_projection["events"][0]["chatter"] = serde_json::json!([]);
+        assert!(parse_session(&serde_json::to_string(&invalid_projection).unwrap()).is_err());
+
+        let mut duplicate = session;
+        duplicate.events.push(correction);
+        let error = parse_session(&serde_json::to_string(&duplicate).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("repeats transcript entry key"));
     }
 
     #[test]
@@ -867,7 +1036,9 @@ mod tests {
                     handoff: None,
                     message: "Everything affected passed.".to_string(),
                     detail: Some("cargo test --all-targets".to_string()),
-                    evidence_ids: vec!["check:rust".to_string()],
+                    evidence: vec![crate::events::EvidenceRef::Check {
+                        check_id: "rust".to_string(),
+                    }],
                     nesting_depth: None,
                     timestamp_ms: None,
                 }),
@@ -888,10 +1059,13 @@ mod tests {
                     crate::events::AutomationActor::Trinity
                 ),
                 message,
-                evidence_ids,
+                evidence,
                 ..
             } if message == "Everything affected passed."
-                && evidence_ids == &vec!["check:rust".to_string()]
+                && evidence
+                    == &vec![crate::events::EvidenceRef::Check {
+                        check_id: "rust".to_string(),
+                    }]
         ));
 
         delete_session(dir.path(), "session-123").unwrap();

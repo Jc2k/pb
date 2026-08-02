@@ -18,7 +18,7 @@ use crate::agent_core::{
 use crate::cli_ui::render_event;
 use crate::config::UserConfig;
 use crate::environment::{EnvironmentBackend, EnvironmentConfig, EnvironmentMode};
-use crate::events::{AgentEvent, EventEnvelope};
+use crate::events::{AgentEvent, EventEnvelope, EvidenceRef};
 use crate::session_store::now_millis;
 use crate::{HarnessAgentArgs, HarnessCacheEvalArgs};
 
@@ -466,7 +466,11 @@ impl EventSink for HarnessEventSink {
             } => {
                 state.summary = CapturedSummary {
                     branch: branch.clone(),
-                    commits: commits.clone(),
+                    commits: commits
+                        .iter()
+                        .map(|commit| format!("{} {}", commit.oid, commit.subject))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                     summary: summary.clone(),
                     diff_stat: diff_stat.clone(),
                 };
@@ -518,11 +522,15 @@ impl EventSink for HarnessEventSink {
                     state.audit.output_fingerprints.push(fingerprint.clone());
                 }
             }
-            AgentEvent::TeamMessage { evidence_ids, .. } => {
+            AgentEvent::TeamMessage { evidence, .. } => {
                 state.audit.team_messages += 1;
-                for evidence_id in evidence_ids {
-                    if !state.audit.feedback_evidence_ids.contains(evidence_id) {
-                        state.audit.feedback_evidence_ids.push(evidence_id.clone());
+                for reference in evidence {
+                    let evidence_id = match reference {
+                        EvidenceRef::Check { check_id } => format!("check:{check_id}"),
+                        EvidenceRef::Commit { oid } => format!("commit:{oid}"),
+                    };
+                    if !state.audit.feedback_evidence_ids.contains(&evidence_id) {
+                        state.audit.feedback_evidence_ids.push(evidence_id);
                     }
                 }
             }
@@ -3939,7 +3947,9 @@ mod tests {
             handoff: None,
             message: "The web check needs attention.".to_string(),
             detail: Some("failed".to_string()),
-            evidence_ids: vec!["check:web".to_string()],
+            evidence: vec![EvidenceRef::Check {
+                check_id: "web".to_string(),
+            }],
             nesting_depth: None,
             timestamp_ms: None,
         });

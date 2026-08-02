@@ -84,6 +84,26 @@ export function workflowRecoveryPresentation(
   };
 }
 
+export function mergeEventHistory(
+  earlier: EventEnvelope[],
+  later: EventEnvelope[],
+): EventEnvelope[] {
+  const merged = [...earlier];
+  const positions = new Map(
+    merged.map((envelope, index) => [envelope.transcript.entry_key, index]),
+  );
+  for (const envelope of later) {
+    const existing = positions.get(envelope.transcript.entry_key);
+    if (existing === undefined) {
+      positions.set(envelope.transcript.entry_key, merged.length);
+      merged.push(envelope);
+    } else {
+      merged[existing] = envelope;
+    }
+  }
+  return merged;
+}
+
 export function SessionPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
   const navigate = useNavigate();
@@ -107,6 +127,7 @@ export function SessionPage() {
   const [workflowRecoveryError, setWorkflowRecoveryError] = useState("");
   const [showMessageTimes, setShowMessageTimes] = useState(false);
   const sourceRef = useRef<EventSource | null>(null);
+  const sessionRequestRef = useRef(0);
   const chatRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
   const messageTimePullStartRef = useRef<{ x: number; y: number } | null>(null);
@@ -118,7 +139,7 @@ export function SessionPage() {
     src.onmessage = (msg) => {
       try {
         const parsed = JSON.parse(msg.data) as EventEnvelope;
-        setEvents((prev) => [...prev, parsed]);
+        setEvents((previous) => mergeEventHistory(previous, [parsed]));
         const effect = parsed.transcript.session_effect;
         if (effect.title) {
           const title = effect.title;
@@ -139,15 +160,16 @@ export function SessionPage() {
         console.error(err);
       }
     };
-    src.onerror = () => src.close();
   };
 
   const fetchSession = async () => {
+    const request = ++sessionRequestRef.current;
     const res = await fetch(`/api/sessions/${sessionId}`);
     if (!res.ok) return;
     const details = (await res.json()) as SessionDetails;
+    if (request !== sessionRequestRef.current) return;
     setSession(details);
-    setEvents(details.events);
+    setEvents((previous) => mergeEventHistory(details.events, previous));
     setSessionRunning(details.running);
     setAnswer("");
   };
@@ -378,8 +400,14 @@ export function SessionPage() {
   useEffect(() => {
     if (!sessionId) return;
     atBottomRef.current = true;
-    void fetchSession().then(() => openEvents(sessionId));
-    return () => sourceRef.current?.close();
+    setSession(null);
+    setEvents([]);
+    openEvents(sessionId);
+    void fetchSession();
+    return () => {
+      sessionRequestRef.current += 1;
+      sourceRef.current?.close();
+    };
   }, [sessionId]);
 
   useEffect(() => {
@@ -461,9 +489,7 @@ export function SessionPage() {
   const showWorkDrawer = Boolean(
     session.goal || actionTimeline.length > 0,
   );
-  const sessionStartMs =
-    events.find((event) => event.event.type === "started")?.event
-      .timestamp_ms ?? session.updated_at_ms;
+  const sessionStartMs = session.started_at_ms;
   const workflowRecovery = workflowRecoveryPresentation(session.workflow);
 
   return (
@@ -628,6 +654,7 @@ export function SessionPage() {
                         <MessageBubble
                           envelope={grouped as EventEnvelope}
                           evidenceEvents={events}
+                          focusRoot={session.workdir}
                           workflow={session.workflow ?? undefined}
                           showIdentity={showIdentity}
                         />

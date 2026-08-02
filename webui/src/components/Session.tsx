@@ -21,7 +21,6 @@ import {
   harnessEfficiencyStats,
   profileJobTitle,
   profileName,
-  trustedSessionSummaryCommitLines,
 } from "../lib/sessionUtils";
 import type {
   ActionTimelineItem,
@@ -606,7 +605,7 @@ function CorrectionNotice({
   if (event.type !== "correction") return null;
   const copy = envelope.chatter.find(({ audience }) => audience === "team")!;
   const teammate = teamActorPresentation(copy.actor);
-  const technicalDetail = prettyTechnicalDetail(event.message);
+  const technicalDetail = prettyTechnicalDetail(copy.detail);
 
   return (
     <article
@@ -927,11 +926,11 @@ function handoffOutcomeLabel(outcome?: string): string {
 
 function TeamMessageBubble({
   envelope,
-  events,
+  focusRoot,
   showIdentity = true,
 }: {
   envelope: EventEnvelope;
-  events: EventEnvelope[];
+  focusRoot?: string | null;
   showIdentity?: boolean;
 }) {
   const event = envelope.event;
@@ -939,34 +938,13 @@ function TeamMessageBubble({
   const teammate = teamActorPresentation(event.actor);
   const accentClass = teamActorAccentClass(event.actor);
 
-  const index = events.indexOf(envelope);
-  const priorEvents = events.slice(0, index < 0 ? events.length : index);
-  const recentPriorEvents = [...priorEvents].reverse();
-  const evidenceIds = new Set(event.evidence_ids);
-  const checkEvidence = Array.from(evidenceIds)
-    .filter((id) => id.startsWith("check:"))
-    .map((id) => id.slice("check:".length))
-    .map((checkId) =>
-      recentPriorEvents.find((candidate) =>
-        candidate.event.type === "check_result" &&
-        candidate.event.check_id === checkId
-      )
-    )
-    .filter((candidate): candidate is EventEnvelope => Boolean(candidate));
-  const commitEvidence = Array.from(evidenceIds)
-    .filter((id) => id.startsWith("commit:"))
-    .map((id) => id.slice("commit:".length))
-    .map((oid) =>
-      recentPriorEvents.find((candidate) =>
-        candidate.event.type === "commit_result" && candidate.event.oid === oid
-      )
-    )
-    .filter((candidate): candidate is EventEnvelope => Boolean(candidate));
+  const checkEvidence = envelope.evidence.flatMap((entry) =>
+    entry.kind === "check" ? [entry.value] : []
+  );
+  const commitEvidence = envelope.evidence.flatMap((entry) =>
+    entry.kind === "commit" ? [entry.value] : []
+  );
   const summary = event.handoff;
-  const start = events.find((candidate) => candidate.event.type === "started");
-  const focusRoot = start?.event.type === "started"
-    ? start.event.focus_root
-    : undefined;
   const hasEvidence = checkEvidence.length > 0 || commitEvidence.length > 0 ||
     Boolean(summary) || Boolean(event.detail);
 
@@ -1020,9 +998,7 @@ function TeamMessageBubble({
                 {event.detail
                   ? <pre className="handoff-detail">{event.detail}</pre>
                   : null}
-                {checkEvidence.map((candidate) => {
-                  if (candidate.event.type !== "check_result") return null;
-                  const check = candidate.event;
+                {checkEvidence.map((check) => {
                   const status = check.skip_reason
                     ? "skipped"
                     : check.reused
@@ -1050,9 +1026,7 @@ function TeamMessageBubble({
                     </section>
                   );
                 })}
-                {commitEvidence.map((candidate) => {
-                  if (candidate.event.type !== "commit_result") return null;
-                  const commit = candidate.event;
+                {commitEvidence.map((commit) => {
                   return (
                     <section
                       className="handoff-commit"
@@ -1999,11 +1973,13 @@ function SessionMetricsDetails({
 export function MessageBubble({
   envelope,
   evidenceEvents = [],
+  focusRoot,
   workflow,
   showIdentity = true,
 }: {
   envelope: EventEnvelope;
   evidenceEvents?: EventEnvelope[];
+  focusRoot?: string | null;
   workflow?: WorkflowSummary;
   showIdentity?: boolean;
 }) {
@@ -2139,7 +2115,7 @@ export function MessageBubble({
       return (
         <TeamMessageBubble
           envelope={envelope}
-          events={evidenceEvents}
+          focusRoot={focusRoot}
           showIdentity={showIdentity}
         />
       );
@@ -2300,10 +2276,7 @@ export function MessageBubble({
 
     case "session_summary": {
       const hasSummary = Boolean(e.summary?.trim());
-      const commitLines = trustedSessionSummaryCommitLines(
-        e.commits,
-        evidenceEvents,
-      );
+      const commitLines = e.commits;
       const hasChanges = Boolean(e.diff_stat?.trim() || e.diff?.trim());
       if (!hasSummary && commitLines.length === 0 && !hasChanges) return null;
       return (
@@ -2330,8 +2303,8 @@ export function MessageBubble({
                     <strong>Commits from this delivery</strong>
                     <ul>
                       {commitLines.map((line) => (
-                        <li key={line}>
-                          <code>{line}</code>
+                        <li key={line.oid}>
+                          <code>{line.oid} {line.subject}</code>
                         </li>
                       ))}
                     </ul>

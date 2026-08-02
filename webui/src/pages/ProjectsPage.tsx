@@ -43,7 +43,11 @@ import {
   uniqueIntegrations,
   usageStatsForToday,
 } from "../lib/helpers";
-import { useProjectSessionData } from "../lib/hooks";
+import {
+  isAbortError,
+  LatestRequest,
+  useProjectSessionData,
+} from "../lib/hooks";
 
 export function ProjectsPage() {
   const {
@@ -216,6 +220,7 @@ export function ProjectPage() {
   });
   const [usageLoading, setUsageLoading] = useState(true);
   const [usageError, setUsageError] = useState("");
+  const usageRequest = useRef(new LatestRequest());
   const name = encodedProjectName ? decodeURIComponent(encodedProjectName) : "";
   const project = projects.find((entry) => entry.name === name);
   const projectSessions = useMemo(
@@ -240,38 +245,43 @@ export function ProjectPage() {
   const latestBranch = projectSessions[0]?.branch || "Managed automatically";
 
   useEffect(() => {
-    if (!name || !project) return;
-    let active = true;
+    if (!name || !project) {
+      usageRequest.current.abort();
+      setUsageLoading(false);
+      return;
+    }
     setUsageLoading(true);
     setUsageError("");
     const fetchUsage = async () => {
+      const controller = usageRequest.current.start();
       try {
         const res = await fetch(
           `/api/projects/${encodeURIComponent(name)}/usage`,
+          { signal: controller.signal },
         );
         if (!res.ok) {
           throw new Error(`Usage request failed (${res.status})`);
         }
         const nextUsage = (await res.json()) as ProjectUsageStats;
-        if (active) {
+        if (usageRequest.current.owns(controller)) {
           setUsage(nextUsage);
           setUsageError("");
         }
       } catch (error) {
-        if (active) {
+        if (!isAbortError(error) && usageRequest.current.owns(controller)) {
           setUsageError(
             error instanceof Error ? error.message : "Usage request failed",
           );
         }
       } finally {
-        if (active) setUsageLoading(false);
+        if (usageRequest.current.owns(controller)) setUsageLoading(false);
       }
     };
     void fetchUsage();
     const timer = window.setInterval(() => void fetchUsage(), 5000);
     return () => {
-      active = false;
       window.clearInterval(timer);
+      usageRequest.current.abort();
     };
   }, [name, project?.path]);
 
@@ -714,7 +724,9 @@ export function ProjectSettingsPage() {
   const [schemaError, setSchemaError] = useState("");
   const [submitError, setSubmitError] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const [integrationError, setIntegrationError] = useState("");
+  const [marketplaceError, setMarketplaceError] = useState("");
+  const [installedError, setInstalledError] = useState("");
+  const [integrationMutationError, setIntegrationMutationError] = useState("");
   const [integrationSearch, setIntegrationSearch] = useState("");
   const [integrationCategory, setIntegrationCategory] = useState<
     IntegrationKind | "all"
@@ -723,13 +735,23 @@ export function ProjectSettingsPage() {
     id: number;
     controller?: AbortController;
   }>({ id: 0 });
+  const projectsRequest = useRef(new LatestRequest());
+  const marketplaceRequest = useRef(new LatestRequest());
+  const installedRequest = useRef(new LatestRequest());
   const invalidateSchemaRequest = () => {
     schemaRequest.current.controller?.abort();
     schemaRequest.current = { id: schemaRequest.current.id + 1 };
   };
-  useEffect(() => () => invalidateSchemaRequest(), []);
+  useEffect(() => () => {
+    invalidateSchemaRequest();
+    projectsRequest.current.abort();
+    marketplaceRequest.current.abort();
+    installedRequest.current.abort();
+  }, []);
   const name = encodedProjectName ? decodeURIComponent(encodedProjectName) : "";
   const project = projects.find((entry) => entry.name === name);
+  const integrationError = integrationMutationError || installedError ||
+    marketplaceError;
   const filteredMarketplace = marketplace.filter((item) => {
     const query = integrationSearch.trim().toLowerCase();
     const matchesCategory = integrationCategory === "all" ||
@@ -742,28 +764,36 @@ export function ProjectSettingsPage() {
   });
 
   const fetchProjects = useCallback(async () => {
+    const controller = projectsRequest.current.start();
     setProjectsLoading(true);
     try {
-      const res = await fetch("/api/projects");
+      const res = await fetch("/api/projects", { signal: controller.signal });
       if (!res.ok) {
         throw new Error(`Project request failed (${res.status})`);
       }
-      setProjects((await res.json()) as ProjectEntry[]);
+      const nextProjects = (await res.json()) as ProjectEntry[];
+      if (!projectsRequest.current.owns(controller)) return;
+      setProjects(nextProjects);
       setProjectsError("");
     } catch (error) {
+      if (isAbortError(error) || !projectsRequest.current.owns(controller)) {
+        return;
+      }
       setProjectsError(
         error instanceof Error ? error.message : "Project request failed",
       );
     } finally {
-      setProjectsLoading(false);
+      if (projectsRequest.current.owns(controller)) setProjectsLoading(false);
     }
   }, []);
 
-  const fetchInstalledIntegrations = async () => {
+  const fetchInstalledIntegrations = useCallback(async () => {
     if (!name) return;
+    const controller = installedRequest.current.start();
     try {
       const res = await fetch(
         `/api/projects/${encodeURIComponent(name)}/integrations`,
+        { signal: controller.signal },
       );
       if (!res.ok) {
         throw new Error(
@@ -773,25 +803,32 @@ export function ProjectSettingsPage() {
           ),
         );
       }
-      setInstalled(
-        uniqueInstalledIntegrations(
-          ((await res.json()) as InstalledIntegration[]).filter((entry) =>
-            entry.kind === "mcp"
-          ),
+      const nextInstalled = uniqueInstalledIntegrations(
+        ((await res.json()) as InstalledIntegration[]).filter((entry) =>
+          entry.kind === "mcp"
         ),
       );
+      if (!installedRequest.current.owns(controller)) return;
+      setInstalled(nextInstalled);
+      setInstalledError("");
     } catch (error) {
-      setIntegrationError(
+      if (isAbortError(error) || !installedRequest.current.owns(controller)) {
+        return;
+      }
+      setInstalledError(
         error instanceof Error
           ? error.message
           : "Could not load installed integrations",
       );
     }
-  };
+  }, [name]);
 
   useEffect(() => {
     void fetchProjects();
-    void fetch("/api/integrations/marketplace")
+    const controller = marketplaceRequest.current.start();
+    void fetch("/api/integrations/marketplace", {
+      signal: controller.signal,
+    })
       .then(async (res) => {
         if (!res.ok) {
           throw new Error(
@@ -803,23 +840,34 @@ export function ProjectSettingsPage() {
         }
         return res.json();
       })
-      .then((entries: MarketplaceIntegration[]) =>
+      .then((entries: MarketplaceIntegration[]) => {
+        if (!marketplaceRequest.current.owns(controller)) return;
         setMarketplace(
           uniqueIntegrations(entries.filter((entry) => entry.kind === "mcp")),
-        )
-      )
-      .catch((error) =>
-        setIntegrationError(
+        );
+        setMarketplaceError("");
+      })
+      .catch((error) => {
+        if (
+          isAbortError(error) || !marketplaceRequest.current.owns(controller)
+        ) {
+          return;
+        }
+        setMarketplaceError(
           error instanceof Error
             ? error.message
             : "Could not load the integration marketplace",
-        )
-      );
+        );
+      });
   }, [fetchProjects]);
 
   useEffect(() => {
+    setInstalled([]);
+    setInstalledError("");
+    setIntegrationMutationError("");
     void fetchInstalledIntegrations();
-  }, [name]);
+    return () => installedRequest.current.abort();
+  }, [fetchInstalledIntegrations]);
 
   const toggleProjectNotifications = async () => {
     if (!project) return;
@@ -916,7 +964,7 @@ export function ProjectSettingsPage() {
     if (!project || !window.confirm(`Remove ${item.name} from this project?`)) {
       return;
     }
-    setIntegrationError("");
+    setIntegrationMutationError("");
     try {
       const res = await fetch(
         `/api/projects/${encodeURIComponent(project.name)}/integrations/${
@@ -931,7 +979,7 @@ export function ProjectSettingsPage() {
       }
       void fetchInstalledIntegrations();
     } catch (error) {
-      setIntegrationError(
+      setIntegrationMutationError(
         error instanceof Error
           ? error.message
           : "Could not remove the integration",

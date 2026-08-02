@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use regex::Regex;
 
@@ -11,7 +12,25 @@ pub use crate::inference::StageRootAuthorityClass as PromptRootAuthorityClass;
 use crate::session_store::now_millis;
 pub use crate::workflow::WorkflowBlockCause;
 
-pub const EVENT_SCHEMA_VERSION: &str = "v2";
+pub const EVENT_SCHEMA_VERSION: &str = "v3";
+static LAST_EVENT_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
+
+fn next_event_timestamp_ms() -> u64 {
+    let wall_time = now_millis();
+    let mut observed = LAST_EVENT_TIMESTAMP_MS.load(Ordering::Relaxed);
+    loop {
+        let next = wall_time.max(observed.saturating_add(1));
+        match LAST_EVENT_TIMESTAMP_MS.compare_exchange_weak(
+            observed,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(current) => observed = current,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -168,6 +187,52 @@ pub struct EventChatter {
     pub message: String,
     pub detail: String,
     pub audience: ChatterAudience,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EvidenceRef {
+    Check { check_id: String },
+    Commit { oid: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckEvidence {
+    pub check_id: String,
+    pub exit_status: i32,
+    pub success: bool,
+    pub timed_out: bool,
+    pub output: String,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
+    pub reused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitEvidence {
+    pub success: bool,
+    pub created: bool,
+    pub reused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    pub changed_paths: Vec<String>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum EventEvidence {
+    Check(CheckEvidence),
+    Commit(CommitEvidence),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1071,7 +1136,7 @@ pub enum AgentEvent {
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
-        evidence_ids: Vec<String>,
+        evidence: Vec<EvidenceRef>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1257,7 +1322,7 @@ pub enum AgentEvent {
     },
     SessionSummary {
         branch: String,
-        commits: String,
+        commits: Vec<HandoffCommitSummary>,
         reached_final: bool,
         contract_status: ContractStatus,
         verified_completed: bool,
@@ -1288,6 +1353,7 @@ pub struct EventEnvelope {
     pub version: String,
     pub event: AgentEvent,
     pub chatter: Vec<EventChatter>,
+    pub evidence: Vec<EventEvidence>,
     pub transcript: TranscriptMetadata,
 }
 
@@ -1314,21 +1380,114 @@ impl EventEnvelope {
             version: EVENT_SCHEMA_VERSION.to_string(),
             event,
             chatter: Vec::new(),
+            evidence: Vec::new(),
             transcript: TranscriptMetadata::pending(),
         };
-        envelope.refresh_projections(&[]);
         envelope.transcript.supersedes = supersedes;
+        envelope.refresh_projections(&[]);
         envelope
     }
 
     pub fn refresh_projections(&mut self, history: &[EventEnvelope]) {
         let supersedes = self.transcript.supersedes.clone();
         self.chatter = chatter_for_event(&self.event, history, &supersedes);
+        self.evidence = evidence_for_event(&self.event, history);
         self.transcript = transcript_metadata_for_event(&self.event, history, supersedes);
     }
 
+    pub fn validate_persisted(&self) -> Result<(), String> {
+        if self.transcript.entry_key != event_entry_key(&self.event) {
+            return Err("event transcript entry key does not match its payload".to_string());
+        }
+        if self
+            .transcript
+            .supersedes
+            .iter()
+            .any(|entry_key| entry_key.trim().is_empty())
+        {
+            return Err("event transcript contains an empty supersession key".to_string());
+        }
+        let unique_supersedes = self.transcript.supersedes.iter().collect::<HashSet<_>>();
+        if unique_supersedes.len() != self.transcript.supersedes.len() {
+            return Err("event transcript contains duplicate supersession keys".to_string());
+        }
+
+        match &self.event {
+            AgentEvent::Correction { .. } => {
+                if self.chatter.len() != 1 || self.chatter[0].audience != ChatterAudience::Team {
+                    return Err(
+                        "correction event must contain exactly one team chatter projection"
+                            .to_string(),
+                    );
+                }
+            }
+            AgentEvent::WorkflowBlocked { .. } => {
+                let team = self
+                    .chatter
+                    .iter()
+                    .filter(|entry| entry.audience == ChatterAudience::Team)
+                    .count();
+                let current_user = self
+                    .chatter
+                    .iter()
+                    .filter(|entry| entry.audience == ChatterAudience::CurrentUser)
+                    .count();
+                if self.chatter.len() != 2 || team != 1 || current_user != 1 {
+                    return Err(
+                        "blocked workflow event must contain team and current-user chatter"
+                            .to_string(),
+                    );
+                }
+            }
+            _ if !self.chatter.is_empty() => {
+                return Err("event type does not support chatter projections".to_string());
+            }
+            _ => {}
+        }
+
+        let AgentEvent::TeamMessage { evidence, .. } = &self.event else {
+            if !self.evidence.is_empty() {
+                return Err("event type does not support evidence projections".to_string());
+            }
+            return Ok(());
+        };
+        if evidence.iter().collect::<HashSet<_>>().len() != evidence.len() {
+            return Err("team message contains duplicate evidence references".to_string());
+        }
+        if evidence.iter().any(|reference| match reference {
+            EvidenceRef::Check { check_id } => check_id.trim().is_empty(),
+            EvidenceRef::Commit { oid } => oid.trim().is_empty(),
+        }) {
+            return Err("team message contains an empty evidence reference".to_string());
+        }
+        if self.evidence.iter().any(|projection| {
+            !evidence
+                .iter()
+                .any(|reference| match (reference, projection) {
+                    (
+                        EvidenceRef::Check { check_id },
+                        EventEvidence::Check(CheckEvidence {
+                            check_id: projected,
+                            ..
+                        }),
+                    ) => check_id == projected,
+                    (
+                        EvidenceRef::Commit { oid },
+                        EventEvidence::Commit(CommitEvidence {
+                            oid: Some(projected),
+                            ..
+                        }),
+                    ) => oid == projected,
+                    _ => false,
+                })
+        }) {
+            return Err("team message evidence projection has no matching reference".to_string());
+        }
+        Ok(())
+    }
+
     pub fn with_timestamp(event: AgentEvent) -> Self {
-        let now = now_millis();
+        let now = next_event_timestamp_ms();
         let mut envelope = match event {
             AgentEvent::Started {
                 task,
@@ -1342,6 +1501,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::Started {
                     task,
@@ -1360,6 +1520,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::HarnessExperimentConfigured {
                     observation_rendering,
@@ -1374,6 +1535,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ConversationTurnStarted {
                     turn_id,
@@ -1390,6 +1552,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::DeliveryProposed {
                     proposal_id,
@@ -1596,6 +1759,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowStarted {
                     workflow_id,
@@ -1612,6 +1776,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowResumed {
                     workflow_id,
@@ -1625,6 +1790,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowStageStarted {
                     workflow_id,
@@ -1641,6 +1807,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowArtifactAccepted {
                     workflow_id,
@@ -1659,6 +1826,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowChallengeRaised {
                     workflow_id,
@@ -1677,6 +1845,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowEvidenceInvalidated {
                     workflow_id,
@@ -1691,6 +1860,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowStageCompleted {
                     workflow_id,
@@ -1707,6 +1877,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowBlocked {
                     workflow_id,
@@ -1725,6 +1896,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::WorkflowCompleted {
                     workflow_id,
@@ -1743,6 +1915,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::StepStarted {
                     step,
@@ -1760,6 +1933,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ModelLoading {
                     model,
@@ -1776,6 +1950,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::Reasoning {
                     content,
@@ -1795,6 +1970,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ToolCall {
                     tool,
@@ -1815,6 +1991,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ControllerObservation {
                     receipt,
@@ -1835,6 +2012,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ControllerClosure {
                     workflow_id,
@@ -1855,6 +2033,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ControllerMutation {
                     receipt,
@@ -1875,6 +2054,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ToolBatch {
                     call_count,
@@ -1903,6 +2083,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ToolResult {
                     tool,
@@ -1932,6 +2113,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ContextLimit {
                     context_capacity,
@@ -1953,6 +2135,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::ExecutorStarted {
                     executor_id,
@@ -1985,6 +2168,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::CheckResult {
                     check_id,
@@ -2015,12 +2199,13 @@ impl EventEnvelope {
                 handoff,
                 message,
                 detail,
-                evidence_ids,
+                evidence,
                 nesting_depth,
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::TeamMessage {
                     actor,
@@ -2029,7 +2214,7 @@ impl EventEnvelope {
                     handoff,
                     message,
                     detail,
-                    evidence_ids,
+                    evidence,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },
@@ -2041,6 +2226,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::HandoffSummary {
                     summary,
@@ -2061,6 +2247,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::CommitResult {
                     success,
@@ -2083,6 +2270,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::UserQuestion {
                     question_id,
@@ -2099,6 +2287,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::UserAnswer {
                     question_id,
@@ -2113,6 +2302,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::UserMessage {
                     message_id,
@@ -2123,6 +2313,7 @@ impl EventEnvelope {
             AgentEvent::UserMessageApplied { message_id, .. } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::UserMessageApplied {
                     message_id,
@@ -2140,6 +2331,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::Correction {
                     message,
@@ -2159,6 +2351,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::SubAgentStarted {
                     profile,
@@ -2175,6 +2368,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::SubAgentFinished {
                     profile,
@@ -2191,6 +2385,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::Diff {
                     path,
@@ -2207,6 +2402,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::Final {
                     content,
@@ -2223,6 +2419,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::FinalGrace {
                     status,
@@ -2250,6 +2447,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::LlmInvocation {
                     step,
@@ -2304,6 +2502,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::SessionMetrics {
                     llm_invocations,
@@ -2342,6 +2541,7 @@ impl EventEnvelope {
             AgentEvent::SessionTitle { title, .. } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::SessionTitle {
                     title,
@@ -2364,6 +2564,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::SessionSummary {
                     branch,
@@ -2388,6 +2589,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::Error {
                     summary,
@@ -2403,6 +2605,7 @@ impl EventEnvelope {
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
+                evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::SemanticGate {
                     receipt,
@@ -2905,6 +3108,77 @@ fn correction_dedupe_key(summary: &str, detail: &str) -> Option<String> {
         );
     }
     (!summary.trim().is_empty()).then(|| format!("correction:{}", summary.trim()))
+}
+
+fn evidence_for_event(event: &AgentEvent, history: &[EventEnvelope]) -> Vec<EventEvidence> {
+    let AgentEvent::TeamMessage { evidence, .. } = event else {
+        return Vec::new();
+    };
+    evidence
+        .iter()
+        .filter_map(|reference| match reference {
+            EvidenceRef::Check { check_id } => history.iter().rev().find_map(|envelope| {
+                let AgentEvent::CheckResult {
+                    check_id: candidate,
+                    exit_status,
+                    success,
+                    timed_out,
+                    output,
+                    duration_ms,
+                    command,
+                    cwd,
+                    executor,
+                    reused,
+                    skip_reason,
+                    ..
+                } = &envelope.event
+                else {
+                    return None;
+                };
+                (candidate == check_id).then(|| {
+                    EventEvidence::Check(CheckEvidence {
+                        check_id: candidate.clone(),
+                        exit_status: *exit_status,
+                        success: *success,
+                        timed_out: *timed_out,
+                        output: output.clone(),
+                        duration_ms: *duration_ms,
+                        command: command.clone(),
+                        cwd: cwd.clone(),
+                        executor: executor.clone(),
+                        reused: *reused,
+                        skip_reason: skip_reason.clone(),
+                    })
+                })
+            }),
+            EvidenceRef::Commit { oid } => history.iter().rev().find_map(|envelope| {
+                let AgentEvent::CommitResult {
+                    success,
+                    created,
+                    reused,
+                    oid: candidate,
+                    subject,
+                    changed_paths,
+                    detail,
+                    ..
+                } = &envelope.event
+                else {
+                    return None;
+                };
+                (candidate.as_deref() == Some(oid.as_str())).then(|| {
+                    EventEvidence::Commit(CommitEvidence {
+                        success: *success,
+                        created: *created,
+                        reused: *reused,
+                        oid: candidate.clone(),
+                        subject: subject.clone(),
+                        changed_paths: changed_paths.clone(),
+                        detail: detail.clone(),
+                    })
+                })
+            }),
+        })
+        .collect()
 }
 
 fn chatter_for_event(
@@ -3508,7 +3782,34 @@ mod tests {
     }
 
     #[test]
-    fn v2_errors_require_summary_and_detail() {
+    fn timestamped_envelopes_assign_unique_ordered_event_identity() {
+        let event = || AgentEvent::Final {
+            content: "done".to_string(),
+            profile: AgentProfile::Build,
+            nesting_depth: None,
+            timestamp_ms: None,
+        };
+        let first = EventEnvelope::with_timestamp(event());
+        let second = EventEnvelope::with_timestamp(event());
+
+        assert_ne!(first.transcript.entry_key, second.transcript.entry_key);
+        assert!(matches!(
+            (&first.event, &second.event),
+            (
+                AgentEvent::Final {
+                    timestamp_ms: Some(first),
+                    ..
+                },
+                AgentEvent::Final {
+                    timestamp_ms: Some(second),
+                    ..
+                }
+            ) if first < second
+        ));
+    }
+
+    #[test]
+    fn v3_errors_require_summary_and_detail() {
         let value = serde_json::to_value(EventEnvelope::new(AgentEvent::Error {
             summary: "Model setup failed".to_string(),
             detail: "llama.cpp failed to load the configured model".to_string(),
@@ -3522,13 +3823,13 @@ mod tests {
             missing["event"].as_object_mut().unwrap().remove(field);
             assert!(
                 serde_json::from_value::<EventEnvelope>(missing).is_err(),
-                "v2 error unexpectedly accepted without {field}"
+                "v3 error unexpectedly accepted without {field}"
             );
         }
     }
 
     #[test]
-    fn v2_tool_results_require_exact_correlation_and_outcome() {
+    fn v3_tool_results_require_exact_correlation_and_outcome() {
         let value = serde_json::to_value(EventEnvelope::new(AgentEvent::ToolResult {
             tool: "read_file".to_string(),
             result: "contents".to_string(),
@@ -3551,7 +3852,7 @@ mod tests {
             missing["event"].as_object_mut().unwrap().remove(field);
             assert!(
                 serde_json::from_value::<EventEnvelope>(missing).is_err(),
-                "v2 tool result unexpectedly accepted without {field}"
+                "v3 tool result unexpectedly accepted without {field}"
             );
         }
     }
@@ -3709,7 +4010,7 @@ mod tests {
     fn new_session_summary_serializes_explicit_outcome_fields() {
         let envelope = EventEnvelope::new(AgentEvent::SessionSummary {
             branch: "task".to_string(),
-            commits: String::new(),
+            commits: Vec::new(),
             reached_final: true,
             contract_status: ContractStatus::Unspecified,
             verified_completed: false,
@@ -3925,7 +4226,9 @@ mod tests {
             handoff: None,
             message: "The web checks need another pass.".to_string(),
             detail: Some("deno task test:web failed".to_string()),
-            evidence_ids: vec!["check:web-test".to_string()],
+            evidence: vec![EvidenceRef::Check {
+                check_id: "web-test".to_string(),
+            }],
             nesting_depth: None,
             timestamp_ms: None,
         });
@@ -3938,12 +4241,102 @@ mod tests {
                 tone: TeamMessageTone::Warning,
                 message,
                 detail: Some(detail),
-                evidence_ids,
+                evidence,
                 ..
             } if message == "The web checks need another pass."
                 && detail == "deno task test:web failed"
-                && evidence_ids == vec!["check:web-test"]
+                && evidence
+                    == vec![EvidenceRef::Check {
+                        check_id: "web-test".to_string()
+                    }]
         ));
+    }
+
+    #[test]
+    fn team_messages_embed_typed_check_and_commit_evidence() {
+        let history = vec![
+            EventEnvelope::new(AgentEvent::CheckResult {
+                check_id: "web-tests".to_string(),
+                exit_status: 0,
+                success: true,
+                timed_out: false,
+                output: "112 tests passed".to_string(),
+                truncated: false,
+                duration_ms: 250,
+                fingerprint: "check-fingerprint".to_string(),
+                command: Some("deno task test:web".to_string()),
+                cwd: Some("/workspace".to_string()),
+                executor: Some("local".to_string()),
+                source: None,
+                command_fingerprint: None,
+                dependency_outputs: BTreeMap::new(),
+                output_fingerprint: None,
+                reused: false,
+                skip_reason: None,
+                nesting_depth: None,
+                timestamp_ms: Some(1),
+            }),
+            EventEnvelope::new(AgentEvent::CommitResult {
+                success: true,
+                created: true,
+                reused: false,
+                oid: Some("abc123".to_string()),
+                subject: Some("fix: strengthen event boundary".to_string()),
+                changed_paths: vec!["src/events.rs".to_string()],
+                detail: "created commit".to_string(),
+                nesting_depth: None,
+                timestamp_ms: Some(2),
+            }),
+        ];
+        let mut envelope = EventEnvelope::new(AgentEvent::TeamMessage {
+            actor: TeamActor::workflow_steward(),
+            tone: TeamMessageTone::Success,
+            purpose: TeamMessagePurpose::HandoffOutcome,
+            handoff: None,
+            message: "The boundary is ready.".to_string(),
+            detail: None,
+            evidence: vec![
+                EvidenceRef::Check {
+                    check_id: "web-tests".to_string(),
+                },
+                EvidenceRef::Commit {
+                    oid: "abc123".to_string(),
+                },
+            ],
+            nesting_depth: None,
+            timestamp_ms: Some(3),
+        });
+        envelope.refresh_projections(&history);
+
+        assert!(matches!(
+            &envelope.evidence[0],
+            EventEvidence::Check(check)
+                if check.check_id == "web-tests"
+                    && check.command.as_deref() == Some("deno task test:web")
+        ));
+        assert!(matches!(
+            &envelope.evidence[1],
+            EventEvidence::Commit(commit)
+                if commit.oid.as_deref() == Some("abc123")
+                    && commit.subject.as_deref() == Some("fix: strengthen event boundary")
+        ));
+        envelope.validate_persisted().unwrap();
+    }
+
+    #[test]
+    fn persisted_projection_validation_rejects_missing_required_chatter() {
+        let mut envelope = EventEnvelope::new(AgentEvent::Correction {
+            kind: CorrectionKind::RepositoryEvidence,
+            message: "technical detail".to_string(),
+            summary: "Repository evidence".to_string(),
+            actor: TeamActor::workflow_steward(),
+            assisting_profile: Some(AgentProfile::Review),
+            nesting_depth: None,
+            timestamp_ms: Some(1),
+        });
+        envelope.chatter.clear();
+
+        assert!(envelope.validate_persisted().is_err());
     }
 
     #[test]
@@ -4091,7 +4484,7 @@ mod tests {
             }),
             EventEnvelope::new(AgentEvent::SessionSummary {
                 branch: "main".to_string(),
-                commits: String::new(),
+                commits: Vec::new(),
                 reached_final: true,
                 contract_status: ContractStatus::Satisfied,
                 verified_completed: true,
@@ -4251,7 +4644,7 @@ mod tests {
             handoff: None,
             message: "Checking the web app.".to_string(),
             detail: None,
-            evidence_ids: Vec::new(),
+            evidence: Vec::new(),
             nesting_depth: None,
             timestamp_ms: None,
         });
@@ -4264,7 +4657,7 @@ mod tests {
                 handoff: Some(summary),
                 message: "The web app is ready.".to_string(),
                 detail: None,
-                evidence_ids: Vec::new(),
+                evidence: Vec::new(),
                 nesting_depth: None,
                 timestamp_ms: None,
             },

@@ -311,8 +311,11 @@ compatibility mode and works in the registered repository itself, so another edi
 change those files while a task is running. Content fingerprints prevent stale review or commit
 evidence from being accepted, but they are conflict detection rather than filesystem isolation.
 
-Persisted sessions and their events must use the current v2 schemas. Incompatible development-era
+Persisted sessions and their events must use the current v3 schemas. Incompatible development-era
 notes are skipped during restoration instead of being migrated or shown with guessed attribution.
+The current schema stores the session start time, Trinity's authored chatter, structured commit
+summaries, and typed check/commit evidence directly so the terminal and browser show the same team
+conversation without reconstructing it from nearby events.
 
 If a file is missing, binary, symlinked, stale, oversized, or cannot fit the bounded prompt safely,
 pb does not pretend it was read. The normal model/tool path remains available. Automatic deletion
