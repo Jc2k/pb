@@ -17,14 +17,12 @@ import {
   toolResultForCall,
 } from "../lib/helpers";
 import {
-  artifactValidationProblem,
   errorSummary,
   getToolDetail,
   harnessEfficiencyStats,
   profileJobTitle,
   profileName,
   TODO_STATUS_LABELS,
-  trinityCorrectionCopy,
   trustedSessionSummaryCommitLines,
 } from "../lib/sessionUtils";
 import type {
@@ -648,35 +646,19 @@ function ErrorEventBubble({
 }
 
 function CorrectionNotice({
-  event,
-  fallbackProfile,
+  envelope,
   showIdentity = true,
 }: {
-  event: Extract<AgentEvent, { type: "correction" }>;
-  fallbackProfile?: string;
+  envelope: EventEnvelope;
   showIdentity?: boolean;
 }) {
-  const teammate = teamActorPresentation(event.actor || workflowStewardActor());
-  const assistedName = event.assisting_profile
-    ? profileName(event.assisting_profile)
-    : fallbackProfile
-    ? profileName(fallbackProfile)
-    : event.message.includes("Planning")
-    ? profileName("plan")
-    : "the model";
-  const assistedProfile = event.assisting_profile || fallbackProfile;
-  const artifactLabel = assistedProfile === "build"
-    ? "implementation report"
-    : assistedProfile === "review"
-    ? "review"
-    : "plan";
-  const copy = trinityCorrectionCopy(
-    event.summary,
-    event.message,
-    assistedName,
-    artifactLabel,
-  );
-  const technicalDetail = prettyTechnicalDetail(event.message);
+  const event = envelope.event;
+  if (event.type !== "correction") return null;
+  const copy = envelope.chatter?.find(({ audience }) => audience === "team");
+  const actor = copy?.actor || event.actor || workflowStewardActor();
+  const teammate = teamActorPresentation(actor);
+  const message = copy?.message || "Trinity has an update for this task.";
+  const technicalDetail = prettyTechnicalDetail(copy?.detail || event.message);
 
   return (
     <article
@@ -703,10 +685,10 @@ function CorrectionNotice({
           title={`${teammate.name} correction evidence`}
           teammateName={teammate.name}
         >
-          {copy.headline
+          {copy?.headline
             ? <strong className="feedback-heading">{copy.headline}</strong>
             : null}
-          <RichText content={copy.message} />
+          <RichText content={message} />
         </TechnicalDetailsBubble>
       </div>
       <MessageTime timestampMs={event.timestamp_ms} />
@@ -717,77 +699,21 @@ function CorrectionNotice({
 function WorkflowBlockedNotice({
   event,
   envelope,
-  events,
   showIdentity = true,
 }: {
   event: Extract<AgentEvent, { type: "workflow_blocked" }>;
   envelope: EventEnvelope;
-  events: EventEnvelope[];
   showIdentity?: boolean;
 }) {
-  const teammate = teamActorPresentation(workflowStewardActor());
-  const eventIndex = events.indexOf(envelope);
-  const priorEvents = events.slice(0, eventIndex < 0 ? 0 : eventIndex);
-  const recentEvents = priorEvents.slice(-5);
-  const repeatedAction = [...recentEvents]
-    .reverse()
-    .find((candidate) =>
-      candidate.event.type === "correction" &&
-      (candidate.event.summary === "Repeated tool call detected" ||
-        candidate.event.summary === "Repeated tool call blocked" ||
-        candidate.event.summary?.includes("repeated the same action") ===
-          true ||
-        candidate.event.summary?.includes("reached the repeat limit") === true)
-    );
-  let recentProfile: string | undefined;
-  for (let index = priorEvents.length - 1; index >= 0; index--) {
-    const candidate = priorEvents[index].event;
-    if (candidate.type === "llm_invocation" || candidate.type === "reasoning") {
-      recentProfile = candidate.profile;
-      break;
-    }
-    if (candidate.type === "tool_call" && candidate.actor?.kind === "agent") {
-      recentProfile = candidate.actor.id;
-      break;
-    }
-  }
-  const repeatedProfile = repeatedAction?.event.type === "correction"
-    ? repeatedAction.event.assisting_profile || recentProfile
-    : recentProfile;
-  const repeatedName = repeatedProfile
-    ? profileName(repeatedProfile)
-    : "A teammate";
-  const repeatedFirstName = repeatedName.split(/\s+/, 1)[0];
-  const planningFirstName = profileName("plan").split(/\s+/, 1)[0];
-  const priorToolCalls = priorEvents.filter((candidate) =>
-    candidate.event.type === "tool_call"
+  const teammateFeedback = envelope.chatter?.find(
+    ({ audience }) => audience === "team",
   );
-  const latestToolCall = priorToolCalls.at(-1)?.event;
-  const repeatedToolCall = latestToolCall?.type === "tool_call" &&
-      priorToolCalls.slice(0, -1).some((candidate) =>
-        candidate.event.type === "tool_call" &&
-        candidate.event.tool === latestToolCall.tool &&
-        JSON.stringify(candidate.event.arguments) ===
-          JSON.stringify(latestToolCall.arguments)
-      )
-    ? latestToolCall
-    : undefined;
-  const repeatedPath = repeatedToolCall?.arguments &&
-      typeof repeatedToolCall.arguments === "object" &&
-      "path" in repeatedToolCall.arguments &&
-      typeof repeatedToolCall.arguments.path === "string"
-    ? repeatedToolCall.arguments.path
-    : undefined;
-  const planningFailure = event.outcome === "plan_rejected" ||
-    event.reason.toLowerCase().includes("planning submission");
-  const gitControlChanged = event.reason.includes("changed Git control state");
-  const repositoryContentChanged = event.reason.includes(
-    "repository content changed while the read-only",
+  const userFeedback = envelope.chatter?.find(
+    ({ audience }) => audience === "current_user",
   );
-  const repeatLimit = event.reason.includes("deterministic repeat limit");
-  const executorUnavailable = event.outcome === "executor_unavailable";
-  const needsCurrentFilesRestart = gitControlChanged ||
-    repositoryContentChanged || event.outcome === "commit_blocked";
+  const teammate = teamActorPresentation(
+    teammateFeedback?.actor || workflowStewardActor(),
+  );
   const [currentUsername, setCurrentUsername] = useState<string>();
 
   useEffect(() => {
@@ -806,31 +732,15 @@ function WorkflowBlockedNotice({
     return () => controller.abort();
   }, []);
 
-  const teammateMessage = planningFailure
-    ? `${planningFirstName}, your plan was rejected after three attempts. ${
-      artifactValidationProblem(event.reason)
-    } Nothing changed, and this delivery is now on hold.`
-    : gitControlChanged && repeatedAction
-    ? `${repeatedFirstName}, you repeated the same action while the repository’s Git state was changing. I blocked the duplicate and put this delivery on hold so we would not commit or overwrite somebody else’s work.`
-    : gitControlChanged
-    ? "Team, I put this delivery on hold because the repository’s Git state changed during the pass. I preserved the current files so we would not commit or overwrite somebody else’s work."
-    : repositoryContentChanged
-    ? "Team, I put this delivery on hold because the project changed while you were reviewing an earlier snapshot. I kept that review tied to its exact files rather than risk overwriting the newer work."
-    : repeatLimit
-    ? repeatedPath
-      ? `${repeatedFirstName}, \`${repeatedPath}\` does not exist. You tried to read it again after I flagged that, then repeated the same action once more. I blocked that last attempt, so your review—and this delivery—are now on hold.`
-      : `${repeatedFirstName}, you repeated the same action after I flagged the failure. I blocked the duplicate, so your task—and this delivery—are now on hold.`
-    : executorUnavailable
-    ? "Team, this delivery is on hold because a required executor is unavailable. I preserved the current work so you can continue once that prerequisite is restored."
-    : "Team, I put this delivery on hold at a safe boundary because the reported problem needs a different approach.";
-  const userRequest = needsCurrentFilesRestart
-    ? "restart this delivery with the current files so the team can plan against the right project state"
-    : executorUnavailable
-    ? "restore the missing prerequisite, then resume this delivery"
-    : "start a follow-up task here and add any context that could help the team find a different way forward";
-  const userMessage = currentUsername
-    ? `@${currentUsername}, can you ${userRequest}?`
-    : `Can you ${userRequest}?`;
+  const teammateMessage = teammateFeedback?.message ||
+    "Team, this delivery is on hold at a safe boundary because the reported problem needs a different approach.";
+  const requestMessage = userFeedback?.message ||
+    "Can you start a follow-up task here and add any context that could help the team find a different way forward?";
+  const userMessage = currentUsername && userFeedback
+    ? `@${currentUsername}, ${requestMessage.charAt(0).toLocaleLowerCase()}${
+      requestMessage.slice(1)
+    }`
+    : requestMessage;
 
   return (
     <>
@@ -855,9 +765,7 @@ function WorkflowBlockedNotice({
           <TechnicalDetailsBubble
             className="correction-bubble"
             detail={prettyTechnicalDetail(
-              repeatedAction?.event.type === "correction"
-                ? `${repeatedAction.event.message}\n${event.reason}`
-                : event.reason,
+              teammateFeedback?.detail || event.reason,
             )}
             title="Why this task is on hold"
             teammateName={teammate.name}
@@ -2166,28 +2074,6 @@ export function MessageBubble({
   showIdentity?: boolean;
 }) {
   const e = envelope.event;
-  const nearestPriorProfile = () => {
-    const eventIndex = evidenceEvents.indexOf(envelope);
-    const prior = evidenceEvents.slice(0, eventIndex < 0 ? 0 : eventIndex);
-    for (let index = prior.length - 1; index >= 0; index--) {
-      const candidate = prior[index].event;
-      if (
-        candidate.type === "llm_invocation" ||
-        candidate.type === "reasoning" ||
-        candidate.type === "final" ||
-        candidate.type === "started"
-      ) {
-        return candidate.profile;
-      }
-      if (
-        candidate.type === "tool_call" &&
-        candidate.actor?.kind === "agent"
-      ) {
-        return candidate.actor.id;
-      }
-    }
-    return activityProfile;
-  };
 
   switch (e.type) {
     case "started":
@@ -2218,14 +2104,17 @@ export function MessageBubble({
       const label = e.type === "model_loading"
         ? "Loading model"
         : `Working step ${e.step} of ${e.max_steps}`;
-      const profile = activityProfile || "build";
       return (
         <article
           className="message-row assistant-message compact typing-row"
           aria-label={label}
         >
           <div className="bot-avatar typing-avatar">
-            <img src={getAvatarForProfile(profile)} alt="" aria-hidden="true" />
+            <img
+              src={getAvatarForProfile(e.profile)}
+              alt=""
+              aria-hidden="true"
+            />
           </div>
           <div className="typing-indicator" aria-hidden="true">
             <span></span>
@@ -2287,7 +2176,6 @@ export function MessageBubble({
         <WorkflowBlockedNotice
           event={e}
           envelope={envelope}
-          events={evidenceEvents}
           showIdentity={showIdentity}
         />
       );
@@ -2308,8 +2196,7 @@ export function MessageBubble({
     case "correction":
       return (
         <CorrectionNotice
-          event={e}
-          fallbackProfile={nearestPriorProfile()}
+          envelope={envelope}
           showIdentity={showIdentity}
         />
       );

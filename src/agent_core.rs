@@ -2706,6 +2706,7 @@ fn run_agent_inner<S: EventSink>(
     sink.emit(AgentEvent::Started {
         task: args.task.clone(),
         model: model_label.clone(),
+        profile: args.profile,
         workspace: workspace_root.display().to_string(),
         focus_root: Some(focus_root.display().to_string()),
         branch: branch.clone(),
@@ -2725,6 +2726,7 @@ fn run_agent_inner<S: EventSink>(
 
     sink.emit(AgentEvent::ModelLoading {
         model: model_label,
+        profile: args.profile,
         nesting_depth: Some(0),
         timestamp_ms: Some(now_millis()),
     });
@@ -7626,6 +7628,7 @@ fn run_agent_steps(
         sink.emit(AgentEvent::StepStarted {
             step,
             max_steps: effective_max_steps,
+            profile: args.profile,
             nesting_depth: (nesting_depth > 0).then_some(nesting_depth),
             timestamp_ms: Some(now_millis()),
         });

@@ -251,7 +251,7 @@ Deno.test("groupActionEvents presents proactive LSP work as Trinity's routine ac
 });
 
 Deno.test("groupActionEvents folds adjacent tool-only inferences by the same teammate into one run", () => {
-  const actor = { kind: "agent" as const, id: "plan" };
+  const actor = { kind: "agent", id: "plan" } as const;
   const inference = (step: number): EventEnvelope => ({
     version: "1",
     event: {
@@ -409,7 +409,7 @@ Deno.test("groupActionEvents hides timing when a model call produced no visible 
 });
 
 Deno.test("groupActionEvents keeps teammate reasoning visible before its action run", () => {
-  const actor = { kind: "agent" as const, id: "build" };
+  const actor = { kind: "agent", id: "build" } as const;
   const events: EventEnvelope[] = [
     {
       version: "1",
@@ -465,7 +465,7 @@ Deno.test("groupActionEvents keeps teammate reasoning visible before its action 
 });
 
 Deno.test("groupActionEvents correlates reordered identical tools across intervening messages", () => {
-  const actor = { kind: "agent" as const, id: "build" };
+  const actor = { kind: "agent", id: "build" } as const;
   const callA: EventEnvelope = {
     version: "1",
     event: {

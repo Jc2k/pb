@@ -23,7 +23,8 @@ browser (`pb serve`) ─────┘          │                            
 
 The terminal and web application are adapters over the same session model. The service exposes an
 HTTP/SSE interface to the browser and a local Unix-socket RPC interface to the CLI. Both surfaces
-render the same typed events and can reconnect to the same persisted session.
+render the same typed events and server-authored teammate chatter, and can reconnect to the same
+persisted session.
 
 ## Component responsibilities
 

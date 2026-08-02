@@ -1,6 +1,7 @@
-use crate::events::{AgentEvent, TeamActor};
+use crate::events::{AgentEvent, EventChatter, EventEnvelope, TeamActor};
 
-pub fn render_event(event: &AgentEvent) {
+pub fn render_event(envelope: &EventEnvelope) {
+    let event = &envelope.event;
     match event {
         AgentEvent::Started {
             task,
@@ -131,7 +132,13 @@ pub fn render_event(event: &AgentEvent) {
         }
         AgentEvent::WorkflowBlocked {
             outcome, reason, ..
-        } => print_header("workflow blocked", &format!("{outcome:?}: {reason}")),
+        } => {
+            if envelope.chatter.is_empty() {
+                print_header("workflow blocked", &format!("{outcome:?}: {reason}"));
+            } else {
+                render_chatter(&envelope.chatter);
+            }
+        }
         AgentEvent::WorkflowCompleted { outcome, .. } => {
             print_header("workflow", &format!("completed: {outcome:?}"));
         }
@@ -334,15 +341,19 @@ pub fn render_event(event: &AgentEvent) {
             message,
             ..
         } => {
-            let body = if summary.trim().is_empty() {
-                message
+            if envelope.chatter.is_empty() {
+                let body = if summary.trim().is_empty() {
+                    message
+                } else {
+                    summary
+                };
+                print_header(
+                    &format!("{} · harness correction", actor.display_name()),
+                    body,
+                );
             } else {
-                summary
-            };
-            print_header(
-                &format!("{} · harness correction", actor.display_name()),
-                body,
-            );
+                render_chatter(&envelope.chatter);
+            }
         }
         AgentEvent::SubAgentStarted {
             profile,
@@ -557,6 +568,16 @@ pub fn render_event(event: &AgentEvent) {
             ),
         ),
         AgentEvent::Error { message, .. } => eprintln!("error: {message}"),
+    }
+}
+
+fn render_chatter(messages: &[EventChatter]) {
+    for message in messages {
+        let body = message.headline.as_ref().map_or_else(
+            || message.message.clone(),
+            |headline| format!("{headline}\n{}", message.message),
+        );
+        print_block(&actor_message_label(message.actor), &body);
     }
 }
 

@@ -81,8 +81,10 @@ process also creates a local Unix socket used by `pb queue`.
 pb queue "Add validation for empty project names" --workdir /path/to/project
 ```
 
-The terminal streams the same typed events shown in the web interface. You can list or reattach to
-daemon sessions without starting a second run:
+The terminal streams the same typed events and teammate chatter shown in the web interface,
+including Trinity's plain-language corrections and on-hold handoffs. Raw evidence remains available
+to the web interface as progressive technical detail. You can list or reattach to daemon sessions
+without starting a second run:
 
 ```bash
 pb queue --list

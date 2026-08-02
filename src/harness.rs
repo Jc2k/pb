@@ -225,6 +225,7 @@ struct CapturedSummary {
 struct JournalState {
     cumulative_writer: BufWriter<File>,
     run_writer: BufWriter<File>,
+    events: Vec<EventEnvelope>,
     observations: Vec<Observation>,
     summary: CapturedSummary,
     audit: HarnessRunAudit,
@@ -264,6 +265,7 @@ impl HarnessEventSink {
             state: Arc::new(Mutex::new(JournalState {
                 cumulative_writer: BufWriter::new(cumulative_file),
                 run_writer: BufWriter::new(run_file),
+                events: Vec::new(),
                 observations: Vec::new(),
                 summary: CapturedSummary::default(),
                 audit: HarnessRunAudit::default(),
@@ -323,13 +325,15 @@ impl HarnessEventSink {
 
 impl EventSink for HarnessEventSink {
     fn emit(&mut self, event: AgentEvent) {
-        render_event(&event);
         let Ok(mut state) = self.state.lock() else {
             eprintln!("pb harness: event journal lock was poisoned");
             return;
         };
+        let mut envelope = EventEnvelope::new(event);
+        envelope.refresh_projections(&state.events);
+        render_event(&envelope);
 
-        match &event {
+        match &envelope.event {
             AgentEvent::Started { branch, .. } => {
                 state.summary.branch = branch.clone();
             }
@@ -554,7 +558,6 @@ impl EventSink for HarnessEventSink {
         if state.write_error.is_some() {
             return;
         }
-        let envelope = EventEnvelope::new(event);
         let encoded = match serde_json::to_vec(&envelope) {
             Ok(encoded) => encoded,
             Err(error) => {
@@ -572,6 +575,7 @@ impl EventSink for HarnessEventSink {
         if !write_errors.is_empty() {
             state.write_error = Some(write_errors.join("; "));
         }
+        state.events.push(envelope);
     }
 
     fn checkpoint_workflow(
@@ -3753,6 +3757,7 @@ mod tests {
         emitter.emit(AgentEvent::Started {
             task: "task".to_string(),
             model: "model".to_string(),
+            profile: crate::agent_core::AgentProfile::Build,
             workspace: "/tmp/workspace".to_string(),
             focus_root: Some("/tmp/workspace".to_string()),
             branch: "pb/task-harness-1".to_string(),
@@ -4100,6 +4105,7 @@ mod tests {
         emitter.emit(AgentEvent::Started {
             task: task.to_string(),
             model: "scripted".to_string(),
+            profile: crate::agent_core::AgentProfile::Build,
             workspace: layout.workspace.display().to_string(),
             focus_root: Some(layout.workspace.display().to_string()),
             branch: branch.to_string(),

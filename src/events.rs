@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
+
+use regex::Regex;
 
 use crate::agent_core::{AgentProfile, SessionAttachment};
 use crate::inference::PromptCacheMissReason;
@@ -119,6 +122,62 @@ pub enum TeamMessageTone {
     Success,
     Warning,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatterAudience {
+    #[default]
+    Team,
+    CurrentUser,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventChatter {
+    pub actor: TeamActor,
+    pub tone: TeamMessageTone,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headline: Option<String>,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub audience: ChatterAudience,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptVisibility {
+    Visible,
+    EvidenceOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptKind {
+    Correction,
+    RepeatedToolDetected,
+    RepeatedToolCorrection,
+    NoProgressCorrection,
+    DependentToolBatchCorrection,
+    HandoffCorrection,
+    WorkflowClosureCheckpoint,
+    WorkUnitProgress,
+    TerminalToolLoopError,
+    WorkflowBlocked,
+    SessionSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptMetadata {
+    pub visibility: TranscriptVisibility,
+    pub kind: TranscriptKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_action_key: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub summary_redundant: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -586,6 +645,8 @@ pub enum AgentEvent {
     Started {
         task: String,
         model: String,
+        #[serde(default)]
+        profile: AgentProfile,
         workspace: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         focus_root: Option<String>,
@@ -813,6 +874,8 @@ pub enum AgentEvent {
     StepStarted {
         step: usize,
         max_steps: usize,
+        #[serde(default)]
+        profile: AgentProfile,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -820,6 +883,8 @@ pub enum AgentEvent {
     },
     ModelLoading {
         model: String,
+        #[serde(default)]
+        profile: AgentProfile,
         #[serde(skip_serializing_if = "Option::is_none")]
         nesting_depth: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1024,6 +1089,8 @@ pub enum AgentEvent {
         question: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         choices: Vec<String>,
+        #[serde(default)]
+        profile: AgentProfile,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
@@ -1230,22 +1297,36 @@ fn is_false(value: &bool) -> bool {
 pub struct EventEnvelope {
     pub version: String,
     pub event: AgentEvent,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chatter: Vec<EventChatter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<TranscriptMetadata>,
 }
 
 impl EventEnvelope {
     pub fn new(event: AgentEvent) -> Self {
-        Self {
+        let mut envelope = Self {
             version: EVENT_SCHEMA_VERSION.to_string(),
             event,
-        }
+            chatter: Vec::new(),
+            transcript: None,
+        };
+        envelope.refresh_projections(&[]);
+        envelope
+    }
+
+    pub fn refresh_projections(&mut self, history: &[EventEnvelope]) {
+        self.chatter = chatter_for_event(&self.event, history);
+        self.transcript = transcript_metadata_for_event(&self.event, history);
     }
 
     pub fn with_timestamp(event: AgentEvent) -> Self {
         let now = now_millis();
-        match event {
+        let mut envelope = match event {
             AgentEvent::Started {
                 task,
                 model,
+                profile,
                 workspace,
                 focus_root,
                 branch,
@@ -1253,9 +1334,12 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::Started {
                     task,
                     model,
+                    profile,
                     workspace,
                     focus_root,
                     branch,
@@ -1268,6 +1352,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::HarnessExperimentConfigured {
                     observation_rendering,
                     timestamp_ms: Some(now),
@@ -1280,6 +1366,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::ConversationTurnStarted {
                     turn_id,
                     intent,
@@ -1294,6 +1382,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::DeliveryProposed {
                     proposal_id,
                     source_turn_id,
@@ -1498,6 +1588,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::WorkflowStarted {
                     workflow_id,
                     source_turn_id,
@@ -1512,6 +1604,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::WorkflowResumed {
                     workflow_id,
                     stage,
@@ -1523,6 +1617,8 @@ impl EventEnvelope {
                 workflow_id, stage, ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::WorkflowStageStarted {
                     workflow_id,
                     stage,
@@ -1537,6 +1633,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::WorkflowArtifactAccepted {
                     workflow_id,
                     artifact_kind,
@@ -1553,6 +1651,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::WorkflowChallengeRaised {
                     workflow_id,
                     challenge_id,
@@ -1569,6 +1669,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::WorkflowEvidenceInvalidated {
                     workflow_id,
                     previous_fingerprint,
@@ -1581,6 +1683,8 @@ impl EventEnvelope {
                 workflow_id, stage, ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::WorkflowStageCompleted {
                     workflow_id,
                     stage,
@@ -1594,6 +1698,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::WorkflowBlocked {
                     workflow_id,
                     outcome,
@@ -1609,6 +1715,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::WorkflowCompleted {
                     workflow_id,
                     outcome,
@@ -1620,25 +1728,33 @@ impl EventEnvelope {
             AgentEvent::StepStarted {
                 step,
                 max_steps,
+                profile,
                 nesting_depth,
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::StepStarted {
                     step,
                     max_steps,
+                    profile,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },
             },
             AgentEvent::ModelLoading {
                 model,
+                profile,
                 nesting_depth,
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::ModelLoading {
                     model,
+                    profile,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },
@@ -1650,6 +1766,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::Reasoning {
                     content,
                     profile,
@@ -1667,6 +1785,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::ToolCall {
                     tool,
                     arguments,
@@ -1685,6 +1805,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::ControllerObservation {
                     receipt,
                     actor,
@@ -1703,6 +1825,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::ControllerClosure {
                     workflow_id,
                     stage,
@@ -1721,6 +1845,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::ControllerMutation {
                     receipt,
                     actor,
@@ -1739,6 +1865,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::ToolBatch {
                     call_count,
                     parallel_safe_count,
@@ -1765,6 +1893,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::ToolResult {
                     tool,
                     result,
@@ -1792,6 +1922,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::ContextLimit {
                     context_capacity,
                     reserved_generation_tokens,
@@ -1811,6 +1943,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::ExecutorStarted {
                     executor_id,
                     kind,
@@ -1841,6 +1975,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::CheckResult {
                     check_id,
                     exit_status,
@@ -1873,6 +2009,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::TeamMessage {
                     actor,
                     tone,
@@ -1889,6 +2027,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::HandoffSummary {
                     summary,
                     nesting_depth,
@@ -1907,6 +2047,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::CommitResult {
                     success,
                     created,
@@ -1923,13 +2065,17 @@ impl EventEnvelope {
                 question_id,
                 question,
                 choices,
+                profile,
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::UserQuestion {
                     question_id,
                     question,
                     choices,
+                    profile,
                     timestamp_ms: Some(now),
                 },
             },
@@ -1939,6 +2085,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::UserAnswer {
                     question_id,
                     answer,
@@ -1951,6 +2099,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::UserMessage {
                     message_id,
                     message,
@@ -1959,6 +2109,8 @@ impl EventEnvelope {
             },
             AgentEvent::UserMessageApplied { message_id, .. } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::UserMessageApplied {
                     message_id,
                     timestamp_ms: Some(now),
@@ -1973,6 +2125,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::Correction {
                     message,
                     summary,
@@ -1989,6 +2143,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::SubAgentStarted {
                     profile,
                     task,
@@ -2003,6 +2159,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::SubAgentFinished {
                     profile,
                     result,
@@ -2017,6 +2175,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::Diff {
                     path,
                     diff,
@@ -2031,6 +2191,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::Final {
                     content,
                     profile,
@@ -2045,6 +2207,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::FinalGrace {
                     status,
                     detail,
@@ -2070,6 +2234,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::LlmInvocation {
                     step,
                     purpose,
@@ -2122,6 +2288,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::SessionMetrics {
                     llm_invocations,
                     llm_runtime_ms,
@@ -2158,6 +2326,8 @@ impl EventEnvelope {
             },
             AgentEvent::SessionTitle { title, .. } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::SessionTitle {
                     title,
                     timestamp_ms: Some(now),
@@ -2178,6 +2348,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::SessionSummary {
                     branch,
                     commits,
@@ -2200,6 +2372,8 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::Error {
                     message,
                     summary,
@@ -2213,14 +2387,768 @@ impl EventEnvelope {
                 ..
             } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
+                chatter: Vec::new(),
+                transcript: None,
                 event: AgentEvent::SemanticGate {
                     receipt,
                     nesting_depth,
                     timestamp_ms: Some(now),
                 },
             },
+        };
+        envelope.refresh_projections(&[]);
+        envelope
+    }
+}
+
+pub fn refresh_event_projections(events: &mut [EventEnvelope]) {
+    for index in 0..events.len() {
+        let (history, current_and_rest) = events.split_at_mut(index);
+        if let Some(current) = current_and_rest.first_mut() {
+            current.refresh_projections(history);
         }
     }
+}
+
+fn transcript_metadata_for_event(
+    event: &AgentEvent,
+    history: &[EventEnvelope],
+) -> Option<TranscriptMetadata> {
+    let (visibility, kind, dedupe_key, related_action_key, summary_redundant) = match event {
+        AgentEvent::Correction {
+            message, summary, ..
+        } => {
+            let visibility = if matches!(
+                summary.as_str(),
+                "Acceptance contract rejected final response"
+                    | "Completion gate blocked final response"
+                    | "The handoff teammate returned failed checks for repair"
+                    | "Workflow closure checkpoint"
+                    | "Work-unit progress earned one bounded turn"
+            ) {
+                TranscriptVisibility::EvidenceOnly
+            } else {
+                TranscriptVisibility::Visible
+            };
+            let kind = match summary.as_str() {
+                "Acceptance contract rejected final response"
+                | "Completion gate blocked final response"
+                | "The handoff teammate returned failed checks for repair" => {
+                    TranscriptKind::HandoffCorrection
+                }
+                "Workflow closure checkpoint" => TranscriptKind::WorkflowClosureCheckpoint,
+                "Work-unit progress earned one bounded turn" => TranscriptKind::WorkUnitProgress,
+                "Repeated tool call detected" => TranscriptKind::RepeatedToolDetected,
+                "No-progress tool outcome detected" => TranscriptKind::NoProgressCorrection,
+                "Dependent tool batch rejected" => TranscriptKind::DependentToolBatchCorrection,
+                _ if summary == "Repeated tool call blocked"
+                    || summary.contains("repeated the same action")
+                    || summary.contains("reached the repeat limit") =>
+                {
+                    TranscriptKind::RepeatedToolCorrection
+                }
+                _ => TranscriptKind::Correction,
+            };
+            let dedupe_key = correction_dedupe_key(summary, message);
+            let related_action_key = dedupe_key
+                .as_ref()
+                .and_then(|_| latest_tool_action_key(history));
+            (visibility, kind, dedupe_key, related_action_key, false)
+        }
+        AgentEvent::Error { summary, .. }
+            if summary == "Deterministic tool loop"
+                || summary == "No-progress tool loop"
+                || summary.contains("reached the repeat limit") =>
+        {
+            (
+                TranscriptVisibility::Visible,
+                TranscriptKind::TerminalToolLoopError,
+                None,
+                None,
+                false,
+            )
+        }
+        AgentEvent::WorkflowBlocked { .. } => (
+            TranscriptVisibility::Visible,
+            TranscriptKind::WorkflowBlocked,
+            None,
+            None,
+            false,
+        ),
+        AgentEvent::SessionSummary { summary, .. } => (
+            TranscriptVisibility::Visible,
+            TranscriptKind::SessionSummary,
+            None,
+            None,
+            session_summary_is_redundant(summary, history),
+        ),
+        _ => return None,
+    };
+    Some(TranscriptMetadata {
+        visibility,
+        kind,
+        dedupe_key,
+        related_action_key,
+        summary_redundant,
+    })
+}
+
+fn latest_tool_action_key(history: &[EventEnvelope]) -> Option<String> {
+    history.iter().rev().find_map(|envelope| {
+        let AgentEvent::ToolCall {
+            tool, arguments, ..
+        } = &envelope.event
+        else {
+            return None;
+        };
+        Some(format!(
+            "tool:{tool}:{}",
+            crate::agent_context::normalized_arguments_sha256(arguments)
+        ))
+    })
+}
+
+fn session_summary_is_redundant(summary: &str, history: &[EventEnvelope]) -> bool {
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return false;
+    }
+    let latest_final = history.iter().rev().find_map(|envelope| {
+        let AgentEvent::Final { content, .. } = &envelope.event else {
+            return None;
+        };
+        Some(content.trim())
+    });
+    let latest_workflow_block = history.iter().rev().find_map(|envelope| {
+        let AgentEvent::WorkflowBlocked { reason, .. } = &envelope.event else {
+            return None;
+        };
+        Some(reason.trim())
+    });
+    latest_final == Some(summary) || latest_workflow_block == Some(summary)
+}
+
+fn correction_dedupe_key(summary: &str, detail: &str) -> Option<String> {
+    if let Ok(failure) = serde_json::from_str::<Value>(detail)
+        && failure.get("type").and_then(Value::as_str) == Some("tool_failure")
+        && let (Some(tool), Some(message)) = (
+            failure.get("tool").and_then(Value::as_str),
+            failure.get("message").and_then(Value::as_str),
+        )
+    {
+        return Some(
+            extract_quoted_after(message, "failed to resolve path '").map_or_else(
+                || format!("tool_failure:{tool}:{message}"),
+                |path| format!("tool_failure:{tool}:missing:{path}"),
+            ),
+        );
+    }
+    (!summary.trim().is_empty()).then(|| format!("correction:{}", summary.trim()))
+}
+
+fn chatter_for_event(event: &AgentEvent, history: &[EventEnvelope]) -> Vec<EventChatter> {
+    match event {
+        AgentEvent::Correction {
+            message,
+            summary,
+            actor,
+            assisting_profile,
+            ..
+        } => vec![correction_chatter(
+            *actor,
+            *assisting_profile,
+            summary,
+            message,
+            history,
+        )],
+        AgentEvent::WorkflowBlocked {
+            outcome, reason, ..
+        } => workflow_blocked_chatter(*outcome, reason, history),
+        _ => Vec::new(),
+    }
+}
+
+fn latest_agent_profile(history: &[EventEnvelope]) -> Option<AgentProfile> {
+    history
+        .iter()
+        .rev()
+        .find_map(|envelope| match &envelope.event {
+            AgentEvent::LlmInvocation {
+                profile: Some(profile),
+                ..
+            }
+            | AgentEvent::StepStarted { profile, .. }
+            | AgentEvent::ModelLoading { profile, .. }
+            | AgentEvent::Reasoning { profile, .. }
+            | AgentEvent::Final { profile, .. }
+            | AgentEvent::Started { profile, .. } => Some(*profile),
+            AgentEvent::ToolCall {
+                actor: Some(TeamActor::Agent(profile)),
+                ..
+            } => Some(*profile),
+            _ => None,
+        })
+}
+
+fn first_name(name: &str) -> &str {
+    name.split_whitespace().next().unwrap_or("Teammate")
+}
+
+fn chatter(
+    actor: TeamActor,
+    headline: Option<String>,
+    message: String,
+    detail: Option<String>,
+    audience: ChatterAudience,
+) -> EventChatter {
+    EventChatter {
+        actor,
+        tone: TeamMessageTone::Warning,
+        headline,
+        message,
+        detail,
+        audience,
+    }
+}
+
+fn correction_chatter(
+    actor: TeamActor,
+    assisting_profile: Option<AgentProfile>,
+    summary: &str,
+    detail: &str,
+    history: &[EventEnvelope],
+) -> EventChatter {
+    let profile = assisting_profile
+        .or_else(|| latest_agent_profile(history))
+        .or_else(|| detail.contains("Planning").then_some(AgentProfile::Plan));
+    let teammate_name = profile
+        .map(AgentProfile::teammate_name)
+        .unwrap_or("the model");
+    let teammate_first_name = first_name(teammate_name);
+    let artifact_label = match profile {
+        Some(AgentProfile::Build) => "implementation report",
+        Some(AgentProfile::Review) => "review",
+        _ => "plan",
+    };
+    let normalized_summary = summary.trim();
+
+    let is_artifact_validation = normalized_summary == "Workflow artifact validation failed"
+        || (normalized_summary.starts_with("submit_")
+            && normalized_summary.ends_with(" tool call was not executed successfully")
+            && ["plan", "plan_review", "implementation", "code_review"]
+                .iter()
+                .any(|tool| normalized_summary.starts_with(&format!("submit_{tool} "))));
+    let (headline, message) = if is_artifact_validation {
+        (
+            Some(format!(
+                "{teammate_name}’s {artifact_label} needs another pass"
+            )),
+            format!(
+                "{} I sent it back so you can correct the submission before the team continues.",
+                artifact_validation_problem(detail)
+            ),
+        )
+    } else if let Some(feedback) = tool_failure_feedback(detail, teammate_name) {
+        (None, feedback)
+    } else if normalized_summary == "Task-focused repository evidence" {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, I found the task-relevant code and pulled out the strongest matching sections. Use them to finish the {artifact_label}. If one concrete fact is still missing, read only the relevant lines instead of rereading the whole file."
+            ),
+        )
+    } else if normalized_summary.contains("contract planning evidence")
+        || normalized_summary.contains("contract review evidence")
+        || normalized_summary.contains("proposed-path review evidence")
+    {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, I rechecked the exact code this stage depends on. You have enough evidence now—finish the {artifact_label} instead of rereading broad sections of the repository."
+            ),
+        )
+    } else if normalized_summary == "Active accepted-plan work unit" {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, I picked the next item from the accepted plan and confirmed exactly which file operation it needs. Complete only that item before moving on."
+            ),
+        )
+    } else if normalized_summary == "Next accepted-plan creation work unit" {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, the next planned file does not exist yet. Create it now with one complete write, then move on to the next item."
+            ),
+        )
+    } else if normalized_summary.contains("using host execution") {
+        (
+            None,
+            "This task includes an Apple-only component, so I’m running that part directly on the Mac while keeping the rest of the session isolated."
+                .to_string(),
+        )
+    } else if normalized_summary.contains("CPU-only llama.cpp fallback") {
+        (
+            None,
+            "The preferred model runtime was unavailable, so I’m using the CPU-only model fallback for this session. Responses may take longer."
+                .to_string(),
+        )
+    } else if normalized_summary.contains("reached the repeat limit") {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, you repeated the same action after guidance, so I blocked the duplicate before you spent more time on it. Choose a different approach or report the blocker."
+            ),
+        )
+    } else if normalized_summary == "Repeated tool call detected"
+        || normalized_summary == "Repeated tool call blocked"
+        || normalized_summary.contains("repeated the same action")
+    {
+        let message = repeated_tool_name(detail).map_or_else(
+            || {
+                format!(
+                    "{teammate_first_name}, you repeated the same action, so I blocked the duplicate before it ran. Change approach or report that you are blocked."
+                )
+            },
+            |tool| {
+                format!(
+                    "{teammate_first_name}, you repeated the same `{tool}` call, so I blocked the duplicate before it ran. Change the path or action, or report that you are blocked."
+                )
+            },
+        );
+        (None, message)
+    } else if normalized_summary == "No-progress tool outcome detected" {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, that action returned the same outcome without adding new evidence. I stopped the loop; choose an action that changes the work or report the blocker."
+            ),
+        )
+    } else if normalized_summary == "Dependent tool batch rejected" {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, those tool calls depend on one another, so I did not run them as one batch. Run the prerequisite first, wait for its result, then submit the dependent action."
+            ),
+        )
+    } else if normalized_summary == "Workflow stage submission required" {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, a prose reply will not complete this stage. Submit the {artifact_label} in the required format so the team can continue."
+            ),
+        )
+    } else if normalized_summary == "Teammate action retries exhausted"
+        || normalized_summary.contains("Parse retry limit")
+    {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, your reply still did not form a valid action after several retries, so I stopped the pass instead of letting it loop. Start again with one small, complete action."
+            ),
+        )
+    } else if normalized_summary.contains("Invalid pb JSON action")
+        || normalized_summary.to_lowercase().contains("unparsable")
+    {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, that reply was not a valid action, so nothing ran. Retry with one complete tool call or finish the stage in the required format."
+            ),
+        )
+    } else if normalized_summary.contains("reached the bounded step limit") {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, you reached this pass’s step limit before completing the work, so I stopped it instead of letting it run in circles. Continue with a tighter next action or report the blocker."
+            ),
+        )
+    } else if normalized_summary == "Advisory budget exhausted" {
+        (
+            None,
+            "I skipped the optional step-limit review because its advisory budget was already used. The main work and repository were left unchanged."
+                .to_string(),
+        )
+    } else if normalized_summary == "Requesting missing bounded evidence" {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, the edit stopped before it became a valid action because one small file excerpt is still missing. Read only the lines around that detail, then retry the edit."
+            ),
+        )
+    } else if normalized_summary.contains("truncated action") {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, the action was cut off before it became valid, so nothing ran. Try again once with one concise, complete tool call."
+            ),
+        )
+    } else if normalized_summary.contains("mutation recovery")
+        || normalized_summary.contains("compact atomic mutation")
+        || normalized_summary.contains("constrained mutation")
+    {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, the edit was incomplete and was not executed. I’m giving you one fresh attempt for the smallest complete change; do not repeat the rejected payload."
+            ),
+        )
+    } else if normalized_summary == "Run cancelled" {
+        (
+            None,
+            "This run was cancelled. I preserved the repository and the evidence collected so far."
+                .to_string(),
+        )
+    } else if normalized_summary == "Goal pausing" {
+        (
+            None,
+            "I’m pausing the goal at a safe checkpoint before anyone starts another action."
+                .to_string(),
+        )
+    } else if normalized_summary == "Cancellation requested" {
+        (
+            None,
+            "Cancellation is requested. I’m preserving the repository and the workflow evidence while the current work stops safely."
+                .to_string(),
+        )
+    } else if normalized_summary == "Restarting delivery from current files" {
+        (
+            None,
+            "I kept the earlier plan and review in the transcript, accepted the project’s current files as the new baseline, and started a fresh planning pass."
+                .to_string(),
+        )
+    } else if normalized_summary == "Retrying Task planning" {
+        (
+            None,
+            "I’m retrying task planning from the preserved repository state. No files or commits change until the new workflow begins delivery."
+                .to_string(),
+        )
+    } else if normalized_summary == "Running as one Build" {
+        (
+            None,
+            "I’m keeping the repository as-is and retrying this request as one Build task instead of splitting it into several tasks."
+                .to_string(),
+        )
+    } else if normalized_summary == "Tool not available" {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, that tool is not available in this stage, so the action did not run. Choose one of the available actions or report the blocker."
+            ),
+        )
+    } else if normalized_summary.contains("Task requirements remain") {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, the handoff still leaves part of the user’s request unfinished. I sent the missing requirements back for one focused repair pass."
+            ),
+        )
+    } else if normalized_summary == "Handoff executor unavailable" {
+        (
+            None,
+            "I could not run the final handoff checks because their executor is unavailable. I preserved the work so the checks can be retried when it returns."
+                .to_string(),
+        )
+    } else if normalized_summary == "Handoff commit blocked" {
+        (
+            None,
+            "The final commit was blocked, so I left the completed changes uncommitted and preserved the handoff evidence for review."
+                .to_string(),
+        )
+    } else if normalized_summary.starts_with("Agent terminated:")
+        || normalized_summary.starts_with("Final grace terminated:")
+    {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, your pass ended before it produced a usable result. I preserved every completed action and stopped at the current safe boundary."
+            ),
+        )
+    } else if normalized_summary == "Harness diagnostic preview" {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, I ran an early diagnostic check and found issues you should account for while you complete the current work item."
+            ),
+        )
+    } else if normalized_summary.to_lowercase().contains("diagnostic") {
+        (
+            None,
+            format!(
+                "{teammate_first_name}, the automatic diagnostics found issues that need repair before this stage can continue. Fix the reported problems, then retry the handoff."
+            ),
+        )
+    } else if let Some(excerpt) = correction_excerpt(detail) {
+        (
+            (!normalized_summary.is_empty()).then(|| normalized_summary.to_string()),
+            excerpt,
+        )
+    } else {
+        (
+            Some(if normalized_summary.is_empty() {
+                "Trinity update".to_string()
+            } else {
+                normalized_summary.to_string()
+            }),
+            format!(
+                "{teammate_first_name}, I could not summarize this safely without losing the exact cause. Check the technical details before choosing your next action."
+            ),
+        )
+    };
+
+    chatter(
+        actor,
+        headline,
+        message,
+        Some(detail.to_string()),
+        ChatterAudience::Team,
+    )
+}
+
+fn tool_failure_feedback(detail: &str, teammate_name: &str) -> Option<String> {
+    let failure = serde_json::from_str::<Value>(detail).ok()?;
+    let failure = failure.as_object()?;
+    if failure.get("type")?.as_str()? != "tool_failure" {
+        return None;
+    }
+    let tool = failure.get("tool")?.as_str()?.trim();
+    if tool.is_empty() {
+        return None;
+    }
+    let failure_message = failure
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let problem = extract_quoted_after(failure_message, "failed to resolve path '").map_or_else(
+        || {
+            if failure_message.to_lowercase().contains("permission denied") {
+                "The requested resource could not be accessed.".to_string()
+            } else {
+                "The action failed before it returned a result.".to_string()
+            }
+        },
+        |path| format!("`{path}` does not exist."),
+    );
+    Some(format!(
+        "{}, your call to the `{tool}` tool was not executed successfully. {problem} Fix the mistake, choose a different action, or report the blocker.",
+        first_name(teammate_name)
+    ))
+}
+
+fn extract_quoted_after<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let start = value.find(prefix)? + prefix.len();
+    let remainder = value.get(start..)?;
+    let end = remainder.find('\'')?;
+    remainder.get(..end)
+}
+
+fn repeated_tool_name(detail: &str) -> Option<&str> {
+    detail.lines().find_map(|line| {
+        let line = line.trim().strip_prefix("- ")?;
+        let (tool, _) = line.split_once(" with args")?;
+        (!tool.is_empty()
+            && tool.chars().all(|character| {
+                character == '_' || character == '-' || character.is_alphanumeric()
+            }))
+        .then_some(tool)
+    })
+}
+
+fn artifact_validation_problem(message: &str) -> &'static str {
+    let lower = message.to_lowercase();
+    if lower.contains("requires non-empty requirements, steps, and acceptance") {
+        "The plan was missing its requirements, implementation steps, and acceptance checks."
+    } else if lower.contains("requirements") && lower.contains("acceptance") {
+        "The plan did not include all of the required planning and acceptance information."
+    } else if lower.contains("fingerprint") {
+        "The submission described an older version of the workspace, so it was not safe to accept."
+    } else if lower.contains("revision") && lower.contains("every assessment passes") {
+        "The review asked for changes but marked every review area as passing."
+    } else {
+        "The submission did not match the delivery structure the team needs to continue safely."
+    }
+}
+
+static CORRECTION_PARAGRAPH_BREAK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\n\s*\n").expect("valid paragraph-break regex"));
+static TEMPORARY_PATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:/private)?/tmp/[^\s,;:)]+").expect("valid temporary-path regex")
+});
+static USER_WORKSPACE_PATH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/Users/[^/\s]+/[^\s,;:)]+").expect("valid workspace-path regex"));
+
+fn correction_excerpt(detail: &str) -> Option<String> {
+    let trimmed = detail.trim();
+    if trimmed.is_empty() || trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return None;
+    }
+    let first_paragraph = CORRECTION_PARAGRAPH_BREAK
+        .split(trimmed)
+        .next()
+        .unwrap_or_default();
+    let without_temporary_paths =
+        TEMPORARY_PATH.replace_all(first_paragraph, "the temporary workspace");
+    let without_workspace_paths =
+        USER_WORKSPACE_PATH.replace_all(&without_temporary_paths, "the workspace");
+    let normalized = without_workspace_paths
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let characters = normalized.chars().collect::<Vec<_>>();
+    if characters.len() <= 360 {
+        return Some(normalized);
+    }
+    let end = characters
+        .windows(2)
+        .enumerate()
+        .take(340)
+        .filter_map(|(index, pair)| (pair == ['.', ' ']).then_some(index + 1))
+        .filter(|end| *end >= 120)
+        .next_back()
+        .unwrap_or(340);
+    Some(format!(
+        "{}…",
+        characters[..end].iter().collect::<String>().trim_end()
+    ))
+}
+
+fn workflow_blocked_chatter(
+    outcome: crate::workflow::WorkflowOutcome,
+    reason: &str,
+    history: &[EventEnvelope],
+) -> Vec<EventChatter> {
+    let recent_history = history.iter().rev().take(5).collect::<Vec<_>>();
+    let repeated_action = recent_history.iter().find_map(|envelope| {
+        let AgentEvent::Correction {
+            message,
+            summary,
+            assisting_profile,
+            ..
+        } = &envelope.event
+        else {
+            return None;
+        };
+        (summary == "Repeated tool call detected"
+            || summary == "Repeated tool call blocked"
+            || summary.contains("repeated the same action")
+            || summary.contains("reached the repeat limit"))
+        .then_some((message, *assisting_profile))
+    });
+    let recent_profile = history
+        .iter()
+        .rev()
+        .find_map(|envelope| match &envelope.event {
+            AgentEvent::LlmInvocation {
+                profile: Some(profile),
+                ..
+            }
+            | AgentEvent::StepStarted { profile, .. }
+            | AgentEvent::ModelLoading { profile, .. }
+            | AgentEvent::Reasoning { profile, .. }
+            | AgentEvent::Started { profile, .. } => Some(*profile),
+            AgentEvent::ToolCall {
+                actor: Some(TeamActor::Agent(profile)),
+                ..
+            } => Some(*profile),
+            _ => None,
+        });
+    let repeated_profile = repeated_action
+        .and_then(|(_, profile)| profile)
+        .or(recent_profile);
+    let repeated_name = repeated_profile
+        .map(AgentProfile::teammate_name)
+        .unwrap_or("A teammate");
+    let repeated_first_name = first_name(repeated_name);
+    let planning_first_name = first_name(AgentProfile::Plan.teammate_name());
+    let tool_calls = history
+        .iter()
+        .filter_map(|envelope| match &envelope.event {
+            AgentEvent::ToolCall {
+                tool, arguments, ..
+            } => Some((tool, arguments)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let repeated_path = tool_calls
+        .last()
+        .and_then(|(latest_tool, latest_arguments)| {
+            let repeated = tool_calls[..tool_calls.len().saturating_sub(1)]
+                .iter()
+                .any(|(tool, arguments)| tool == latest_tool && arguments == latest_arguments);
+            repeated
+                .then(|| latest_arguments.get("path").and_then(Value::as_str))
+                .flatten()
+        });
+
+    let planning_failure = outcome == crate::workflow::WorkflowOutcome::PlanRejected
+        || reason.to_lowercase().contains("planning submission");
+    let git_control_changed = reason.contains("changed Git control state");
+    let repository_content_changed =
+        reason.contains("repository content changed while the read-only");
+    let repeat_limit = reason.contains("deterministic repeat limit");
+    let executor_unavailable = outcome == crate::workflow::WorkflowOutcome::ExecutorUnavailable;
+    let needs_current_files_restart = git_control_changed
+        || repository_content_changed
+        || outcome == crate::workflow::WorkflowOutcome::CommitBlocked;
+    let teammate_message = if planning_failure {
+        format!(
+            "{planning_first_name}, your plan was rejected after three attempts. {} Nothing changed, and this delivery is now on hold.",
+            artifact_validation_problem(reason)
+        )
+    } else if git_control_changed && repeated_action.is_some() {
+        format!(
+            "{repeated_first_name}, you repeated the same action while the repository’s Git state was changing. I blocked the duplicate and put this delivery on hold so we would not commit or overwrite somebody else’s work."
+        )
+    } else if git_control_changed {
+        "Team, I put this delivery on hold because the repository’s Git state changed during the pass. I preserved the current files so we would not commit or overwrite somebody else’s work."
+            .to_string()
+    } else if repository_content_changed {
+        "Team, I put this delivery on hold because the project changed while you were reviewing an earlier snapshot. I kept that review tied to its exact files rather than risk overwriting the newer work."
+            .to_string()
+    } else if repeat_limit {
+        repeated_path.map_or_else(
+            || format!(
+                "{repeated_first_name}, you repeated the same action after I flagged the failure. I blocked the duplicate, so your task—and this delivery—are now on hold."
+            ),
+            |path| format!(
+                "{repeated_first_name}, `{path}` does not exist. You tried to read it again after I flagged that, then repeated the same action once more. I blocked that last attempt, so your review—and this delivery—are now on hold."
+            ),
+        )
+    } else if executor_unavailable {
+        "Team, this delivery is on hold because a required executor is unavailable. I preserved the current work so you can continue once that prerequisite is restored."
+            .to_string()
+    } else {
+        "Team, I put this delivery on hold at a safe boundary because the reported problem needs a different approach."
+            .to_string()
+    };
+    let user_request = if needs_current_files_restart {
+        "restart this delivery with the current files so the team can plan against the right project state"
+    } else if executor_unavailable {
+        "restore the missing prerequisite, then resume this delivery"
+    } else {
+        "start a follow-up task here and add any context that could help the team find a different way forward"
+    };
+    let detail = repeated_action.map_or_else(
+        || reason.to_string(),
+        |(message, _)| format!("{message}\n{reason}"),
+    );
+
+    vec![
+        chatter(
+            TeamActor::workflow_steward(),
+            None,
+            teammate_message,
+            Some(detail),
+            ChatterAudience::Team,
+        ),
+        chatter(
+            TeamActor::workflow_steward(),
+            None,
+            format!("Can you {user_request}?"),
+            None,
+            ChatterAudience::CurrentUser,
+        ),
+    ]
 }
 
 #[cfg(test)]
@@ -2510,6 +3438,27 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn legacy_activity_events_default_to_the_build_profile() {
+        for event in [
+            r#"{"type":"model_loading","model":"legacy"}"#,
+            r#"{"type":"step_started","step":1,"max_steps":2}"#,
+        ] {
+            let json = format!(r#"{{"version":"v1","event":{event}}}"#);
+            let envelope: EventEnvelope = serde_json::from_str(&json).unwrap();
+            assert!(matches!(
+                envelope.event,
+                AgentEvent::ModelLoading {
+                    profile: AgentProfile::Build,
+                    ..
+                } | AgentEvent::StepStarted {
+                    profile: AgentProfile::Build,
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]
@@ -2824,6 +3773,178 @@ mod tests {
                 && detail == "deno task test:web failed"
                 && evidence_ids == vec!["check:web-test"]
         ));
+    }
+
+    #[test]
+    fn correction_chatter_is_server_authored_and_round_trips() {
+        let envelope = EventEnvelope::new(AgentEvent::Correction {
+            message: "technical controller guidance".to_string(),
+            summary: "Task-focused repository evidence".to_string(),
+            actor: TeamActor::workflow_steward(),
+            assisting_profile: Some(AgentProfile::Plan),
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+
+        assert_eq!(envelope.chatter.len(), 1);
+        assert_eq!(
+            envelope.transcript,
+            Some(TranscriptMetadata {
+                visibility: TranscriptVisibility::Visible,
+                kind: TranscriptKind::Correction,
+                dedupe_key: Some("correction:Task-focused repository evidence".to_string()),
+                related_action_key: None,
+                summary_redundant: false,
+            })
+        );
+        assert_eq!(
+            envelope.chatter[0].message,
+            "Dade, I found the task-relevant code and pulled out the strongest matching sections. Use them to finish the plan. If one concrete fact is still missing, read only the relevant lines instead of rereading the whole file."
+        );
+        assert_eq!(
+            envelope.chatter[0].detail.as_deref(),
+            Some("technical controller guidance")
+        );
+
+        let restored: EventEnvelope =
+            serde_json::from_str(&serde_json::to_string(&envelope).unwrap()).unwrap();
+        assert_eq!(restored.chatter, envelope.chatter);
+    }
+
+    #[test]
+    fn correction_chatter_turns_tool_failures_into_teammate_guidance() {
+        let envelope = EventEnvelope::new(AgentEvent::Correction {
+            message: serde_json::json!({
+                "type": "tool_failure",
+                "tool": "read_file",
+                "message": "failed to resolve path 'webui/src/components/SessionRows.tsx': failed to resolve path /private/tmp/workspace/webui/src/components/SessionRows.tsx"
+            })
+            .to_string(),
+            summary: "Tool not available".to_string(),
+            actor: TeamActor::workflow_steward(),
+            assisting_profile: Some(AgentProfile::Review),
+            nesting_depth: None,
+            timestamp_ms: None,
+        });
+
+        assert_eq!(
+            envelope.chatter[0].message,
+            "Eugene, your call to the `read_file` tool was not executed successfully. `webui/src/components/SessionRows.tsx` does not exist. Fix the mistake, choose a different action, or report the blocker."
+        );
+        assert!(!envelope.chatter[0].message.contains("/private/tmp"));
+        assert_eq!(
+            envelope
+                .transcript
+                .as_ref()
+                .and_then(|metadata| metadata.dedupe_key.as_deref()),
+            Some("tool_failure:read_file:missing:webui/src/components/SessionRows.tsx")
+        );
+    }
+
+    #[test]
+    fn workflow_blocked_chatter_uses_prior_events_for_terminal_parity() {
+        let repeated_arguments = serde_json::json!({
+            "path": "webui/src/components/SessionRows.tsx"
+        });
+        let mut history = vec![
+            EventEnvelope::new(AgentEvent::ToolCall {
+                tool: "read_file".to_string(),
+                arguments: repeated_arguments.clone(),
+                call_id: Some("call-1".to_string()),
+                batch_id: None,
+                actor: Some(TeamActor::agent(AgentProfile::Review)),
+                nesting_depth: None,
+                timestamp_ms: None,
+            }),
+            EventEnvelope::new(AgentEvent::ToolCall {
+                tool: "read_file".to_string(),
+                arguments: repeated_arguments,
+                call_id: Some("call-2".to_string()),
+                batch_id: None,
+                actor: Some(TeamActor::agent(AgentProfile::Review)),
+                nesting_depth: None,
+                timestamp_ms: None,
+            }),
+            EventEnvelope::new(AgentEvent::Correction {
+                message: "The repeated path still does not exist.".to_string(),
+                summary: "Eugene reached the repeat limit".to_string(),
+                actor: TeamActor::workflow_steward(),
+                assisting_profile: Some(AgentProfile::Review),
+                nesting_depth: None,
+                timestamp_ms: None,
+            }),
+        ];
+        refresh_event_projections(&mut history);
+        let repeated_action_key = history[2]
+            .transcript
+            .as_ref()
+            .and_then(|metadata| metadata.related_action_key.as_deref());
+        assert!(repeated_action_key.is_some_and(|key| key.starts_with("tool:read_file:")));
+        let reason = "Eugene stopped making progress in the CodeReview stage and reached a deterministic repeat limit";
+        let mut blocked = EventEnvelope::new(AgentEvent::WorkflowBlocked {
+            workflow_id: "workflow-1".to_string(),
+            outcome: crate::workflow::WorkflowOutcome::ReviewFailed,
+            reason: reason.to_string(),
+            timestamp_ms: None,
+        });
+        blocked.refresh_projections(&history);
+
+        assert_eq!(blocked.chatter.len(), 2);
+        assert_eq!(
+            blocked.transcript.as_ref().map(|metadata| metadata.kind),
+            Some(TranscriptKind::WorkflowBlocked)
+        );
+        assert_eq!(
+            blocked.chatter[0].message,
+            "Eugene, `webui/src/components/SessionRows.tsx` does not exist. You tried to read it again after I flagged that, then repeated the same action once more. I blocked that last attempt, so your review—and this delivery—are now on hold."
+        );
+        assert_eq!(
+            blocked.chatter[0].detail.as_deref(),
+            Some(
+                "The repeated path still does not exist.\nEugene stopped making progress in the CodeReview stage and reached a deterministic repeat limit"
+            )
+        );
+        assert_eq!(
+            blocked.chatter[1].message,
+            "Can you start a follow-up task here and add any context that could help the team find a different way forward?"
+        );
+        assert_eq!(blocked.chatter[1].audience, ChatterAudience::CurrentUser);
+    }
+
+    #[test]
+    fn session_summary_projection_marks_repeated_terminal_copy() {
+        let mut history = vec![
+            EventEnvelope::new(AgentEvent::Final {
+                content: "Implemented the event boundary.".to_string(),
+                profile: AgentProfile::Build,
+                nesting_depth: None,
+                timestamp_ms: None,
+            }),
+            EventEnvelope::new(AgentEvent::SessionSummary {
+                branch: "main".to_string(),
+                commits: String::new(),
+                reached_final: true,
+                contract_status: ContractStatus::Satisfied,
+                verified_completed: true,
+                termination_reason: Some(TerminationReason::Final),
+                handoff_outcome: None,
+                summary: " Implemented the event boundary. ".to_string(),
+                power_summary: String::new(),
+                diff_stat: String::new(),
+                diff: String::new(),
+                timestamp_ms: None,
+            }),
+        ];
+
+        refresh_event_projections(&mut history);
+
+        assert_eq!(
+            history[1]
+                .transcript
+                .as_ref()
+                .map(|metadata| (metadata.kind, metadata.summary_redundant)),
+            Some((TranscriptKind::SessionSummary, true))
+        );
     }
 
     #[test]

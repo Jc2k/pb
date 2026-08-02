@@ -1,3 +1,13 @@
+export type AgentProfile =
+  | "build"
+  | "scout"
+  | "review"
+  | "explore"
+  | "plan"
+  | "ask"
+  | "research"
+  | "monitor";
+
 export type AgentEvent =
   | {
     type: "semantic_gate";
@@ -209,7 +219,7 @@ export type AgentEvent =
     focus_root?: string;
     branch: string;
     attachments?: SessionAttachment[];
-    profile: string;
+    profile: AgentProfile;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
@@ -217,19 +227,21 @@ export type AgentEvent =
     type: "step_started";
     step: number;
     max_steps: number;
+    profile: AgentProfile;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
   | {
     type: "model_loading";
     model: string;
+    profile: AgentProfile;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
   | {
     type: "reasoning";
     content: string;
-    profile: string;
+    profile: AgentProfile;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
@@ -272,7 +284,7 @@ export type AgentEvent =
       fallback_reason?: string;
     };
     actor?: TeamActor;
-    assisting_profile?: string;
+    assisting_profile?: AgentProfile;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
@@ -282,7 +294,7 @@ export type AgentEvent =
     stage: WorkflowStage;
     reason: string;
     actor?: TeamActor;
-    assisting_profile?: string;
+    assisting_profile?: AgentProfile;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
@@ -305,7 +317,7 @@ export type AgentEvent =
       recovery: string;
     };
     actor?: TeamActor;
-    assisting_profile?: string;
+    assisting_profile?: AgentProfile;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
@@ -404,7 +416,7 @@ export type AgentEvent =
     question_id: string;
     question: string;
     choices?: string[];
-    profile: string;
+    profile: AgentProfile;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
@@ -431,20 +443,20 @@ export type AgentEvent =
     message: string;
     summary?: string;
     actor?: TeamActor;
-    assisting_profile?: string;
+    assisting_profile?: AgentProfile;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
   | {
     type: "sub_agent_started";
-    profile: string;
+    profile: AgentProfile;
     task: string;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
   | {
     type: "sub_agent_finished";
-    profile: string;
+    profile: AgentProfile;
     result: string;
     nesting_depth?: number;
     timestamp_ms?: number;
@@ -459,7 +471,7 @@ export type AgentEvent =
   | {
     type: "final";
     content: string;
-    profile: string;
+    profile: AgentProfile;
     nesting_depth?: number;
     timestamp_ms?: number;
   }
@@ -495,7 +507,7 @@ export type AgentEvent =
       | "workflow_closure"
       | "workflow_recovery";
     workflow_stage?: string;
-    profile?: string;
+    profile?: AgentProfile;
     duration_ms: number;
     prompt_tokens: number;
     generated_tokens: number;
@@ -683,10 +695,40 @@ export type AgentEvent =
   };
 
 export type TeamActor =
-  | { kind: "agent"; id: string }
+  | { kind: "agent"; id: AgentProfile }
   | { kind: "automation"; id: "trinity" | "handoff" };
 
 export type TeamMessageTone = "info" | "success" | "warning" | "error";
+
+export interface EventChatter {
+  actor: TeamActor;
+  tone: TeamMessageTone;
+  headline?: string;
+  message: string;
+  detail?: string;
+  audience: "team" | "current_user";
+}
+
+export type TranscriptKind =
+  | "correction"
+  | "repeated_tool_detected"
+  | "repeated_tool_correction"
+  | "no_progress_correction"
+  | "dependent_tool_batch_correction"
+  | "handoff_correction"
+  | "workflow_closure_checkpoint"
+  | "work_unit_progress"
+  | "terminal_tool_loop_error"
+  | "workflow_blocked"
+  | "session_summary";
+
+export interface TranscriptMetadata {
+  visibility: "visible" | "evidence_only";
+  kind: TranscriptKind;
+  dedupe_key?: string;
+  related_action_key?: string;
+  summary_redundant?: boolean;
+}
 
 export type HandoffOutcome =
   | "pending"
@@ -747,6 +789,8 @@ export interface SessionMetricsSnapshot {
 export interface EventEnvelope {
   version: string;
   event: AgentEvent;
+  chatter?: EventChatter[];
+  transcript?: TranscriptMetadata;
 }
 
 export interface SemanticGateReceipt {

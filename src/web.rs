@@ -3781,6 +3781,7 @@ impl EventSink for WebEventSink {
             question_id: question_id.clone(),
             question: question.to_string(),
             choices: choices.to_vec(),
+            profile: self.request_template.profile,
             timestamp_ms: Some(now_millis()),
         };
 
@@ -5397,6 +5398,7 @@ fn session_from_persisted(mut persisted: PersistedSession) -> (String, SessionSt
     } else {
         std::mem::take(&mut persisted.pending_user_messages)
     };
+    crate::events::refresh_event_projections(&mut persisted.events);
     let history = Arc::new(StdMutex::new(persisted.events));
     let pending_user_messages =
         Arc::new(StdMutex::new(pending_user_messages.into_iter().collect()));
@@ -5793,14 +5795,17 @@ fn publish_event(
     history: &StdMutex<Vec<EventEnvelope>>,
     event: AgentEvent,
 ) {
-    let envelope = EventEnvelope::with_timestamp(event);
-    let _ = sender.send(envelope.clone());
+    let mut envelope = EventEnvelope::with_timestamp(event);
     if let Ok(mut entries) = history.lock() {
+        envelope.refresh_projections(&entries);
+        let _ = sender.send(envelope.clone());
         entries.push(envelope);
         if entries.len() > MAX_HISTORY_EVENTS {
             let overflow = entries.len() - MAX_HISTORY_EVENTS;
             entries.drain(..overflow);
         }
+    } else {
+        let _ = sender.send(envelope);
     }
 }
 

@@ -199,26 +199,23 @@ Deno.test("session corrections render as direct steward chat with progressive de
   const component = await Deno.readTextFile("webui/src/components/Session.tsx");
   const css = await Deno.readTextFile("webui/src/session.css");
   const types = await Deno.readTextFile("webui/src/types/index.ts");
-  const utils = await Deno.readTextFile("webui/src/lib/sessionUtils.ts");
 
   ok(types.includes('type: "correction"'));
+  ok(types.includes("interface EventChatter"));
+  ok(types.includes("chatter?: EventChatter[]"));
   ok(component.includes('case "correction"'));
   ok(component.includes("function CorrectionNotice"));
   ok(component.includes("workflowStewardActor()"));
   ok(component.includes("Correction from ${teammate.name}"));
-  ok(component.includes("trinityCorrectionCopy("));
-  ok(!component.includes("I noticed a problem in ${assistedName}"));
-  ok(
-    utils.includes('normalizedSummary === "Task-focused repository evidence"'),
-  );
-  ok(utils.includes("toolFailureFeedback(detail, teammateName)"));
+  ok(component.includes('audience === "team"'));
+  ok(!component.includes("trinityCorrectionCopy("));
+  ok(!component.includes("normalizedSummary"));
   ok(component.includes("function TechnicalDetailsBubble"));
   ok(component.includes("technical-detail-button"));
   ok(component.includes("window.setTimeout"));
   ok(component.includes("Technical details"));
   ok(component.includes("function WorkflowBlockedNotice"));
-  ok(component.includes("your review—and this delivery—are now on hold"));
-  ok(component.includes("start a follow-up task here"));
+  ok(component.includes('audience === "current_user"'));
   ok(component.includes('fetch("/api/current-user"'));
   ok(component.includes("Task hold message from ${teammate.name}"));
   ok(component.includes("Request from ${teammate.name} to the current user"));
@@ -228,7 +225,7 @@ Deno.test("session corrections render as direct steward chat with progressive de
   ok(component.includes('className="action-origin"'));
   ok(component.includes("chat-event-message"));
   ok(component.includes("trinity-message"));
-  ok(component.includes("<RichText content={copy.message} />"));
+  ok(component.includes("<RichText content={message} />"));
   ok(css.includes(".correction-bubble"));
   ok(css.includes("--trinity-accent:"));
   ok(css.includes(".teammate-message .thought-bubble"));
@@ -277,7 +274,7 @@ Deno.test("assistant and Trinity prose share safe inline Markdown rendering", as
   ok(component.includes("parseInlineRichText(content)"));
   ok(component.includes('className="rich-text-inline-code"'));
   ok(component.includes("<RichText content={e.content} />"));
-  ok(component.includes("<RichText content={copy.message} />"));
+  ok(component.includes("<RichText content={message} />"));
 });
 
 Deno.test("final assistant messages use profile avatars", async () => {
@@ -428,15 +425,13 @@ Deno.test("session metrics stay compact while inference details remain available
   ok(css.includes(".session-metrics-summary:hover .inference-info-button"));
 });
 
-Deno.test("terminal Trinity feedback hands an on-hold task from teammate to user", async () => {
+Deno.test("terminal Trinity feedback uses server-authored chatter and addresses the current user", async () => {
   const component = await Deno.readTextFile("webui/src/components/Session.tsx");
 
-  ok(component.includes("${repeatedFirstName}, \\`"));
-  ok(component.includes("your review—and this delivery—are now on hold"));
-  ok(component.includes("@${currentUsername}, can you ${userRequest}?"));
-  ok(component.includes("restart this delivery with the current files"));
-  ok(component.includes("restore the missing prerequisite"));
-  ok(component.includes("start a follow-up task here"));
+  ok(component.includes("const teammateFeedback = envelope.chatter?.find("));
+  ok(component.includes("const userFeedback = envelope.chatter?.find("));
+  ok(component.includes('audience === "current_user"'));
+  ok(component.includes("@${currentUsername}, ${"));
   ok(!component.includes("Choose **Build** below"));
 });
 

@@ -241,7 +241,7 @@ pub async fn watch_session(socket_path: &PathBuf, session_id: String) -> Result<
         match notification.method.as_str() {
             "pb.session.event" => {
                 let envelope: EventEnvelope = serde_json::from_value(notification.params)?;
-                render_event(&envelope.event);
+                render_event(&envelope);
             }
             "pb.session.finished" => break,
             _ => {}

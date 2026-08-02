@@ -9,8 +9,6 @@ import {
   getToolDetail,
   harnessEfficiencyStats,
   latestAssistantProfile,
-  toolFailureFeedback,
-  trinityCorrectionCopy,
   trustedSessionSummaryCommitLines,
 } from "./sessionUtils.ts";
 
@@ -72,6 +70,10 @@ Deno.test("harness efficiency uses durable help and prevention evidence", () => 
     },
     {
       version: "1",
+      transcript: {
+        visibility: "visible",
+        kind: "repeated_tool_correction",
+      },
       event: {
         type: "correction",
         summary: "Repeated tool call blocked",
@@ -80,6 +82,10 @@ Deno.test("harness efficiency uses durable help and prevention evidence", () => 
     },
     {
       version: "1",
+      transcript: {
+        visibility: "visible",
+        kind: "dependent_tool_batch_correction",
+      },
       event: {
         type: "correction",
         summary: "Dependent tool batch rejected",
@@ -88,6 +94,10 @@ Deno.test("harness efficiency uses durable help and prevention evidence", () => 
     },
     {
       version: "1",
+      transcript: {
+        visibility: "visible",
+        kind: "no_progress_correction",
+      },
       event: {
         type: "correction",
         summary: "No-progress tool outcome detected",
@@ -106,152 +116,6 @@ Deno.test("harness efficiency uses durable help and prevention evidence", () => 
     dependentBatchesPrevented: 1,
     noProgressLoopsStopped: 1,
   });
-});
-
-Deno.test("tool failures become direct teammate guidance without leaking workspace paths", () => {
-  equal(
-    toolFailureFeedback(
-      JSON.stringify({
-        type: "tool_failure",
-        tool: "read_file",
-        message:
-          "failed to resolve path 'webui/src/components/SessionRows.tsx': failed to resolve path /private/tmp/workspace/webui/src/components/SessionRows.tsx: No such file or directory (os error 2)",
-      }),
-      "Eugene Belford",
-    ),
-    "Eugene, your call to the `read_file` tool was not executed successfully. `webui/src/components/SessionRows.tsx` does not exist. Fix the mistake, choose a different action, or report the blocker.",
-  );
-
-  equal(toolFailureFeedback("plain correction", "Eugene Belford"), null);
-});
-
-Deno.test("Trinity corrections explain the specific event in human language", () => {
-  deepEqual(
-    trinityCorrectionCopy(
-      "Task-focused repository evidence",
-      "technical controller guidance",
-      "Dade Murphy",
-      "plan",
-    ),
-    {
-      message:
-        "Dade, I found the task-relevant code and pulled out the strongest matching sections. Use them to finish the plan. If one concrete fact is still missing, read only the relevant lines instead of rereading the whole file.",
-    },
-  );
-  deepEqual(
-    trinityCorrectionCopy(
-      "Eugene reached the repeat limit",
-      "deterministic stop",
-      "Eugene Belford",
-      "review",
-    ),
-    {
-      message:
-        "Eugene, you repeated the same action after guidance, so I blocked the duplicate before you spent more time on it. Choose a different approach or report the blocker.",
-    },
-  );
-  deepEqual(
-    trinityCorrectionCopy(
-      "Retrying",
-      "legacy correction",
-      "Kate Libby",
-      "implementation report",
-    ),
-    {
-      headline: "Retrying",
-      message: "legacy correction",
-    },
-  );
-  deepEqual(
-    trinityCorrectionCopy(
-      "Active accepted-plan work unit",
-      "technical target",
-      "Kate Libby",
-      "implementation report",
-    ),
-    {
-      message:
-        "Kate, I picked the next item from the accepted plan and confirmed exactly which file operation it needs. Complete only that item before moving on.",
-    },
-  );
-  deepEqual(
-    trinityCorrectionCopy(
-      "Harness diagnostic preview",
-      "technical diagnostics",
-      "Kate Libby",
-      "implementation report",
-    ),
-    {
-      message:
-        "Kate, I ran an early diagnostic check and found issues you should account for while you complete the current work item.",
-    },
-  );
-});
-
-Deno.test("Trinity correction families keep distinct user-facing explanations", () => {
-  const cases = [
-    [
-      "using host execution for an Apple-only component",
-      "running that part directly on the Mac",
-    ],
-    ["Workflow stage submission required", "prose reply will not complete"],
-    ["Teammate action retries exhausted", "valid action"],
-    ["Kate reached the bounded step limit", "step limit"],
-    [
-      "Automatic language-server diagnostics need repair",
-      "automatic diagnostics found issues",
-    ],
-    ["Cancellation requested", "Cancellation is requested"],
-  ] as const;
-
-  for (const [summary, expected] of cases) {
-    const copy = trinityCorrectionCopy(
-      summary,
-      "technical controller detail",
-      "Kate Libby",
-      "implementation report",
-    );
-    ok(copy.message.includes(expected), `${summary}: ${copy.message}`);
-  }
-});
-
-Deno.test("Trinity guidance describes teammate actions instead of prompt plumbing", () => {
-  const messages = [
-    trinityCorrectionCopy(
-      "Task-focused repository evidence",
-      "controller detail",
-      "Eugene Belford",
-      "review",
-    ).message,
-    trinityCorrectionCopy(
-      "Requesting missing bounded evidence",
-      "controller detail",
-      "Kate Libby",
-      "implementation report",
-    ).message,
-    trinityCorrectionCopy(
-      "Eugene reached the repeat limit",
-      "controller detail",
-      "Eugene Belford",
-      "review",
-    ).message,
-  ];
-
-  for (const message of messages) {
-    for (
-      const plumbing of [
-        "your context",
-        "ask for",
-        "model turn",
-        "inference",
-        "thinking disabled",
-        "bounded read",
-      ]
-    ) {
-      ok(!message.includes(plumbing), `${plumbing}: ${message}`);
-    }
-  }
-  ok(messages[0].includes("read only the relevant lines"));
 });
 
 Deno.test("buildActionTimeline preserves chronology and actor provenance", () => {
@@ -565,6 +429,7 @@ Deno.test("chatEventsWithOnlyLatestStep keeps only the current activity indicato
       event: {
         type: "model_loading",
         model: "/models/local.gguf",
+        profile: "build",
       },
     },
     {
@@ -573,6 +438,7 @@ Deno.test("chatEventsWithOnlyLatestStep keeps only the current activity indicato
         type: "step_started",
         step: 1,
         max_steps: 20,
+        profile: "build",
       },
     },
   ];
@@ -620,6 +486,11 @@ Deno.test("chatEventsWithOnlyLatestStep removes session summary text duplicated 
     },
     {
       version: "1",
+      transcript: {
+        visibility: "visible",
+        kind: "session_summary",
+        summary_redundant: true,
+      },
       event: {
         type: "session_summary",
         branch: "fix-duplicate-summary",
@@ -642,6 +513,10 @@ Deno.test("chat hides internal closure checkpoints and deduplicates blocked deli
   const events: EventEnvelope[] = [
     {
       version: "v1",
+      transcript: {
+        visibility: "evidence_only",
+        kind: "workflow_closure_checkpoint",
+      },
       event: {
         type: "correction",
         summary: "Workflow closure checkpoint",
@@ -660,6 +535,11 @@ Deno.test("chat hides internal closure checkpoints and deduplicates blocked deli
     },
     {
       version: "v1",
+      transcript: {
+        visibility: "visible",
+        kind: "session_summary",
+        summary_redundant: true,
+      },
       event: {
         type: "session_summary",
         branch: "main",
@@ -698,6 +578,7 @@ Deno.test("latestAssistantProfile falls back to the started profile for early ac
         type: "step_started",
         step: 1,
         max_steps: 20,
+        profile: "build",
       },
     },
   ];
@@ -766,6 +647,10 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
   const events: EventEnvelope[] = [
     {
       version: "v1",
+      transcript: {
+        visibility: "visible",
+        kind: "repeated_tool_detected",
+      },
       event: {
         type: "correction",
         summary: "Repeated tool call detected",
@@ -776,6 +661,10 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
     },
     {
       version: "v1",
+      transcript: {
+        visibility: "visible",
+        kind: "repeated_tool_correction",
+      },
       event: {
         type: "correction",
         summary: "Eugene reached the repeat limit",
@@ -786,6 +675,10 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
     },
     {
       version: "v1",
+      transcript: {
+        visibility: "visible",
+        kind: "repeated_tool_detected",
+      },
       event: {
         type: "correction",
         summary: "Repeated tool call detected",
@@ -800,10 +693,15 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
         type: "step_started",
         step: index + 3,
         max_steps: 8,
+        profile: "review",
       },
     })),
     {
       version: "v1",
+      transcript: {
+        visibility: "visible",
+        kind: "repeated_tool_correction",
+      },
       event: {
         type: "correction",
         summary: "Eugene reached the repeat limit",
@@ -814,6 +712,10 @@ Deno.test("terminal repeat errors stay in evidence but collapse into Trinity fee
     },
     {
       version: "v1",
+      transcript: {
+        visibility: "visible",
+        kind: "terminal_tool_loop_error",
+      },
       event: {
         type: "error",
         summary: "Kate reached the repeat limit",
@@ -860,6 +762,13 @@ Deno.test("a repeated failed action keeps one explanation and one terminal outco
     },
     {
       version: "v1",
+      transcript: {
+        visibility: "visible",
+        kind: "correction",
+        dedupe_key:
+          "tool_failure:read_file:missing:webui/src/components/SessionRows.tsx",
+        related_action_key: "tool:read_file:same-path",
+      },
       event: {
         type: "correction",
         summary: "read_file failed",
@@ -879,6 +788,13 @@ Deno.test("a repeated failed action keeps one explanation and one terminal outco
     },
     {
       version: "v1",
+      transcript: {
+        visibility: "visible",
+        kind: "correction",
+        dedupe_key:
+          "tool_failure:read_file:missing:webui/src/components/SessionRows.tsx",
+        related_action_key: "tool:read_file:same-path",
+      },
       event: {
         type: "correction",
         summary: "read_file tool call was not executed successfully",
@@ -912,6 +828,10 @@ Deno.test("no-progress loop errors collapse into the terminal Trinity message", 
   const events: EventEnvelope[] = [
     {
       version: "v1",
+      transcript: {
+        visibility: "visible",
+        kind: "no_progress_correction",
+      },
       event: {
         type: "correction",
         summary: "No-progress tool outcome detected",
@@ -922,6 +842,10 @@ Deno.test("no-progress loop errors collapse into the terminal Trinity message", 
     },
     {
       version: "v1",
+      transcript: {
+        visibility: "visible",
+        kind: "terminal_tool_loop_error",
+      },
       event: {
         type: "error",
         summary: "No-progress tool loop",
@@ -948,6 +872,10 @@ Deno.test("no-progress loop errors collapse into the terminal Trinity message", 
 Deno.test("work-unit progress credits do not split adjacent action runs", () => {
   const visible = chatEventsWithOnlyLatestStep([{
     version: "v1",
+    transcript: {
+      visibility: "evidence_only",
+      kind: "work_unit_progress",
+    },
     event: {
       type: "correction",
       summary: "Work-unit progress earned one bounded turn",
