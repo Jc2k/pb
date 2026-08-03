@@ -36,7 +36,12 @@ The browser SSE stream begins with a revisioned session snapshot and sends anoth
 state-changing events. A reconnect cursor that has fallen outside retained history produces an
 explicit history reset instead of silently splicing two non-contiguous transcript windows.
 Every durable lifecycle transition, including queued follow-up and recovery work, publishes a typed
-state event before its mutation response completes; the browser never has to refetch to discover it.
+state event before its mutation response completes. Existing-session mutations also return the exact
+revisioned session snapshot shape used by SSE, so the initiating browser applies the committed state
+immediately and never has to refetch or wait for stream delivery to discover it. A running cancellation
+remains `running` with an explicit server-authored cancellation-requested flag until the terminal event.
+The `started` event projects the runner's resolved branch and focus root into live session state before
+publication, keeping browser, terminal, collection rows, and persistence on the same workspace identity.
 
 The browser starts repository-backed work with a registered project ID; resolving that identity to a
 display name and filesystem path belongs to the daemon. CLI commands may still supply an explicit

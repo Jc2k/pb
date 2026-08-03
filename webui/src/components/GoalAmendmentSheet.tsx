@@ -4,17 +4,25 @@ import type {
   GoalCheckpoint,
   GoalContinuationPolicy,
   GoalCriterionInput,
+  SessionStreamSnapshot,
 } from "../types";
 import { VoiceInputButton } from "./VoiceInputButton";
 import { apiErrorMessage } from "../lib/integrationConfig";
+import { parseSessionStreamSnapshotJson } from "../lib/eventContract";
 
 interface Props {
   goal: GoalCheckpoint;
   onClose: () => void;
   onSubmitted: () => void;
+  onSessionUpdated: (snapshot: SessionStreamSnapshot) => void;
 }
 
-export function GoalAmendmentSheet({ goal, onClose, onSubmitted }: Props) {
+export function GoalAmendmentSheet({
+  goal,
+  onClose,
+  onSubmitted,
+  onSessionUpdated,
+}: Props) {
   const initialDraft = goal.run.stage === "awaiting_plan_approval" &&
     !goal.run.pending_amendment;
   const [objective, setObjective] = useState(goal.run.objective);
@@ -50,6 +58,9 @@ export function GoalAmendmentSheet({ goal, onClose, onSubmitted }: Props) {
         setError(await apiErrorMessage(response, "Could not update the goal"));
         return;
       }
+      onSessionUpdated(
+        parseSessionStreamSnapshotJson(await response.text()),
+      );
       onSubmitted();
     } catch (cause) {
       setError(

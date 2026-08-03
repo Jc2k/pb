@@ -64,7 +64,6 @@ function currentSession(values: Partial<SessionItem>): SessionItem {
     ...values,
     started_at_ms: values.started_at_ms ?? 0,
     project: values.project ?? null,
-    revision: values.revision ?? 0,
   };
 }
 

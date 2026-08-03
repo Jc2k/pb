@@ -421,7 +421,7 @@ Deno.test("terminal Trinity feedback uses server-authored chatter and addresses 
   ok(!component.includes("Choose **Build** below"));
 });
 
-Deno.test("session mutations wait for authoritative stream lifecycle effects", async () => {
+Deno.test("session mutations apply the authoritative stream snapshot response", async () => {
   const page = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");
   const mutations = page.slice(
     page.indexOf("const continueSession"),
@@ -430,6 +430,18 @@ Deno.test("session mutations wait for authoritative stream lifecycle effects", a
 
   ok(!mutations.includes("setSessionRunning"));
   ok(!mutations.includes('setIntent("discuss")'));
+  ok(
+    (mutations.match(/parseSessionStreamSnapshotJson/g)?.length ?? 0) >= 7,
+  );
+  ok(
+    (mutations.match(/applySessionSnapshot\(snapshot\.session/g)?.length ??
+      0) >= 7,
+  );
+  ok(
+    page.includes(
+      "goalControlsBusy = goalBusy || session?.cancel_requested === true",
+    ),
+  );
   equal(page.match(/setSessionRunning/g)?.length, 4);
 });
 

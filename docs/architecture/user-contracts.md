@@ -436,6 +436,11 @@ caches, and collection revision under one lock order. There is no fallible post-
 reload and a disconnected HTTP or RPC caller cannot strand memory behind disk. Project mutations
 return the same revisioned snapshot shape as the stream, so the browser can apply the authoritative
 result even while SSE is reconnecting and can continue displaying its last valid snapshot as stale data.
+Existing-session and Goal mutations likewise return the exact revisioned session snapshot used by the
+session stream. New-session creation returns identity for navigation; starting a Goal in an existing
+session uses the session mutation endpoint and returns the session snapshot. Cancellation requests and
+the runner-resolved branch and focus root are explicit session state rather than browser inference or
+event-sink-only persistence.
 Each session event sender owns the collection publisher, so every state-affecting event appends its
 history entry and publishes the matching collection revision synchronously while the caller holds the
 session lock. There is no asynchronous watcher reconstructing collection transitions after delivery.

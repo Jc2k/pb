@@ -1428,7 +1428,6 @@ export interface SessionItem {
   active_goal: boolean;
   multi_task: MultiTaskSummary | null;
   active_multi_task: boolean;
-  revision: number;
 }
 
 export interface SessionDetails {
@@ -1437,6 +1436,7 @@ export interface SessionDetails {
   title: string | null;
   running: boolean;
   paused: boolean;
+  cancel_requested: boolean;
   status: SessionStatus;
   intent: TurnIntent | null;
   branch: string | null;

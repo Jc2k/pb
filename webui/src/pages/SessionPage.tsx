@@ -318,7 +318,9 @@ export function SessionPage() {
           await apiErrorMessage(response, "Could not continue the session"),
         );
       }
+      const snapshot = parseSessionStreamSnapshotJson(await response.text());
       if (!actionRequestRef.current.owns(controller)) return;
+      applySessionSnapshot(snapshot.session, snapshot.reset_history);
       setFollowUp("");
     } catch (error) {
       if (isAbortError(error) || !actionRequestRef.current.owns(controller)) {
@@ -349,7 +351,10 @@ export function SessionPage() {
           await apiErrorMessage(response, "Message could not be sent"),
         );
       }
-      if (messageRequestRef.current.owns(controller)) setRunningMessage("");
+      const snapshot = parseSessionStreamSnapshotJson(await response.text());
+      if (!messageRequestRef.current.owns(controller)) return;
+      applySessionSnapshot(snapshot.session, snapshot.reset_history);
+      setRunningMessage("");
     } catch (error) {
       if (isAbortError(error) || !messageRequestRef.current.owns(controller)) {
         return;
@@ -381,7 +386,9 @@ export function SessionPage() {
           await apiErrorMessage(response, "Could not update the goal"),
         );
       }
+      const snapshot = parseSessionStreamSnapshotJson(await response.text());
       if (!actionRequestRef.current.owns(controller)) return false;
+      applySessionSnapshot(snapshot.session, snapshot.reset_history);
       return true;
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
@@ -451,6 +458,9 @@ export function SessionPage() {
         );
         return;
       }
+      const snapshot = parseSessionStreamSnapshotJson(await response.text());
+      if (!actionRequestRef.current.owns(controller)) return;
+      applySessionSnapshot(snapshot.session, snapshot.reset_history);
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
         setWorkflowRecoveryError(
@@ -481,6 +491,9 @@ export function SessionPage() {
         );
         return;
       }
+      const snapshot = parseSessionStreamSnapshotJson(await response.text());
+      if (!actionRequestRef.current.owns(controller)) return;
+      applySessionSnapshot(snapshot.session, snapshot.reset_history);
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
         setActionError(
@@ -508,6 +521,9 @@ export function SessionPage() {
         );
         return;
       }
+      const snapshot = parseSessionStreamSnapshotJson(await response.text());
+      if (!actionRequestRef.current.owns(controller)) return;
+      applySessionSnapshot(snapshot.session, snapshot.reset_history);
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
         setActionError(
@@ -570,6 +586,9 @@ export function SessionPage() {
         );
         return;
       }
+      const snapshot = parseSessionStreamSnapshotJson(await response.text());
+      if (!actionRequestRef.current.owns(controller)) return;
+      applySessionSnapshot(snapshot.session, snapshot.reset_history);
       setAnswer("");
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
@@ -668,11 +687,12 @@ export function SessionPage() {
 
   const isRunning = sessionRunning;
   const activeGoal = session?.active_goal ? session.goal : undefined;
+  const goalControlsBusy = goalBusy || session?.cancel_requested === true;
   const activeGoalBanner = activeGoal
     ? (
       <GoalModeBanner
         goal={activeGoal}
-        busy={goalBusy}
+        busy={goalControlsBusy}
         onDetails={() => setGoalDetailsOpen(true)}
         onPause={() => void pauseGoal()}
         onResume={() => void resumeGoal()}
@@ -822,7 +842,8 @@ export function SessionPage() {
           <button
             className="btn session-header-action stop-action"
             onClick={() => activeGoal ? void stopGoal() : void cancelSession()}
-            disabled={!isRunning && session.status !== "paused"}
+            disabled={session.cancel_requested ||
+              (!isRunning && session.status !== "paused")}
             aria-label="Stop session"
           >
             <i className="bi bi-stop-fill"></i>
@@ -1001,7 +1022,7 @@ export function SessionPage() {
           ? (
             <GoalPlanReview
               goal={activeGoal}
-              busy={goalBusy}
+              busy={goalControlsBusy}
               onApprove={(plan, amendmentId) =>
                 void approveGoalPlan(plan, amendmentId)}
               onDiscardAmendment={(amendmentId) =>
@@ -1028,7 +1049,8 @@ export function SessionPage() {
                 <button
                   className="btn btn-primary btn-sm"
                   type="button"
-                  disabled={goalBusy || activeGoal.run.stage !== "paused"}
+                  disabled={goalControlsBusy ||
+                    activeGoal.run.stage !== "paused"}
                   onClick={() => void editGoal()}
                 >
                   Review change
@@ -1036,7 +1058,8 @@ export function SessionPage() {
                 <button
                   className="btn btn-light btn-sm"
                   type="button"
-                  disabled={goalBusy || activeGoal.run.stage !== "paused"}
+                  disabled={goalControlsBusy ||
+                    activeGoal.run.stage !== "paused"}
                   onClick={() => void resumeGoal()}
                 >
                   Continue without change
@@ -1288,7 +1311,7 @@ export function SessionPage() {
                           <button
                             className="btn btn-primary"
                             type="button"
-                            disabled={goalBusy}
+                            disabled={goalControlsBusy}
                             onClick={() => {
                               setGoalDetailsOpen(false);
                               void acceptGoal();
@@ -1303,7 +1326,7 @@ export function SessionPage() {
                           <button
                             className="btn btn-primary"
                             type="button"
-                            disabled={goalBusy}
+                            disabled={goalControlsBusy}
                             onClick={() => {
                               setGoalDetailsOpen(false);
                               void resumeGoal();
@@ -1316,7 +1339,7 @@ export function SessionPage() {
                           <button
                             className="btn btn-light"
                             type="button"
-                            disabled={goalBusy ||
+                            disabled={goalControlsBusy ||
                               activeGoal.run.pause_requested}
                             onClick={() => {
                               setGoalDetailsOpen(false);
@@ -1331,6 +1354,7 @@ export function SessionPage() {
                       <button
                         className="btn btn-light"
                         type="button"
+                        disabled={goalControlsBusy}
                         onClick={() => {
                           setGoalDetailsOpen(false);
                           void editGoal();
@@ -1345,6 +1369,7 @@ export function SessionPage() {
                       <button
                         className="btn btn-outline-danger"
                         type="button"
+                        disabled={goalControlsBusy}
                         onClick={() => {
                           setGoalDetailsOpen(false);
                           void stopGoal();
@@ -1367,6 +1392,11 @@ export function SessionPage() {
               onSubmitted={() => {
                 setGoalEditOpen(false);
               }}
+              onSessionUpdated={(snapshot) =>
+                applySessionSnapshot(
+                  snapshot.session,
+                  snapshot.reset_history,
+                )}
             />
           )
           : null}
@@ -1382,6 +1412,8 @@ export function SessionPage() {
             setGoalStartOpen(false);
             setFollowUp("");
           }}
+          onSessionUpdated={(snapshot) =>
+            applySessionSnapshot(snapshot.session, snapshot.reset_history)}
         />
       </section>
     </div>

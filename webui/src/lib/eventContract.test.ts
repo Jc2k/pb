@@ -469,7 +469,6 @@ Deno.test("project snapshot parsing validates terminal transition semantics", ()
       active_goal: false,
       multi_task: null,
       active_multi_task: false,
-      revision: 2,
     }],
     overall_usage: {
       total: { tokens: 3, runtime_ms: 4, tool_calls: 1 },
@@ -549,6 +548,11 @@ Deno.test("Rust and TypeScript collection structs keep exact fields", async () =
     rustStructFields(server, "SessionListItem").sort(),
     "SessionItem fields drifted from the Rust list projection",
   );
+  deepEqual(
+    typescriptInterfaceFields(types, "SessionDetails").sort(),
+    rustStructFields(server, "SessionDetails").sort(),
+    "SessionDetails fields drifted across the Rust/TypeScript boundary",
+  );
 });
 
 Deno.test("session and project stream boundaries are server-authored", async () => {
@@ -563,6 +567,7 @@ Deno.test("session and project stream boundaries are server-authored", async () 
     const required of [
       'event("session_snapshot")',
       "reset_history: bool",
+      'route("/api/sessions/{id}/goal", post(start_session_goal))',
       "pub struct ProjectSessionSnapshot",
       "pub stream_id: String",
       "pub usage_window_start_ms: u64",
@@ -583,6 +588,7 @@ Deno.test("session and project stream boundaries are server-authored", async () 
     const required of [
       "export interface SessionStreamSnapshot",
       "reset_history: boolean",
+      "cancel_requested: boolean",
       "export interface ProjectSessionSnapshot",
     ]
   ) {
@@ -592,6 +598,11 @@ Deno.test("session and project stream boundaries are server-authored", async () 
   }
   if (!sessionPage.includes('addEventListener("session_snapshot"')) {
     throw new Error("session page does not consume server snapshots");
+  }
+  if (!server.includes("Result<Json<SessionStreamSnapshot>, ApiError>")) {
+    throw new Error(
+      "existing-session mutations do not return the stream snapshot projection",
+    );
   }
   if (!hooks.includes('projectSessionUrl("/api/project-sessions"')) {
     throw new Error("project pages do not consume the atomic server snapshot");

@@ -323,8 +323,12 @@ without reconstructing them from nearby events. Session snapshots and live event
 revision, preventing a slower snapshot response from reverting a newer title or running state.
 The browser addresses registered projects by durable ID rather than copying their names or filesystem
 paths into session, Goal, usage, notification, or integration requests. The service resolves that ID
-and returns structured failures for invalid or stale mutations. Successful browser mutations wait for
-those responses and streams instead of guessing the new lifecycle state. Live effects at or below
+and returns structured failures for invalid or stale mutations. Successful controls for an existing
+session return and apply the same revisioned snapshot used by the session stream; the stream then keeps
+other clients synchronized. The browser therefore does not guess lifecycle state or wait for SSE before
+clearing a completed control. A requested cancellation is explicit while work winds down, and the
+runner's resolved branch and focus root replace requested workspace values as soon as its `started`
+event is published. Live effects at or below
 the accepted snapshot revision are replay,
 while the SSE service sends revisioned session snapshots after state-changing events. When a browser
 reconnect cursor is no longer retained, the service marks the snapshot as a history reset rather

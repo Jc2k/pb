@@ -3,20 +3,34 @@ import type {
   GoalBudget,
   GoalContinuationPolicy,
   ProjectEntry,
+  SessionStreamSnapshot,
 } from "../types";
 import { apiErrorMessage } from "../lib/integrationConfig";
+import { parseSessionStreamSnapshotJson } from "../lib/eventContract";
 import { VoiceInputButton } from "./VoiceInputButton";
 
-interface GoalStartSheetProps {
+interface GoalStartSheetBaseProps {
   open: boolean;
   initialObjective: string;
   initialCriteria?: string[];
-  sessionId?: string;
   projectId?: string;
   projects?: ProjectEntry[];
   onClose: () => void;
   onStarted: (sessionId: string) => void;
 }
+
+type GoalStartSheetProps =
+  & GoalStartSheetBaseProps
+  & (
+    | {
+      sessionId: string;
+      onSessionUpdated: (snapshot: SessionStreamSnapshot) => void;
+    }
+    | {
+      sessionId?: undefined;
+      onSessionUpdated?: never;
+    }
+  );
 
 const EMPTY_PROJECTS: ProjectEntry[] = [];
 
@@ -58,6 +72,7 @@ export function GoalStartSheet({
   projects = EMPTY_PROJECTS,
   onClose,
   onStarted,
+  onSessionUpdated,
 }: GoalStartSheetProps) {
   const initialCriteriaKey = JSON.stringify(initialCriteria ?? []);
   const projectOptionsKey = projects.map(({ id, name }) => `${id}\u0000${name}`)
@@ -101,31 +116,39 @@ export function GoalStartSheet({
     setSubmitting(true);
     setError("");
     try {
-      const response = await fetch("/api/goals", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id: sessionId,
-          objective: objective.trim(),
-          project_id: sessionId ? undefined : selectedProjectId,
-          continuation,
-          budget: budgetPreset === "advanced"
-            ? advancedBudget
-            : GOAL_BUDGET_PRESETS[budgetPreset],
-          criteria: criteria
-            .map((criterion) => criterion.trim())
-            .filter(Boolean)
-            .map((text) => ({ text, verifier: "review_required" })),
-        }),
-      });
+      const response = await fetch(
+        sessionId ? `/api/sessions/${sessionId}/goal` : "/api/goals",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            objective: objective.trim(),
+            project_id: sessionId ? undefined : selectedProjectId,
+            continuation,
+            budget: budgetPreset === "advanced"
+              ? advancedBudget
+              : GOAL_BUDGET_PRESETS[budgetPreset],
+            criteria: criteria
+              .map((criterion) => criterion.trim())
+              .filter(Boolean)
+              .map((text) => ({ text, verifier: "review_required" })),
+          }),
+        },
+      );
       if (!response.ok) {
         setError(
           await apiErrorMessage(response, "pb could not create this goal."),
         );
         return;
       }
-      const result = (await response.json()) as { session_id: string };
-      onStarted(result.session_id);
+      if (sessionId) {
+        const snapshot = parseSessionStreamSnapshotJson(await response.text());
+        onSessionUpdated(snapshot);
+        onStarted(snapshot.session.session_id);
+      } else {
+        const result = (await response.json()) as { session_id: string };
+        onStarted(result.session_id);
+      }
     } catch (cause) {
       setError(
         cause instanceof Error

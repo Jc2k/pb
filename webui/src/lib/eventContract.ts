@@ -606,7 +606,6 @@ function sessionItem(value: unknown, index: number): SessionItem {
       "active_goal",
       "multi_task",
       "active_multi_task",
-      "revision",
     ],
     label,
   );
@@ -673,7 +672,6 @@ function sessionItem(value: unknown, index: number): SessionItem {
   if (session.multi_task !== null) {
     multiTaskSummary(session.multi_task, `${label} multi task`);
   }
-  nonNegativeInteger(session.revision, `${label} revision`);
   return session as unknown as SessionItem;
 }
 
@@ -1330,6 +1328,7 @@ function sessionDetails(value: unknown): SessionDetails {
     "title",
     "running",
     "paused",
+    "cancel_requested",
     "status",
     "intent",
     "branch",
@@ -1362,9 +1361,13 @@ function sessionDetails(value: unknown): SessionDetails {
   requiredString(session.task, "session task");
   nullableString(session.title, "session title");
   if (
-    typeof session.running !== "boolean" || typeof session.paused !== "boolean"
+    typeof session.running !== "boolean" ||
+    typeof session.paused !== "boolean" ||
+    typeof session.cancel_requested !== "boolean"
   ) {
-    throw new Error("session running and paused state must be boolean");
+    throw new Error(
+      "session running, paused, and cancellation state must be boolean",
+    );
   }
   enumValue(session.status, sessionStatuses, "session status");
   nullableEnum(session.intent, turnIntents, "session intent");

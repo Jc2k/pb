@@ -34,7 +34,6 @@ function session(status: SessionItem["status"]): SessionItem {
     active_goal: false,
     multi_task: null,
     active_multi_task: false,
-    revision: 0,
   };
 }
 

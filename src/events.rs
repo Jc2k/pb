@@ -2875,7 +2875,13 @@ pub(crate) fn event_entry_key(event: &AgentEvent) -> String {
 fn event_requires_session_snapshot(event: &AgentEvent) -> bool {
     matches!(
         event,
-        AgentEvent::DeliveryProposed { .. }
+        AgentEvent::Started { .. }
+            | AgentEvent::UserMessage { .. }
+            | AgentEvent::Correction {
+                kind: CorrectionKind::Lifecycle,
+                ..
+            }
+            | AgentEvent::DeliveryProposed { .. }
             | AgentEvent::GoalProposed { .. }
             | AgentEvent::GoalStarted { .. }
             | AgentEvent::GoalPlanAwaitingApproval { .. }
@@ -4602,6 +4608,36 @@ mod tests {
 
     #[test]
     fn lifecycle_effects_are_published_only_after_state_transitions() {
+        let started = EventEnvelope::new(AgentEvent::Started {
+            task: "review the boundary".to_string(),
+            model: "local".to_string(),
+            profile: AgentProfile::Review,
+            workspace: "/workspace".to_string(),
+            focus_root: Some("/workspace/project".to_string()),
+            branch: "feature/boundary".to_string(),
+            attachments: Vec::new(),
+            timestamp_ms: Some(1),
+        });
+        assert!(started.requires_session_snapshot());
+
+        let user_message = EventEnvelope::new(AgentEvent::UserMessage {
+            message_id: "message-1".to_string(),
+            message: "Keep going".to_string(),
+            timestamp_ms: Some(1),
+        });
+        assert!(user_message.requires_session_snapshot());
+
+        let cancellation = EventEnvelope::new(AgentEvent::Correction {
+            kind: CorrectionKind::Lifecycle,
+            message: "Cancellation requested".to_string(),
+            summary: "Cancellation requested".to_string(),
+            actor: TeamActor::workflow_steward(),
+            assisting_profile: Some(AgentProfile::Review),
+            nesting_depth: None,
+            timestamp_ms: Some(1),
+        });
+        assert!(cancellation.requires_session_snapshot());
+
         let final_message = EventEnvelope::new(AgentEvent::Final {
             content: "Done".to_string(),
             profile: AgentProfile::Build,
