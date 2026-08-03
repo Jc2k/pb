@@ -251,10 +251,15 @@ Deno.test("Rust and TypeScript expose the same event and profile variants", asyn
       "stream_id: string",
       "terminal_transition_floor: number",
       "terminal_transitions: ProjectSessionTerminalTransition[]",
+      "usage_window_start_ms: number",
+      "usage_window_end_ms: number",
       "projects: ProjectEntry[]",
       "sessions: SessionItem[]",
       "revision: number",
-      "project_usage: Record<string, ProjectUsageStats>",
+      "overall_usage: ProjectUsageSummary",
+      "project_usage: Record<string, ProjectUsageSummary>",
+      "total: ProjectUsageStats",
+      "today: ProjectUsageStats",
     ]
   ) {
     if (!types.includes(required)) {
@@ -274,6 +279,8 @@ Deno.test("project snapshot parsing validates terminal transition semantics", ()
   const snapshot = {
     stream_id: "process-a",
     revision: 2,
+    usage_window_start_ms: 1_767_225_600_000,
+    usage_window_end_ms: 1_767_312_000_000,
     terminal_transition_floor: 1,
     terminal_transitions: [{
       entry_key: "event-2",
@@ -290,13 +297,48 @@ Deno.test("project snapshot parsing validates terminal transition semantics", ()
         notify_on_finish: true,
       },
     }],
-    projects: [],
+    projects: [{
+      id: "project-1",
+      name: "pb",
+      path: "/workspace/pb",
+      notify_on_finish: true,
+    }],
     sessions: [],
-    project_usage: {},
+    overall_usage: {
+      total: { tokens: 3, runtime_ms: 4, tool_calls: 1 },
+      today: { tokens: 2, runtime_ms: 3, tool_calls: 1 },
+    },
+    project_usage: {
+      "project-1": {
+        total: { tokens: 3, runtime_ms: 4, tool_calls: 1 },
+        today: { tokens: 2, runtime_ms: 3, tool_calls: 1 },
+      },
+    },
   };
   deepEqual(
     parseProjectSessionSnapshotJson(JSON.stringify(snapshot)),
     snapshot,
+  );
+  const staleTransition = structuredClone(snapshot);
+  staleTransition.terminal_transitions[0].revision = 1;
+  throws(
+    () => parseProjectSessionSnapshotJson(JSON.stringify(staleTransition)),
+    /outside the snapshot delta/,
+  );
+  const unorderedTransitions = structuredClone(snapshot);
+  unorderedTransitions.terminal_transitions.push({
+    ...unorderedTransitions.terminal_transitions[0],
+    entry_key: "event-2-duplicate-revision",
+  });
+  throws(
+    () => parseProjectSessionSnapshotJson(JSON.stringify(unorderedTransitions)),
+    /out of order/,
+  );
+  const missingProjectUsage = structuredClone(snapshot);
+  Reflect.deleteProperty(missingProjectUsage.project_usage, "project-1");
+  throws(
+    () => parseProjectSessionSnapshotJson(JSON.stringify(missingProjectUsage)),
+    /contain every project exactly once/,
   );
   snapshot.terminal_transitions[0].status = "running";
   throws(
@@ -314,6 +356,7 @@ Deno.test("Rust and TypeScript collection structs keep exact fields", async () =
     const name of [
       "ProjectSessionSnapshot",
       "ProjectSessionTerminalTransition",
+      "ProjectUsageSummary",
     ]
   ) {
     deepEqual(
@@ -322,6 +365,11 @@ Deno.test("Rust and TypeScript collection structs keep exact fields", async () =
       `${name} fields drifted across the Rust/TypeScript boundary`,
     );
   }
+  deepEqual(
+    typescriptInterfaceFields(types, "SessionItem").sort(),
+    rustStructFields(server, "SessionListItem").sort(),
+    "SessionItem fields drifted from the Rust list projection",
+  );
 });
 
 Deno.test("session and project stream boundaries are server-authored", async () => {
@@ -338,6 +386,8 @@ Deno.test("session and project stream boundaries are server-authored", async () 
       "reset_history: bool",
       "pub struct ProjectSessionSnapshot",
       "pub stream_id: String",
+      "pub usage_window_start_ms: u64",
+      "pub usage_window_end_ms: u64",
       "pub terminal_transition_floor: u64",
       "pub terminal_transitions: Vec<ProjectSessionTerminalTransition>",
       'route("/api/project-sessions", get(list_project_sessions))',
@@ -364,11 +414,12 @@ Deno.test("session and project stream boundaries are server-authored", async () 
   if (!sessionPage.includes('addEventListener("session_snapshot"')) {
     throw new Error("session page does not consume server snapshots");
   }
-  if (!hooks.includes('fetch("/api/project-sessions"')) {
+  if (!hooks.includes('projectSessionUrl("/api/project-sessions"')) {
     throw new Error("project pages do not consume the atomic server snapshot");
   }
   if (
-    !hooks.includes('new EventSource("/api/project-sessions/events")') ||
+    !hooks.includes('"/api/project-sessions/events"') ||
+    !hooks.includes("projectSessionUrl(") ||
     hooks.includes("setInterval")
   ) {
     throw new Error(
@@ -385,14 +436,16 @@ Deno.test("session and project stream boundaries are server-authored", async () 
 });
 
 Deno.test("v5 consumers do not reconstruct omitted server state", async () => {
-  const [helpers, session, sessionPage, projectsPage, energy] = await Promise
-    .all([
-      Deno.readTextFile("webui/src/lib/helpers.ts"),
-      Deno.readTextFile("webui/src/components/Session.tsx"),
-      Deno.readTextFile("webui/src/pages/SessionPage.tsx"),
-      Deno.readTextFile("webui/src/pages/ProjectsPage.tsx"),
-      Deno.readTextFile("webui/src/lib/energy.ts"),
-    ]);
+  const [helpers, hooks, session, sessionPage, projectsPage, energy] =
+    await Promise
+      .all([
+        Deno.readTextFile("webui/src/lib/helpers.ts"),
+        Deno.readTextFile("webui/src/lib/hooks.ts"),
+        Deno.readTextFile("webui/src/components/Session.tsx"),
+        Deno.readTextFile("webui/src/pages/SessionPage.tsx"),
+        Deno.readTextFile("webui/src/pages/ProjectsPage.tsx"),
+        Deno.readTextFile("webui/src/lib/energy.ts"),
+      ]);
 
   for (
     const workaround of [
@@ -408,10 +461,14 @@ Deno.test("v5 consumers do not reconstruct omitted server state", async () => {
       "projectName(",
       "metrics.ended_at_ms ??",
       "metrics.started_at_ms ??",
+      "usageStatsForToday(",
+      "seenTerminalEntries",
+      "terminal_transitions.filter",
     ]
   ) {
     if (
-      helpers.includes(workaround) || session.includes(workaround) ||
+      helpers.includes(workaround) || hooks.includes(workaround) ||
+      session.includes(workaround) ||
       sessionPage.includes(workaround) || projectsPage.includes(workaround)
     ) {
       throw new Error(

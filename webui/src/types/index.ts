@@ -1421,7 +1421,6 @@ export interface SessionItem {
   started_at_ms: number;
   updated_at_ms: number;
   metrics: SessionMetricsSnapshot | null;
-  usage_records: SessionMetricsSnapshot[];
   workflow_id: string | null;
   workflow_stage: WorkflowStage | null;
   workflow_outcome: WorkflowOutcome | null;
@@ -1512,11 +1511,14 @@ export interface ProjectEntry {
 export interface ProjectSessionSnapshot {
   stream_id: string;
   revision: number;
+  usage_window_start_ms: number;
+  usage_window_end_ms: number;
   terminal_transition_floor: number;
   terminal_transitions: ProjectSessionTerminalTransition[];
   projects: ProjectEntry[];
   sessions: SessionItem[];
-  project_usage: Record<string, ProjectUsageStats>;
+  overall_usage: ProjectUsageSummary;
+  project_usage: Record<string, ProjectUsageSummary>;
 }
 
 export interface ProjectSessionTerminalTransition {
@@ -1536,6 +1538,11 @@ export interface ProjectUsageStats {
   tool_calls: number;
   energy_kwh?: number | null;
   energy_joules?: number | null;
+}
+
+export interface ProjectUsageSummary {
+  total: ProjectUsageStats;
+  today: ProjectUsageStats;
 }
 
 export type IntegrationKind = "mcp" | "lsp";

@@ -329,14 +329,24 @@ the accepted snapshot revision are replay,
 while the SSE service sends revisioned session snapshots after state-changing events. When a browser
 reconnect cursor is no longer retained, the service marks the snapshot as a history reset rather
 than joining non-contiguous transcript windows. Project pages consume a server-sent registry,
-session, project-usage, and terminal-transition snapshot instead of polling separate endpoints. Each
-service process gives that stream a new identity and monotonic revision, and only the live stream may
+session, usage-summary, and terminal-transition snapshot instead of polling separate endpoints. The
+browser supplies its local calendar-day bounds, and pb returns total and today summaries for all
+sessions and for every registered project; the browser does not download per-turn usage records to
+recalculate those cards. Each service process gives that stream a new identity and monotonic
+revision, and only the live stream may
 change the browser's accepted process identity, so a delayed HTTP response cannot restore an older
 process after restart. The service records a subscription-specific terminal-transition floor under
-the same publication lock as revisions and retained transitions. Projects added or removed through
+the same publication lock as revisions and retained transitions. The first snapshot includes only
+retained transitions above that floor, and each subsequent event advances it before producing the
+next delta. Projects added or removed through
 the CLI therefore appear without a browser reload, a session that finishes while the first snapshot
 is being built still produces one finish notification, and project/session identity and usage cannot
 drift between separate requests.
+
+Deleting a session continues its authoritative durable removal, usage update, and live publication
+even if the browser or terminal disconnects while the request is in flight. A durable deletion error
+leaves the session visible. Environment or managed-workspace cleanup failures after deletion are
+reported as warnings on the successful result.
 
 The service records an event before making it live. Terminal reattachment atomically captures
 history and subscribes, recovers a lagged receiver from sequence-numbered history, and drains final

@@ -5,11 +5,9 @@ import type {
   MarketplaceIntegration,
   ProjectEntry,
   ProjectSessionTerminalTransition,
-  ProjectUsageStats,
   SessionItem,
   TeamActor,
 } from "../types/index";
-import { metricEnergyJoules, metricRuntimeMs } from "./energy";
 import { teamActorKey } from "./team";
 
 export { getAvatarForProfile } from "./team";
@@ -427,48 +425,6 @@ export function sessionBelongsToProject(
 
 export function sessionProjectName(session: SessionItem): string {
   return session.project?.name ?? "Unknown project";
-}
-
-export function usageStatsForToday(
-  sessions: SessionItem[],
-  now = new Date(),
-): ProjectUsageStats {
-  const startOfToday = new Date(now);
-  startOfToday.setHours(0, 0, 0, 0);
-  const startMs = startOfToday.getTime();
-  const endMs = startMs + 86_400_000;
-
-  const totals: ProjectUsageStats = { tokens: 0, runtime_ms: 0, tool_calls: 0 };
-  sessions.forEach((session) => {
-    if (!session.metrics) return;
-    session.usage_records.forEach((metrics) => {
-      const runtime = metricRuntimeMs(metrics);
-      const endedAt = metrics.ended_at_ms;
-      const startedAt = metrics.started_at_ms;
-      const interval = Math.max(1, endedAt - startedAt);
-      const overlap = Math.max(
-        0,
-        Math.min(endedAt, endMs) - Math.max(startedAt, startMs),
-      );
-      if (overlap <= 0) return;
-      const share = Math.min(1, overlap / interval);
-      totals.tokens += (metrics.prompt_tokens + metrics.generated_tokens) *
-        share;
-      totals.runtime_ms += runtime * share;
-      totals.tool_calls += metrics.tool_calls * share;
-      const energy = metricEnergyJoules(metrics);
-      if (energy !== undefined) {
-        totals.energy_joules = (totals.energy_joules ?? 0) + energy * share;
-      }
-    });
-  });
-  totals.tokens = Math.round(totals.tokens);
-  totals.runtime_ms = Math.round(totals.runtime_ms);
-  totals.tool_calls = Math.round(totals.tool_calls);
-  if (totals.energy_joules !== undefined) {
-    totals.energy_kwh = (totals.energy_joules ?? 0) / 3_600_000;
-  }
-  return totals;
 }
 
 export function relativeTime(ms: number): string {

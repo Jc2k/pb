@@ -27,7 +27,6 @@ function session(status: SessionItem["status"]): SessionItem {
     started_at_ms: Date.now(),
     updated_at_ms: Date.now(),
     metrics: null,
-    usage_records: [],
     workflow_id: null,
     workflow_stage: null,
     workflow_outcome: null,

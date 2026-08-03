@@ -1,10 +1,6 @@
 /// <reference lib="deno.ns" />
 import { equal } from "node:assert/strict";
-import type {
-  EventEnvelope,
-  SessionItem,
-  SessionMetricsSnapshot,
-} from "../types/index";
+import type { EventEnvelope, SessionItem } from "../types/index";
 import {
   buildChatPresentation,
   CHAT_TIME_GAP_MS,
@@ -17,7 +13,6 @@ import {
   sessionProjectName,
   sessionTitle,
   toolResultForCall,
-  usageStatsForToday,
 } from "./helpers.ts";
 
 let testEventIndex = 0;
@@ -44,31 +39,6 @@ function eventEnvelopeDefaults(): Pick<
   };
 }
 
-function currentMetrics(
-  values: Partial<SessionMetricsSnapshot> = {},
-): SessionMetricsSnapshot {
-  return {
-    llm_invocations: 0,
-    llm_runtime_ms: 0,
-    prompt_tokens: 0,
-    generated_tokens: 0,
-    tool_calls: 0,
-    tool_runtime_ms: 0,
-    cache_persistence_queued_checkpoints: 0,
-    cache_persistence_completed_checkpoints: 0,
-    cache_persistence_wall_ms: 0,
-    cache_persistence_failures: 0,
-    wall_runtime_ms: 0,
-    display_energy_excluded: false,
-    idle_baseline_applied: false,
-    energy_complete: false,
-    energy_exclusive: false,
-    ...values,
-    started_at_ms: values.started_at_ms ?? 0,
-    ended_at_ms: values.ended_at_ms ?? 0,
-  };
-}
-
 function currentSession(values: Partial<SessionItem>): SessionItem {
   return {
     session_id: "session",
@@ -84,7 +54,6 @@ function currentSession(values: Partial<SessionItem>): SessionItem {
     pending_question: null,
     updated_at_ms: 0,
     metrics: null,
-    usage_records: [],
     workflow_id: null,
     workflow_stage: null,
     workflow_outcome: null,
@@ -721,83 +690,4 @@ Deno.test("projectSettingsPath encodes durable IDs under the project URL", () =>
     "/projects/project-alpha/settings",
   );
   equal(projectSettingsPath("project-123"), "/projects/project-123/settings");
-});
-
-Deno.test("usageStatsForToday sums metrics for sessions updated today", () => {
-  const today = new Date("2026-06-26T12:00:00");
-  const todayMetrics = currentMetrics({
-    llm_invocations: 1,
-    llm_runtime_ms: 1000,
-    prompt_tokens: 120,
-    generated_tokens: 30,
-    tool_calls: 2,
-    tool_runtime_ms: 500,
-    wall_runtime_ms: 1500,
-    started_at_ms: new Date("2026-06-26T08:29:58.500").getTime(),
-    ended_at_ms: new Date("2026-06-26T08:30:00").getTime(),
-    total_energy_joules: 10_800,
-    energy_complete: true,
-    energy_exclusive: true,
-  });
-  const yesterdayMetrics = currentMetrics({
-    llm_invocations: 1,
-    llm_runtime_ms: 2000,
-    prompt_tokens: 400,
-    generated_tokens: 100,
-    tool_calls: 5,
-    tool_runtime_ms: 1000,
-    wall_runtime_ms: 3000,
-    started_at_ms: new Date("2026-06-25T23:59:56").getTime(),
-    ended_at_ms: new Date("2026-06-25T23:59:59").getTime(),
-  });
-  const sessions = [
-    currentSession({
-      session_id: "today",
-      task: "Current work",
-      updated_at_ms: new Date("2026-06-26T08:30:00").getTime(),
-      metrics: todayMetrics,
-      usage_records: [todayMetrics],
-    }),
-    currentSession({
-      session_id: "yesterday",
-      task: "Old work",
-      updated_at_ms: new Date("2026-06-25T23:59:59").getTime(),
-      metrics: yesterdayMetrics,
-      usage_records: [yesterdayMetrics],
-    }),
-  ];
-
-  const stats = usageStatsForToday(sessions, today);
-
-  equal(stats.tokens, 150);
-  equal(stats.runtime_ms, 1500);
-  equal(stats.tool_calls, 2);
-  equal(stats.energy_kwh, 0.003);
-});
-
-Deno.test("usageStatsForToday uses per-turn windows and apportions midnight overlap", () => {
-  const record = currentMetrics({
-    llm_invocations: 1,
-    llm_runtime_ms: 120_000,
-    prompt_tokens: 80,
-    generated_tokens: 20,
-    tool_calls: 4,
-    tool_runtime_ms: 0,
-    wall_runtime_ms: 120_000,
-    started_at_ms: new Date("2026-06-25T23:59:00").getTime(),
-    ended_at_ms: new Date("2026-06-26T00:01:00").getTime(),
-    total_energy_joules: 120,
-  });
-  const stats = usageStatsForToday([currentSession({
-    session_id: "midnight",
-    task: "Cross midnight",
-    updated_at_ms: record.ended_at_ms,
-    metrics: record,
-    usage_records: [record],
-  })], new Date("2026-06-26T12:00:00"));
-
-  equal(stats.tokens, 50);
-  equal(stats.runtime_ms, 60_000);
-  equal(stats.tool_calls, 2);
-  equal(stats.energy_joules, 60);
 });

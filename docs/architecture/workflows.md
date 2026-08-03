@@ -802,10 +802,11 @@ wording, or adjacency.
 Every tool call and result also carries a required durable call ID and batch ID. Results require a
 typed outcome and measured duration, so replay and browser grouping correlate exact calls without a
 tool-name or actor fallback. Current session list/detail responses always include their nullable
-state fields and empty collections explicitly, including pending questions and per-turn usage
-records. They also carry the durable session start time directly; the browser does not derive it
-from a bounded event window. The TypeScript contract does not model those server fields as
-optionally omitted.
+state fields explicitly, including pending questions. Detail responses include the complete per-turn
+usage records needed for that session's diagnostics; collection snapshots instead carry
+server-aggregated total and requested-day summaries and omit those records. Both projections carry
+the durable session start time directly; the browser does not derive it from a bounded event window.
+The TypeScript contract does not model those server fields as optionally omitted.
 
 Error events likewise carry a required concise summary and a separate required diagnostic detail.
 Consumers render that split directly instead of extracting a heading from diagnostic prose.

@@ -1,11 +1,18 @@
 /// <reference lib="deno.ns" />
-import { equal, ok } from "node:assert/strict";
-import { LatestRequest, ProjectSessionStreamCursor } from "../lib/hooks.ts";
+import { deepEqual, equal, ok } from "node:assert/strict";
+import {
+  currentUsageWindow,
+  LatestRequest,
+  ProjectSessionStreamCursor,
+} from "../lib/hooks.ts";
 import type {
   ProjectSessionSnapshot,
   ProjectSessionTerminalTransition,
 } from "../types/index.ts";
-import { nextProjectNotificationPreference } from "./ProjectsPage.tsx";
+import {
+  nextProjectNotificationPreference,
+  recoverProjectSettings,
+} from "./ProjectsPage.tsx";
 
 Deno.test("nextProjectNotificationPreference flips the project notification setting", () => {
   equal(nextProjectNotificationPreference({ notify_on_finish: false }), true);
@@ -55,10 +62,16 @@ function projectSnapshot(
   return {
     stream_id: streamId,
     revision,
+    usage_window_start_ms: 1_767_225_600_000,
+    usage_window_end_ms: 1_767_312_000_000,
     terminal_transition_floor: terminalTransitionFloor,
     terminal_transitions: terminalTransitions,
     projects: [],
     sessions: [],
+    overall_usage: {
+      total: { tokens: 0, runtime_ms: 0, tool_calls: 0 },
+      today: { tokens: 0, runtime_ms: 0, tool_calls: 0 },
+    },
     project_usage: {},
   };
 }
@@ -95,26 +108,22 @@ Deno.test("project stream authority rejects stale process generations", () => {
   equal(startup.accept(projectSnapshot("process-a", 5), "stream"), null);
 });
 
-Deno.test("project stream consumes only server-authored terminal transitions after its floor", () => {
+Deno.test("project stream trusts server-authored per-connection terminal deltas", () => {
   const cursor = new ProjectSessionStreamCursor();
-  const preexisting = terminalTransition("old", 3);
   const racedWithInitialSnapshot = terminalTransition("fast", 4);
   const initial = cursor.accept(
-    projectSnapshot("process-a", 4, 3, [
-      preexisting,
-      racedWithInitialSnapshot,
-    ]),
+    projectSnapshot("process-a", 4, 3, [racedWithInitialSnapshot]),
     "stream",
   );
   equal(initial?.terminalTransitions.length, 1);
   equal(initial?.terminalTransitions[0].entry_key, "fast");
+  equal(cursor.resumeCursor(), "process-a:4");
 
-  const duplicate = cursor.accept(
-    projectSnapshot("process-a", 4, 3, [racedWithInitialSnapshot]),
+  const overlappingConnection = cursor.accept(
+    projectSnapshot("process-a", 4, 4),
     "stream",
   );
-  equal(duplicate?.applyData, false);
-  equal(duplicate?.terminalTransitions.length, 0);
+  equal(overlappingConnection?.terminalTransitions.length, 0);
 
   const afterReconnect = terminalTransition("reconnected", 5);
   const replay = cursor.accept(
@@ -122,6 +131,26 @@ Deno.test("project stream consumes only server-authored terminal transitions aft
     "stream",
   );
   equal(replay?.terminalTransitions[0].entry_key, "reconnected");
+});
+
+Deno.test("project usage windows follow the browser's local calendar day", () => {
+  const window = currentUsageWindow(new Date(2026, 5, 26, 12));
+  const start = new Date(window.start_ms);
+  const end = new Date(window.end_ms);
+  equal(start.getHours(), 0);
+  equal(end.getHours(), 0);
+  equal(end.getDate(), start.getDate() + 1);
+});
+
+Deno.test("project settings recovery clears the presented mutation error before refresh", async () => {
+  const events: string[] = [];
+  await recoverProjectSettings(
+    async () => {
+      events.push("refresh");
+    },
+    (message) => events.push(`clear:${message}`),
+  );
+  deepEqual(events, ["clear:", "refresh"]);
 });
 
 Deno.test("project index uses the shared workspace frame", async () => {
@@ -223,18 +252,18 @@ Deno.test("project pages distinguish loading and API failures from empty state",
   ok(page.includes("Loading project settings"));
   ok(page.includes("dataError && projects.length > 0"));
   ok(hooks.includes("Project data request failed"));
-  ok(hooks.includes('fetch("/api/project-sessions"'));
+  ok(hooks.includes('projectSessionUrl("/api/project-sessions"'));
   ok(hooks.includes("dataRequest.current.start()"));
   ok(hooks.includes("snapshot.projects"));
   ok(hooks.includes("snapshot.sessions"));
-  ok(hooks.includes('new EventSource("/api/project-sessions/events")'));
+  ok(hooks.includes("snapshot.overall_usage"));
+  ok(hooks.includes('"/api/project-sessions/events"'));
   ok(hooks.includes('addEventListener("project_session_snapshot"'));
   ok(!hooks.includes("    void fetchData();"));
   ok(hooks.includes("ProjectSessionStreamCursor"));
-  ok(hooks.includes("snapshot.terminal_transitions.filter"));
-  ok(
-    hooks.includes("transition.revision <= snapshot.terminal_transition_floor"),
-  );
+  ok(hooks.includes("? snapshot.terminal_transitions"));
+  ok(!hooks.includes("seenTerminalEntries"));
+  ok(!hooks.includes("snapshot.terminal_transitions.filter"));
   ok(!hooks.includes("previous !== session.status"));
   ok(!hooks.includes("setInterval"));
   ok(hooks.includes("dataLoading"));
@@ -248,6 +277,7 @@ Deno.test("project pages distinguish loading and API failures from empty state",
   ok(!hooks.includes("refreshProjects"));
   ok(!hooks.includes('fetch("/api/sessions"'));
   ok(page.includes("projectUsage[project.id]"));
+  ok(!page.includes("usageStatsForToday"));
   ok(
     !page.includes(
       "fetch(`/api/projects/${encodeURIComponent(project.id)}/usage`",
@@ -260,6 +290,7 @@ Deno.test("project pages distinguish loading and API failures from empty state",
   ok(!page.includes("setInterval"));
   ok(page.includes("encodeURIComponent(project.id)"));
   ok(!page.includes("encodeURIComponent(project.name)"));
+  ok(page.includes("recoverProjectSettings(fetchProjects"));
 });
 
 Deno.test("project integration mutations apply their authoritative response", async () => {

@@ -13,14 +13,9 @@ import {
   SessionRows,
   UsageMetrics,
 } from "../components/SessionDashboard";
-import type {
-  ComposerMode,
-  ProjectUsageStats,
-  SessionAttachment,
-} from "../types";
-import { relativeTime, usageStatsForToday } from "../lib/helpers";
+import type { ComposerMode, SessionAttachment } from "../types";
+import { relativeTime } from "../lib/helpers";
 import { useProjectSessionData } from "../lib/hooks";
-import { metricEnergyJoules, metricRuntimeMs } from "../lib/energy";
 
 export function HomePage() {
   const [task, setTask] = useState("");
@@ -30,31 +25,13 @@ export function HomePage() {
   const [voiceInputActive, setVoiceInputActive] = useState(false);
   const [images, setImages] = useState<SessionAttachment[]>([]);
   const [filter, setFilter] = useState<SessionFilter>("all");
-  const { sessions, projects } = useProjectSessionData();
+  const { sessions, projects, overallUsage } = useProjectSessionData();
   const navigate = useNavigate();
 
   const counts = useMemo(() => sessionCounts(sessions), [sessions]);
   const visibleSessions = filter === "all"
     ? sessions
     : sessions.filter((session) => session.status === filter);
-  const usage = useMemo<ProjectUsageStats>(
-    () =>
-      sessions.reduce<ProjectUsageStats>((totals, session) => {
-        if (!session.metrics) return totals;
-        totals.tokens += session.metrics.prompt_tokens +
-          session.metrics.generated_tokens;
-        totals.runtime_ms += metricRuntimeMs(session.metrics);
-        totals.tool_calls += session.metrics.tool_calls;
-        const energy = metricEnergyJoules(session.metrics);
-        if (energy !== undefined) {
-          totals.energy_joules = (totals.energy_joules ?? 0) + energy;
-          totals.energy_kwh = totals.energy_joules / 3_600_000;
-        }
-        return totals;
-      }, { tokens: 0, runtime_ms: 0, tool_calls: 0 }),
-    [sessions],
-  );
-  const todaysUsage = useMemo(() => usageStatsForToday(sessions), [sessions]);
   const runningSession = sessions.find((session) =>
     session.status === "running"
   );
@@ -223,8 +200,8 @@ export function HomePage() {
               </div>
               <div className="info-list usage-list">
                 <UsageMetrics
-                  usage={usage}
-                  todaysUsage={todaysUsage}
+                  usage={overallUsage.total}
+                  todaysUsage={overallUsage.today}
                   scopeLabel="Across all sessions"
                 />
               </div>

@@ -43,6 +43,27 @@ function requiredString(value: unknown, label: string): string {
   return value;
 }
 
+function projectUsageStats(value: unknown, label: string): void {
+  const stats = record(value, label);
+  nonNegativeInteger(stats.tokens, `${label} tokens`);
+  nonNegativeInteger(stats.runtime_ms, `${label} runtime`);
+  nonNegativeInteger(stats.tool_calls, `${label} tool calls`);
+  for (const field of ["energy_kwh", "energy_joules"] as const) {
+    const energy = stats[field];
+    if (energy !== null && energy !== undefined) {
+      if (finiteNumber(energy, `${label} ${field}`) < 0) {
+        throw new Error(`${label} ${field} must be non-negative`);
+      }
+    }
+  }
+}
+
+function projectUsageSummary(value: unknown, label: string): void {
+  const summary = record(value, label);
+  projectUsageStats(summary.total, `${label} total`);
+  projectUsageStats(summary.today, `${label} today`);
+}
+
 const handoffOutcomes = new Set([
   "pending",
   "ready",
@@ -164,6 +185,20 @@ export function parseProjectSessionSnapshotJson(
     snapshot.revision,
     "project session revision",
   );
+  const usageWindowStart = nonNegativeInteger(
+    snapshot.usage_window_start_ms,
+    "project usage window start",
+  );
+  const usageWindowEnd = nonNegativeInteger(
+    snapshot.usage_window_end_ms,
+    "project usage window end",
+  );
+  if (
+    usageWindowEnd <= usageWindowStart ||
+    usageWindowEnd - usageWindowStart > 172_800_000
+  ) {
+    throw new Error("project usage window must be a positive 48-hour interval");
+  }
   const transitionFloor = nonNegativeInteger(
     snapshot.terminal_transition_floor,
     "project session terminal transition floor",
@@ -175,8 +210,13 @@ export function parseProjectSessionSnapshotJson(
     throw new Error("project session terminal transitions must be an array");
   }
   const transitions = snapshot.terminal_transitions.map(terminalTransition);
-  if (transitions.some((transition) => transition.revision > revision)) {
-    throw new Error("terminal transition exceeds the snapshot revision");
+  if (
+    transitions.some((transition) =>
+      transition.revision <= transitionFloor ||
+      transition.revision > revision
+    )
+  ) {
+    throw new Error("terminal transition falls outside the snapshot delta");
   }
   if (
     new Set(transitions.map((transition) => transition.entry_key)).size !==
@@ -184,9 +224,41 @@ export function parseProjectSessionSnapshotJson(
   ) {
     throw new Error("project session terminal transitions contain duplicates");
   }
+  if (
+    transitions.some((transition, index) =>
+      index > 0 && transitions[index - 1].revision >= transition.revision
+    )
+  ) {
+    throw new Error("project session terminal transitions are out of order");
+  }
   if (!Array.isArray(snapshot.projects) || !Array.isArray(snapshot.sessions)) {
     throw new Error("project session collections must be arrays");
   }
-  record(snapshot.project_usage, "project usage snapshot");
+  const projectIds = snapshot.projects.map((value, index) => {
+    const project = record(value, `project ${index}`);
+    return requiredString(project.id, `project ${index} id`);
+  });
+  if (new Set(projectIds).size !== projectIds.length) {
+    throw new Error("project session snapshot contains duplicate projects");
+  }
+  projectUsageSummary(snapshot.overall_usage, "overall usage summary");
+  const projectUsage = record(snapshot.project_usage, "project usage snapshot");
+  const usageIds = Object.keys(projectUsage);
+  if (
+    usageIds.length !== projectIds.length ||
+    projectIds.some((projectId) => !Object.hasOwn(projectUsage, projectId))
+  ) {
+    throw new Error(
+      "project usage snapshot must contain every project exactly once",
+    );
+  }
+  for (const projectId of usageIds) {
+    if (!projectIds.includes(projectId)) {
+      throw new Error(
+        `project usage snapshot contains unknown project ${projectId}`,
+      );
+    }
+    projectUsageSummary(projectUsage[projectId], `project ${projectId} usage`);
+  }
   return snapshot as unknown as ProjectSessionSnapshot;
 }

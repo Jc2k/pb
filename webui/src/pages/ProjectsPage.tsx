@@ -8,7 +8,7 @@ import type {
   MarketplaceIntegration,
   PendingIntegrationInstall,
   ProjectEntry,
-  ProjectUsageStats,
+  ProjectUsageSummary,
   SessionAttachment,
   SessionItem,
 } from "../types";
@@ -42,7 +42,6 @@ import {
   sessionTitle,
   uniqueInstalledIntegrations,
   uniqueIntegrations,
-  usageStatsForToday,
 } from "../lib/helpers";
 import {
   isAbortError,
@@ -165,12 +164,25 @@ export function ProjectsPage() {
   );
 }
 
+const EMPTY_USAGE_SUMMARY: ProjectUsageSummary = {
+  total: { tokens: 0, runtime_ms: 0, tool_calls: 0 },
+  today: { tokens: 0, runtime_ms: 0, tool_calls: 0 },
+};
+
 type ProjectDetailsTab = "usage" | "overview" | "snapshot";
 
 export function nextProjectNotificationPreference(
   project: Pick<ProjectEntry, "notify_on_finish">,
 ): boolean {
   return !project.notify_on_finish;
+}
+
+export async function recoverProjectSettings(
+  refresh: () => Promise<void>,
+  clearMutationError: (message: string) => void,
+): Promise<void> {
+  clearMutationError("");
+  await refresh();
 }
 
 function projectMcpIntegrations(
@@ -210,13 +222,7 @@ export function ProjectPage() {
     ? decodeURIComponent(encodedProjectId)
     : "";
   const project = projects.find((entry) => entry.id === projectId);
-  const usage: ProjectUsageStats = project
-    ? projectUsage[project.id] || {
-      tokens: 0,
-      runtime_ms: 0,
-      tool_calls: 0,
-    }
-    : { tokens: 0, runtime_ms: 0, tool_calls: 0 };
+  const usage = project ? projectUsage[project.id] : EMPTY_USAGE_SUMMARY;
   const usageLoading = dataLoading && !project;
   const usageError = dataError;
   const projectSessions = useMemo(
@@ -237,9 +243,6 @@ export function ProjectPage() {
   const lastActive = projectSessions[0]?.updated_at_ms
     ? relativeTime(projectSessions[0].updated_at_ms)
     : "No activity yet";
-  const todaysUsage = useMemo(() => usageStatsForToday(projectSessions), [
-    projectSessions,
-  ]);
   const latestBranch = projectSessions[0]?.branch || "Managed automatically";
 
   useEffect(() => {
@@ -301,8 +304,8 @@ export function ProjectPage() {
     ? <p className="text-danger small">{usageError}</p>
     : (
       <UsageMetrics
-        usage={usage}
-        todaysUsage={todaysUsage}
+        usage={usage.total}
+        todaysUsage={usage.today}
         scopeLabel="Across project sessions"
       />
     );
@@ -725,6 +728,10 @@ export function ProjectSettingsPage() {
     : "";
   const project = projects.find((entry) => entry.id === projectId);
   const projectsError = projectsMutationError || projectsDataError;
+  const retryProjects = useCallback(
+    () => recoverProjectSettings(fetchProjects, setProjectsMutationError),
+    [fetchProjects],
+  );
   const integrationError = integrationMutationError || installedError ||
     marketplaceError;
   const filteredMarketplace = marketplace.filter((item) => {
@@ -1058,7 +1065,7 @@ export function ProjectSettingsPage() {
             <button
               type="button"
               className="btn btn-sm btn-link"
-              onClick={() => void fetchProjects()}
+              onClick={() => void retryProjects()}
             >
               Try again
             </button>
@@ -1074,7 +1081,7 @@ export function ProjectSettingsPage() {
                 <button
                   type="button"
                   className="btn btn-sm btn-link"
-                  onClick={() => void fetchProjects()}
+                  onClick={() => void retryProjects()}
                 >
                   Try again
                 </button>

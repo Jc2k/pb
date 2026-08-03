@@ -3,7 +3,7 @@ import type {
   ProjectEntry,
   ProjectSessionSnapshot,
   ProjectSessionTerminalTransition,
-  ProjectUsageStats,
+  ProjectUsageSummary,
   SessionItem,
 } from "../types";
 import { notifySessionFinished } from "./helpers";
@@ -40,12 +40,39 @@ export interface ProjectSessionSnapshotDecision {
   terminalTransitions: ProjectSessionTerminalTransition[];
 }
 
+export interface UsageWindow {
+  start_ms: number;
+  end_ms: number;
+}
+
+export function currentUsageWindow(now = new Date()): UsageWindow {
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 1);
+  return { start_ms: start.getTime(), end_ms: end.getTime() };
+}
+
+function projectSessionUrl(
+  path: string,
+  window: UsageWindow,
+  lastEventId?: string,
+): string {
+  const query = new URLSearchParams({
+    usage_window_start_ms: String(window.start_ms),
+    usage_window_end_ms: String(window.end_ms),
+  });
+  if (lastEventId) query.set("last_event_id", lastEventId);
+  return `${path}?${query}`;
+}
+
 export class ProjectSessionStreamCursor {
   private eventStreamId: string | null = null;
+  private eventRevision = -1;
   private dataStreamId: string | null = null;
   private revision = -1;
+  private usageWindowStartMs = -1;
   private readonly retiredStreamIds = new Set<string>();
-  private readonly seenTerminalEntries = new Set<string>();
 
   accept(
     snapshot: ProjectSessionSnapshot,
@@ -64,29 +91,42 @@ export class ProjectSessionStreamCursor {
       if (this.retiredStreamIds.has(snapshot.stream_id)) return null;
       if (this.eventStreamId) this.retiredStreamIds.add(this.eventStreamId);
       this.eventStreamId = snapshot.stream_id;
+      this.eventRevision = -1;
       if (snapshot.stream_id !== this.dataStreamId) {
         this.dataStreamId = snapshot.stream_id;
         this.revision = -1;
       }
-      this.seenTerminalEntries.clear();
     }
 
-    const terminalTransitions = source === "stream"
-      ? snapshot.terminal_transitions.filter((transition) => {
-        if (
-          transition.revision <= snapshot.terminal_transition_floor ||
-          this.seenTerminalEntries.has(transition.entry_key)
-        ) return false;
-        this.seenTerminalEntries.add(transition.entry_key);
-        return true;
-      })
+    const advancesEventCursor = source === "stream" &&
+      snapshot.revision > this.eventRevision;
+    const terminalTransitions = advancesEventCursor
+      ? snapshot.terminal_transitions
       : [];
+    if (advancesEventCursor) this.eventRevision = snapshot.revision;
+    const usageWindowChanged =
+      snapshot.usage_window_start_ms !== this.usageWindowStartMs;
     const applyData = snapshot.stream_id === this.dataStreamId &&
-      snapshot.revision > this.revision;
-    if (applyData) this.revision = snapshot.revision;
+      (snapshot.revision > this.revision ||
+        (snapshot.revision === this.revision && usageWindowChanged));
+    if (applyData) {
+      this.revision = snapshot.revision;
+      this.usageWindowStartMs = snapshot.usage_window_start_ms;
+    }
     return { applyData, terminalTransitions };
   }
+
+  resumeCursor(): string | undefined {
+    return this.eventStreamId !== null && this.eventRevision >= 0
+      ? `${this.eventStreamId}:${this.eventRevision}`
+      : undefined;
+  }
 }
+
+const EMPTY_USAGE_SUMMARY: ProjectUsageSummary = {
+  total: { tokens: 0, runtime_ms: 0, tool_calls: 0 },
+  today: { tokens: 0, runtime_ms: 0, tool_calls: 0 },
+};
 
 export function useProjectSessionData(
   { finishNotifications = true }: { finishNotifications?: boolean } = {},
@@ -94,8 +134,14 @@ export function useProjectSessionData(
   const [sessions, setSessions] = useState<SessionItem[]>([]);
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [projectUsage, setProjectUsage] = useState<
-    Record<string, ProjectUsageStats>
+    Record<string, ProjectUsageSummary>
   >({});
+  const [overallUsage, setOverallUsage] = useState<ProjectUsageSummary>(
+    EMPTY_USAGE_SUMMARY,
+  );
+  const [usageWindow, setUsageWindow] = useState<UsageWindow>(() =>
+    currentUsageWindow()
+  );
   const [dataLoading, setDataLoading] = useState(true);
   const [dataError, setDataError] = useState("");
   const dataRequest = useRef(new LatestRequest());
@@ -123,15 +169,19 @@ export function useProjectSessionData(
     if (!decision.applyData) return;
     setProjects(snapshot.projects);
     setSessions(snapshot.sessions);
+    setOverallUsage(snapshot.overall_usage);
     setProjectUsage(snapshot.project_usage);
   }, [finishNotifications]);
 
   const fetchData = useCallback(async () => {
     const controller = dataRequest.current.start();
     try {
-      const res = await fetch("/api/project-sessions", {
-        signal: controller.signal,
-      });
+      const res = await fetch(
+        projectSessionUrl("/api/project-sessions", usageWindow),
+        {
+          signal: controller.signal,
+        },
+      );
       if (!res.ok) {
         throw new Error(
           await apiErrorMessage(res, "Project data request failed"),
@@ -153,10 +203,23 @@ export function useProjectSessionData(
         setDataLoading(false);
       }
     }
-  }, [applySnapshot]);
+  }, [applySnapshot, usageWindow]);
 
   useEffect(() => {
-    const source = new EventSource("/api/project-sessions/events");
+    const timer = globalThis.setTimeout(() => {
+      setUsageWindow(currentUsageWindow());
+    }, Math.max(1_000, usageWindow.end_ms - Date.now() + 100));
+    return () => globalThis.clearTimeout(timer);
+  }, [usageWindow.end_ms]);
+
+  useEffect(() => {
+    const source = new EventSource(
+      projectSessionUrl(
+        "/api/project-sessions/events",
+        usageWindow,
+        streamCursor.current.resumeCursor(),
+      ),
+    );
     source.addEventListener("project_session_snapshot", (message) => {
       try {
         applySnapshot((message as MessageEvent<string>).data, "stream");
@@ -175,11 +238,12 @@ export function useProjectSessionData(
       source.close();
       dataRequest.current.abort();
     };
-  }, [applySnapshot]);
+  }, [applySnapshot, usageWindow]);
 
   return {
     sessions,
     projects,
+    overallUsage,
     projectUsage,
     dataLoading,
     dataError,

@@ -211,7 +211,6 @@ pub struct SessionListItem {
     pub started_at_ms: u64,
     pub updated_at_ms: u64,
     pub metrics: Option<SessionMetricsSnapshot>,
-    pub usage_records: Vec<SessionMetricsSnapshot>,
     pub workflow_id: Option<String>,
     pub workflow_stage: Option<crate::workflow::WorkflowStage>,
     pub workflow_outcome: Option<crate::workflow::WorkflowOutcome>,
@@ -227,11 +226,14 @@ pub struct SessionListItem {
 pub struct ProjectSessionSnapshot {
     pub stream_id: String,
     pub revision: u64,
+    pub usage_window_start_ms: u64,
+    pub usage_window_end_ms: u64,
     pub terminal_transition_floor: u64,
     pub terminal_transitions: Vec<ProjectSessionTerminalTransition>,
     pub projects: Vec<ProjectEntry>,
     pub sessions: Vec<SessionListItem>,
-    pub project_usage: HashMap<String, ProjectUsageStats>,
+    pub overall_usage: ProjectUsageSummary,
+    pub project_usage: HashMap<String, ProjectUsageSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -267,6 +269,12 @@ pub struct ProjectUsageStats {
     pub energy_joules: Option<f64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectUsageSummary {
+    pub total: ProjectUsageStats,
+    pub today: ProjectUsageStats,
+}
+
 impl ProjectUsageStats {
     fn add_metrics(&mut self, metrics: &SessionMetricsSnapshot) {
         self.tokens = self.tokens.saturating_add(
@@ -274,14 +282,7 @@ impl ProjectUsageStats {
                 .prompt_tokens
                 .saturating_add(metrics.generated_tokens),
         );
-        let runtime = if metrics.wall_runtime_ms > 0 {
-            metrics.wall_runtime_ms
-        } else {
-            metrics
-                .llm_runtime_ms
-                .saturating_add(metrics.tool_runtime_ms)
-        };
-        self.runtime_ms = self.runtime_ms.saturating_add(runtime);
+        self.runtime_ms = self.runtime_ms.saturating_add(metrics_runtime_ms(metrics));
         self.tool_calls = self.tool_calls.saturating_add(metrics.tool_calls);
         if let Some(energy_joules) = metrics_energy_joules(metrics) {
             self.energy_joules = Some(self.energy_joules.unwrap_or(0.0) + energy_joules);
@@ -295,14 +296,7 @@ impl ProjectUsageStats {
                 .prompt_tokens
                 .saturating_add(metrics.generated_tokens),
         );
-        let runtime = if metrics.wall_runtime_ms > 0 {
-            metrics.wall_runtime_ms
-        } else {
-            metrics
-                .llm_runtime_ms
-                .saturating_add(metrics.tool_runtime_ms)
-        };
-        self.runtime_ms = self.runtime_ms.saturating_sub(runtime);
+        self.runtime_ms = self.runtime_ms.saturating_sub(metrics_runtime_ms(metrics));
         self.tool_calls = self.tool_calls.saturating_sub(metrics.tool_calls);
         if let Some(energy) = metrics_energy_joules(metrics) {
             let remaining = (self.energy_joules.unwrap_or(0.0) - energy).max(0.0);
@@ -809,7 +803,6 @@ pub async fn run_server_with_ready(
         .route("/api/project-sessions", get(list_project_sessions))
         .route("/api/project-sessions/events", get(project_session_events))
         .route("/api/projects", get(list_projects))
-        .route("/api/projects/{id}/usage", get(get_project_usage))
         .route(
             "/api/integrations/marketplace",
             get(list_marketplace_integrations),
@@ -933,6 +926,39 @@ async fn list_marketplace_integrations()
 #[derive(Debug, Deserialize)]
 struct IntegrationSchemaQuery {
     image: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProjectSessionQuery {
+    usage_window_start_ms: u64,
+    usage_window_end_ms: u64,
+    #[serde(default)]
+    last_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UsageWindow {
+    start_ms: u64,
+    end_ms: u64,
+}
+
+impl ProjectSessionQuery {
+    fn usage_window(&self) -> Result<UsageWindow, ApiError> {
+        self.usage_window_end_ms
+            .checked_sub(self.usage_window_start_ms)
+            .filter(|duration| *duration > 0 && *duration <= 172_800_000)
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_usage_window",
+                    "usage window must be a positive interval no longer than 48 hours",
+                )
+            })?;
+        Ok(UsageWindow {
+            start_ms: self.usage_window_start_ms,
+            end_ms: self.usage_window_end_ms,
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -3561,9 +3587,20 @@ async fn delete_session_inner(
     state: AppState,
     id: &str,
 ) -> Result<DeleteSessionResponse, DeleteSessionError> {
+    // Keep every authoritative phase in one owned task. Dropping a disconnected HTTP or RPC
+    // response future then detaches this task instead of cancelling the transaction between awaits.
+    tokio::spawn(delete_session_transaction(state, id.to_string()))
+        .await
+        .map_err(|error| anyhow::anyhow!("session deletion transaction failed: {error}"))?
+}
+
+async fn delete_session_transaction(
+    state: AppState,
+    id: String,
+) -> Result<DeleteSessionResponse, DeleteSessionError> {
     let session = {
         let mut sessions = state.sessions.lock().await;
-        let Some(session) = sessions.get(id) else {
+        let Some(session) = sessions.get(&id) else {
             return Err(DeleteSessionError::NotFound(format!(
                 "session not found: {id}"
             )));
@@ -3581,7 +3618,7 @@ async fn delete_session_inner(
             .clone()
             .or_else(|| session.request_template.workdir.clone());
         if let Some(workdir) = persisted_workdir {
-            let session_id = id.to_string();
+            let session_id = id.clone();
             tokio::task::spawn_blocking(move || {
                 session_store::delete_session(&workdir, &session_id)
             })
@@ -3589,7 +3626,7 @@ async fn delete_session_inner(
             .map_err(|error| anyhow::anyhow!("session persistence deletion task failed: {error}"))?
             .map_err(anyhow::Error::from)?;
         }
-        sessions.remove(id).expect("session exists")
+        sessions.remove(&id).expect("session exists")
     };
 
     let project_id = session
@@ -3606,7 +3643,7 @@ async fn delete_session_inner(
         }
     }
     state.publish_project_session_change();
-    let cleanup_session_id = id.to_string();
+    let cleanup_session_id = id.clone();
     let cleanup_warnings = match tokio::task::spawn_blocking(move || {
         cleanup_deleted_session_resources(&cleanup_session_id)
     })
@@ -3616,11 +3653,11 @@ async fn delete_session_inner(
         Err(error) => vec![format!("session resource cleanup task failed: {error}")],
     };
     for warning in &cleanup_warnings {
-        tracing::warn!(session_id = id, %warning, "session was deleted with cleanup warnings");
+        tracing::warn!(session_id = %id, %warning, "session was deleted with cleanup warnings");
     }
 
     Ok(DeleteSessionResponse {
-        session_id: id.to_string(),
+        session_id: id,
         deleted: true,
         cleanup_warnings,
     })
@@ -3667,7 +3704,9 @@ async fn list_projects(
 
 async fn list_project_sessions(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Query(query): Query<ProjectSessionQuery>,
 ) -> Result<Json<ProjectSessionSnapshot>, ApiError> {
+    let usage_window = query.usage_window()?;
     reload_projects(&state).await.map_err(|error| {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3677,14 +3716,16 @@ async fn list_project_sessions(
     })?;
     let transition_floor = state.project_session_revision_baseline();
     Ok(Json(
-        project_session_snapshot(&state, transition_floor).await,
+        project_session_snapshot(&state, transition_floor, usage_window).await,
     ))
 }
 
 async fn project_session_events(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     headers: HeaderMap,
+    Query(query): Query<ProjectSessionQuery>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let usage_window = query.usage_window()?;
     reload_projects(&state).await.map_err(|error| {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3695,30 +3736,69 @@ async fn project_session_events(
     let (receiver, subscribed_revision) = state.subscribe_project_session_changes();
     let transition_floor =
         project_session_last_event_revision(&headers, state.project_session_stream_id.as_str())
+            .or_else(|| {
+                query.last_event_id.as_deref().and_then(|value| {
+                    project_session_event_revision(value, state.project_session_stream_id.as_str())
+                })
+            })
             .map_or(subscribed_revision, |revision| {
                 revision.min(subscribed_revision)
             });
-    let initial = futures::stream::iter(
-        project_session_snapshot_sse_event(
-            &project_session_snapshot(&state, transition_floor).await,
-        )
-        .map(Ok),
+    let initial_snapshot = project_session_snapshot(&state, transition_floor, usage_window).await;
+    let live_floor = initial_snapshot.revision;
+    let initial =
+        futures::stream::iter(project_session_snapshot_sse_event(&initial_snapshot).map(Ok));
+    let live = futures::stream::unfold(
+        (receiver, state, usage_window, live_floor),
+        |(mut receiver, state, usage_window, mut terminal_transition_floor)| async move {
+            loop {
+                let snapshot = next_project_session_snapshot(
+                    &mut receiver,
+                    &state,
+                    terminal_transition_floor,
+                    usage_window,
+                )
+                .await?;
+                terminal_transition_floor = snapshot.revision;
+                if let Some(event) = project_session_snapshot_sse_event(&snapshot) {
+                    return Some((
+                        Ok(event),
+                        (receiver, state, usage_window, terminal_transition_floor),
+                    ));
+                }
+            }
+        },
     );
-    let live_state = state.clone();
-    let live = BroadcastStream::new(receiver).filter_map(move |_| {
-        let state = live_state.clone();
-        async move {
-            project_session_snapshot_sse_event(
-                &project_session_snapshot(&state, transition_floor).await,
-            )
-            .map(Ok)
-        }
-    });
     Ok(Sse::new(initial.chain(live)).keep_alive(KeepAlive::default()))
+}
+
+async fn next_project_session_snapshot(
+    receiver: &mut broadcast::Receiver<u64>,
+    state: &AppState,
+    terminal_transition_floor: u64,
+    usage_window: UsageWindow,
+) -> Option<ProjectSessionSnapshot> {
+    loop {
+        match receiver.recv().await {
+            Ok(revision) if revision <= terminal_transition_floor => continue,
+            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                let snapshot =
+                    project_session_snapshot(state, terminal_transition_floor, usage_window).await;
+                if snapshot.revision > terminal_transition_floor {
+                    return Some(snapshot);
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
+    }
 }
 
 fn project_session_last_event_revision(headers: &HeaderMap, stream_id: &str) -> Option<u64> {
     let value = headers.get("last-event-id")?.to_str().ok()?.trim();
+    project_session_event_revision(value, stream_id)
+}
+
+fn project_session_event_revision(value: &str, stream_id: &str) -> Option<u64> {
     let (cursor_stream_id, revision) = value.rsplit_once(':')?;
     (cursor_stream_id == stream_id)
         .then(|| revision.parse::<u64>().ok())
@@ -3733,38 +3813,6 @@ fn project_session_snapshot_sse_event(snapshot: &ProjectSessionSnapshot) -> Opti
             .event("project_session_snapshot")
             .data(data),
     )
-}
-
-async fn get_project_usage(
-    Path(id): Path<String>,
-    State((state, _defaults)): State<(AppState, AgentRequest)>,
-) -> Result<Json<ProjectUsageStats>, ApiError> {
-    reload_projects(&state).await.map_err(|error| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "project_registry_unavailable",
-            error,
-        )
-    })?;
-    let registered = {
-        let projects = state.projects.lock().await;
-        projects.iter().any(|entry| entry.id == id)
-    };
-    if !registered {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "project_not_found",
-            format!("registered project not found: {id}"),
-        ));
-    }
-    let usage = state
-        .project_usage
-        .lock()
-        .await
-        .get(&id)
-        .cloned()
-        .unwrap_or_default();
-    Ok(Json(usage))
 }
 
 async fn update_project_notifications(
@@ -6599,7 +6647,6 @@ fn session_list_items(sessions: &HashMap<String, SessionState>) -> Vec<SessionLi
                 started_at_ms: session.started_at_ms,
                 updated_at_ms: session.updated_at_ms,
                 metrics: session.metrics.clone(),
-                usage_records: session_usage_records(session),
                 workflow_id: workflow.as_ref().map(|workflow| workflow.id.clone()),
                 workflow_stage: workflow.as_ref().map(|workflow| workflow.stage),
                 workflow_outcome: workflow.as_ref().and_then(|workflow| workflow.outcome),
@@ -6616,9 +6663,121 @@ fn session_list_items(sessions: &HashMap<String, SessionState>) -> Vec<SessionLi
     items
 }
 
+#[derive(Default)]
+struct WindowedUsageAccumulator {
+    tokens: f64,
+    runtime_ms: f64,
+    tool_calls: f64,
+    energy_joules: Option<f64>,
+}
+
+impl WindowedUsageAccumulator {
+    fn add_metrics(&mut self, metrics: &SessionMetricsSnapshot, window: UsageWindow) {
+        let interval_ms = metrics
+            .ended_at_ms
+            .saturating_sub(metrics.started_at_ms)
+            .max(1);
+        let overlap_start = metrics.started_at_ms.max(window.start_ms);
+        let overlap_end = metrics.ended_at_ms.min(window.end_ms);
+        if overlap_end <= overlap_start {
+            return;
+        }
+        let share = (overlap_end - overlap_start) as f64 / interval_ms as f64;
+        self.tokens += metrics
+            .prompt_tokens
+            .saturating_add(metrics.generated_tokens) as f64
+            * share;
+        self.runtime_ms += metrics_runtime_ms(metrics) as f64 * share;
+        self.tool_calls += metrics.tool_calls as f64 * share;
+        if let Some(energy_joules) = metrics_energy_joules(metrics) {
+            self.energy_joules = Some(self.energy_joules.unwrap_or(0.0) + energy_joules * share);
+        }
+    }
+
+    fn finish(self) -> ProjectUsageStats {
+        let energy_joules = self.energy_joules;
+        ProjectUsageStats {
+            tokens: self.tokens.round() as usize,
+            runtime_ms: self.runtime_ms.round() as u64,
+            tool_calls: self.tool_calls.round() as usize,
+            energy_kwh: energy_joules.map(|joules| joules / 3_600_000.0),
+            energy_joules,
+        }
+    }
+}
+
+fn metrics_runtime_ms(metrics: &SessionMetricsSnapshot) -> u64 {
+    if metrics.wall_runtime_ms > 0 {
+        metrics.wall_runtime_ms
+    } else {
+        metrics
+            .llm_runtime_ms
+            .saturating_add(metrics.tool_runtime_ms)
+    }
+}
+
+fn usage_summaries(
+    projects: &[ProjectEntry],
+    sessions: &HashMap<String, SessionState>,
+    project_totals: &HashMap<String, ProjectUsageStats>,
+    window: UsageWindow,
+) -> (ProjectUsageSummary, HashMap<String, ProjectUsageSummary>) {
+    let mut overall_total = ProjectUsageStats::default();
+    let mut overall_today = WindowedUsageAccumulator::default();
+    let mut project_today = projects
+        .iter()
+        .map(|project| (project.id.clone(), WindowedUsageAccumulator::default()))
+        .collect::<HashMap<_, _>>();
+
+    for session in sessions.values() {
+        if let Some(metrics) = &session.metrics {
+            overall_total.add_metrics(metrics);
+        }
+        let project_id = session
+            .durable
+            .project
+            .as_ref()
+            .map(|project| project.id.as_str());
+        let Ok(records) = session.usage_records.lock() else {
+            continue;
+        };
+        for metrics in records.iter() {
+            overall_today.add_metrics(metrics, window);
+            if let Some(accumulator) = project_id.and_then(|id| project_today.get_mut(id)) {
+                accumulator.add_metrics(metrics, window);
+            }
+        }
+    }
+
+    let project_usage = projects
+        .iter()
+        .map(|project| {
+            let today = project_today
+                .remove(&project.id)
+                .unwrap_or_default()
+                .finish();
+            (
+                project.id.clone(),
+                ProjectUsageSummary {
+                    total: project_totals.get(&project.id).cloned().unwrap_or_default(),
+                    today,
+                },
+            )
+        })
+        .collect();
+    (
+        ProjectUsageSummary {
+            total: overall_total,
+            today: overall_today.finish(),
+        },
+        project_usage,
+    )
+}
+
 async fn project_session_snapshot(
     state: &AppState,
     terminal_transition_floor: u64,
+    usage_window: UsageWindow,
 ) -> ProjectSessionSnapshot {
     let projects = state.projects.lock().await;
     let sessions = state.sessions.lock().await;
@@ -6627,14 +6786,27 @@ async fn project_session_snapshot(
         .project_session_publication
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let revision = state.project_session_revision.load(Ordering::SeqCst);
+    let (overall_usage, project_usage) =
+        usage_summaries(&projects, &sessions, &project_usage, usage_window);
     ProjectSessionSnapshot {
         stream_id: (*state.project_session_stream_id).clone(),
-        revision: state.project_session_revision.load(Ordering::SeqCst),
+        revision,
+        usage_window_start_ms: usage_window.start_ms,
+        usage_window_end_ms: usage_window.end_ms,
         terminal_transition_floor,
-        terminal_transitions: publication.terminal_transitions.iter().cloned().collect(),
+        terminal_transitions: publication
+            .terminal_transitions
+            .iter()
+            .filter(|transition| {
+                transition.revision > terminal_transition_floor && transition.revision <= revision
+            })
+            .cloned()
+            .collect(),
         projects: projects.clone(),
         sessions: session_list_items(&sessions),
-        project_usage: project_usage.clone(),
+        overall_usage,
+        project_usage,
     }
 }
 
@@ -6945,7 +7117,13 @@ mod workflow_tests {
         let (project_session_sender, _) = broadcast::channel(16);
         let state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            projects: Arc::new(Mutex::new(Vec::new())),
+            projects: Arc::new(Mutex::new(vec![ProjectEntry {
+                id: "project-1".to_string(),
+                name: "pb".to_string(),
+                path: "/workspace/pb".to_string(),
+                repository_root: None,
+                notify_on_finish: false,
+            }])),
             project_usage: Arc::new(Mutex::new(HashMap::from([(
                 "project-1".to_string(),
                 ProjectUsageStats {
@@ -7010,15 +7188,89 @@ mod workflow_tests {
         );
         assert_eq!(changes.recv().await.unwrap(), 2);
 
-        let snapshot = project_session_snapshot(&state, transition_floor).await;
+        let usage_window = UsageWindow {
+            start_ms: 0,
+            end_ms: 86_400_000,
+        };
+        let snapshot = project_session_snapshot(&state, transition_floor, usage_window).await;
         assert_eq!(snapshot.stream_id, "test-stream");
         assert_eq!(snapshot.revision, 2);
         assert_eq!(snapshot.terminal_transition_floor, 0);
         assert_eq!(snapshot.terminal_transitions.len(), 1);
         assert_eq!(snapshot.terminal_transitions[0].revision, 2);
-        assert_eq!(snapshot.project_usage["project-1"].tokens, 7);
+        assert_eq!(snapshot.project_usage["project-1"].total.tokens, 7);
+        assert_eq!(snapshot.project_usage["project-1"].today.tokens, 0);
+        assert_eq!(snapshot.overall_usage.total.tokens, 0);
+        assert!(
+            project_session_snapshot(&state, snapshot.revision, usage_window)
+                .await
+                .terminal_transitions
+                .is_empty()
+        );
         let event = project_session_snapshot_sse_event(&snapshot).unwrap();
         assert!(format!("{event:?}").contains("project_session_snapshot"));
+    }
+
+    #[tokio::test]
+    async fn project_stream_coalesces_publications_into_advancing_transition_deltas() {
+        let (project_session_sender, _) = broadcast::channel(16);
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            projects: Arc::new(Mutex::new(Vec::new())),
+            project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_session_stream_id: Arc::new("test-stream".to_string()),
+            project_session_revision: Arc::new(AtomicU64::new(0)),
+            project_session_publication: Arc::new(StdMutex::new(
+                ProjectSessionPublication::default(),
+            )),
+            project_session_sender,
+            sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+            tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
+                8311, 8311, false,
+            ))),
+            web_listen: "127.0.0.1".to_string(),
+        };
+        let transition = |entry_key: &str| ProjectSessionTerminalTransition {
+            entry_key: entry_key.to_string(),
+            revision: 0,
+            session_id: format!("session-{entry_key}"),
+            status: SessionStatus::Completed,
+            task: "finish the boundary".to_string(),
+            title: None,
+            handoff_outcome: Some(HandoffOutcome::Ready),
+            project: None,
+        };
+        let usage_window = UsageWindow {
+            start_ms: 0,
+            end_ms: 86_400_000,
+        };
+        let (mut receiver, floor) = state.subscribe_project_session_changes();
+        state.publish_project_session_update(Some(transition("one")));
+        state.publish_project_session_update(Some(transition("two")));
+
+        let first = next_project_session_snapshot(&mut receiver, &state, floor, usage_window)
+            .await
+            .unwrap();
+        assert_eq!(first.revision, 2);
+        assert_eq!(first.terminal_transition_floor, 0);
+        assert_eq!(
+            first
+                .terminal_transitions
+                .iter()
+                .map(|transition| transition.entry_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
+
+        state.publish_project_session_update(Some(transition("three")));
+        let second =
+            next_project_session_snapshot(&mut receiver, &state, first.revision, usage_window)
+                .await
+                .unwrap();
+        assert_eq!(second.revision, 3);
+        assert_eq!(second.terminal_transition_floor, 2);
+        assert_eq!(second.terminal_transitions.len(), 1);
+        assert_eq!(second.terminal_transitions[0].entry_key, "three");
     }
 
     #[test]
@@ -7031,6 +7283,14 @@ mod workflow_tests {
         );
         assert_eq!(
             project_session_last_event_revision(&headers, "stream-b"),
+            None
+        );
+        assert_eq!(
+            project_session_event_revision("stream-a:9", "stream-a"),
+            Some(9)
+        );
+        assert_eq!(
+            project_session_event_revision("stream-a:9", "stream-b"),
             None
         );
     }
@@ -7086,7 +7346,15 @@ mod workflow_tests {
                 .unwrap(),
             1
         );
-        let snapshot = project_session_snapshot(&state, transition_floor).await;
+        let snapshot = project_session_snapshot(
+            &state,
+            transition_floor,
+            UsageWindow {
+                start_ms: 0,
+                end_ms: 86_400_000,
+            },
+        )
+        .await;
         assert_eq!(snapshot.terminal_transitions.len(), 1);
         assert_eq!(
             snapshot.terminal_transitions[0].status,
@@ -7429,6 +7697,91 @@ mod workflow_tests {
         assert_eq!(state.project_session_revision.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn cancelled_delete_caller_cannot_split_authoritative_state() {
+        let mut request = request(std::path::Path::new("."));
+        request.workdir = None;
+        request.branch = None;
+        request.repository_less = true;
+        let mut persisted = PersistedSession::from_parts(
+            request.session_id.clone(),
+            request,
+            None,
+            None,
+            false,
+            SessionStatus::Completed,
+            Vec::new(),
+        );
+        persisted.project = Some(SessionProject {
+            id: "project-1".to_string(),
+            name: "pb".to_string(),
+            path: "/workspace/pb".to_string(),
+        });
+        let metrics = SessionMetricsSnapshot {
+            prompt_tokens: 7,
+            generated_tokens: 3,
+            ..Default::default()
+        };
+        persisted.metrics = Some(metrics.clone());
+        persisted.usage_records = vec![metrics];
+        let (session_id, session) = session_from_persisted(persisted);
+        let (project_session_sender, _) = broadcast::channel(16);
+        let mut changes = project_session_sender.subscribe();
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), session)]))),
+            projects: Arc::new(Mutex::new(Vec::new())),
+            project_usage: Arc::new(Mutex::new(HashMap::from([(
+                "project-1".to_string(),
+                ProjectUsageStats {
+                    tokens: 10,
+                    ..ProjectUsageStats::default()
+                },
+            )]))),
+            project_session_stream_id: Arc::new("test-stream".to_string()),
+            project_session_revision: Arc::new(AtomicU64::new(0)),
+            project_session_publication: Arc::new(StdMutex::new(
+                ProjectSessionPublication::default(),
+            )),
+            project_session_sender,
+            sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+            tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
+                8311, 8311, false,
+            ))),
+            web_listen: "127.0.0.1".to_string(),
+        };
+
+        let usage_guard = state.project_usage.lock().await;
+        let caller_state = state.clone();
+        let caller_session_id = session_id.clone();
+        let caller =
+            tokio::spawn(
+                async move { delete_session_inner(caller_state, &caller_session_id).await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !state.sessions.lock().await.contains_key(&session_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned deletion should reach the accounting boundary");
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        drop(usage_guard);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), changes.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert_eq!(state.project_usage.lock().await["project-1"].tokens, 0);
+        assert!(!state.sessions.lock().await.contains_key(&session_id));
+    }
+
     fn request(workdir: &std::path::Path) -> AgentRequest {
         AgentRequest {
             task: "deliver safely".to_string(),
@@ -7543,6 +7896,82 @@ mod workflow_tests {
             ..Default::default()
         });
         assert_eq!(measured_zero.energy_joules, Some(0.0));
+    }
+
+    #[test]
+    fn usage_summaries_cover_every_project_and_apportion_the_requested_day() {
+        let projects = vec![
+            ProjectEntry {
+                id: "project-1".to_string(),
+                name: "pb".to_string(),
+                path: "/workspace/pb".to_string(),
+                repository_root: None,
+                notify_on_finish: false,
+            },
+            ProjectEntry {
+                id: "project-empty".to_string(),
+                name: "empty".to_string(),
+                path: "/workspace/empty".to_string(),
+                repository_root: None,
+                notify_on_finish: false,
+            },
+        ];
+        let mut request = request(std::path::Path::new("."));
+        request.workdir = None;
+        request.branch = None;
+        request.repository_less = true;
+        let mut persisted = PersistedSession::from_parts(
+            request.session_id.clone(),
+            request,
+            None,
+            None,
+            false,
+            SessionStatus::Completed,
+            Vec::new(),
+        );
+        persisted.project = Some(SessionProject {
+            id: "project-1".to_string(),
+            name: "pb".to_string(),
+            path: "/workspace/pb".to_string(),
+        });
+        let metrics = SessionMetricsSnapshot {
+            prompt_tokens: 80,
+            generated_tokens: 20,
+            tool_calls: 4,
+            wall_runtime_ms: 120_000,
+            started_at_ms: 60_000,
+            ended_at_ms: 180_000,
+            total_energy_joules: Some(120.0),
+            ..Default::default()
+        };
+        persisted.metrics = Some(metrics.clone());
+        persisted.usage_records = vec![metrics];
+        let (session_id, session) = session_from_persisted(persisted);
+        let sessions = HashMap::from([(session_id, session)]);
+        let totals = build_project_usage_cache(&sessions);
+
+        let (overall, project_usage) = usage_summaries(
+            &projects,
+            &sessions,
+            &totals,
+            UsageWindow {
+                start_ms: 120_000,
+                end_ms: 240_000,
+            },
+        );
+
+        assert_eq!(overall.total.tokens, 100);
+        assert_eq!(overall.today.tokens, 50);
+        assert_eq!(overall.today.runtime_ms, 60_000);
+        assert_eq!(overall.today.tool_calls, 2);
+        assert_eq!(overall.today.energy_joules, Some(60.0));
+        assert_eq!(project_usage["project-1"].total.tokens, 100);
+        assert_eq!(project_usage["project-1"].today.tokens, 50);
+        assert_eq!(
+            project_usage["project-empty"].total.tokens,
+            ProjectUsageStats::default().tokens
+        );
+        assert_eq!(project_usage["project-empty"].today.tokens, 0);
     }
 
     #[tokio::test]
