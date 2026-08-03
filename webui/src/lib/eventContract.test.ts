@@ -1,8 +1,10 @@
 /// <reference lib="deno.ns" />
 import { deepEqual, throws } from "node:assert/strict";
 import {
+  eventFields,
   parseEventEnvelopeJson,
   parseProjectSessionSnapshotJson,
+  parseSessionDetailsJson,
 } from "./eventContract.ts";
 
 function rustEnumVariants(source: string, enumName: string): string[] {
@@ -195,7 +197,25 @@ Deno.test("Rust and TypeScript expose the same event and profile variants", asyn
       serverOptionalFields.get(variant)?.toSorted(),
       `event optionality drifted for ${variant}`,
     );
+    const runtime = eventFields[variant as keyof typeof eventFields];
+    deepEqual(
+      runtime?.[0].toSorted(),
+      server?.filter((field) =>
+        !serverOptionalFields.get(variant)?.includes(field)
+      ).toSorted(),
+      `runtime required fields drifted for ${variant}`,
+    );
+    deepEqual(
+      runtime?.[1].toSorted(),
+      serverOptionalFields.get(variant)?.toSorted(),
+      `runtime optional fields drifted for ${variant}`,
+    );
   }
+  deepEqual(
+    Object.keys(eventFields).toSorted(),
+    typescriptEventVariants(types).toSorted(),
+    "runtime event variants drifted from AgentEvent",
+  );
 
   const typeProfiles = types
     .slice(
@@ -303,6 +323,47 @@ Deno.test("v5 browser parsing rejects obsolete event envelopes", () => {
   throws(
     () => parseEventEnvelopeJson('{"version":"v4"}'),
     /unsupported event schema 'v4'; expected 'v5'/,
+  );
+});
+
+Deno.test("v5 browser parsing rejects incomplete event and session projections", () => {
+  const envelope = {
+    version: "v5",
+    event: { type: "session_metrics" },
+    chatter: [],
+    evidence: [],
+    transcript: {
+      sequence: 1,
+      visibility: "activity",
+      kind: "activity",
+      entry_key: "session_metrics:1",
+      supersedes: [],
+      summary_redundant: false,
+      session_effect: { running: "unchanged", reset_intent: false },
+    },
+  };
+  throws(
+    () => parseEventEnvelopeJson(JSON.stringify(envelope)),
+    /session_metrics is missing field llm_invocations/,
+  );
+  envelope.event = {
+    type: "session_title",
+    title: "Boundary",
+  } as typeof envelope.event;
+  Object.assign(envelope.chatter, [{
+    actor: { kind: "automation", id: "trinity" },
+    tone: "info",
+    message: "Boundary updated",
+    detail: "",
+  }]);
+  throws(
+    () => parseEventEnvelopeJson(JSON.stringify(envelope)),
+    /event chatter 0 is missing field audience/,
+  );
+  throws(
+    () =>
+      parseSessionDetailsJson('{"session_id":"s","revision":0,"events":[]}'),
+    /session snapshot is missing field task/,
   );
 });
 

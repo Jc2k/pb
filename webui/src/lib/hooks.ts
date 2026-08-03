@@ -33,6 +33,23 @@ export class LatestRequest {
   }
 }
 
+export class LatestSubscription {
+  private generation = 0;
+
+  start(): number {
+    this.generation += 1;
+    return this.generation;
+  }
+
+  owns(generation: number): boolean {
+    return this.generation === generation;
+  }
+
+  close(generation: number): void {
+    if (this.owns(generation)) this.generation += 1;
+  }
+}
+
 export type ProjectSessionSnapshotSource = "http" | "stream";
 
 export interface ProjectSessionSnapshotDecision {
@@ -153,6 +170,7 @@ export function useProjectSessionData(
   const [dataError, setDataError] = useState("");
   const [hasSnapshot, setHasSnapshot] = useState(false);
   const dataRequest = useRef(new LatestRequest());
+  const streamSubscription = useRef(new LatestSubscription());
   const streamCursor = useRef(new ProjectSessionStreamCursor());
 
   const applySnapshot = useCallback((
@@ -226,6 +244,7 @@ export function useProjectSessionData(
   }, [usageWindow.end_ms]);
 
   useEffect(() => {
+    const generation = streamSubscription.current.start();
     const source = new EventSource(
       projectSessionUrl(
         "/api/project-sessions/events",
@@ -234,6 +253,7 @@ export function useProjectSessionData(
       ),
     );
     source.addEventListener("project_session_snapshot", (message) => {
+      if (!streamSubscription.current.owns(generation)) return;
       try {
         applySnapshot((message as MessageEvent<string>).data, "stream");
       } catch (error) {
@@ -244,10 +264,12 @@ export function useProjectSessionData(
       }
     });
     source.onerror = () => {
+      if (!streamSubscription.current.owns(generation)) return;
       setDataError("Live project updates are temporarily unavailable");
       setDataLoading(false);
     };
     return () => {
+      streamSubscription.current.close(generation);
       source.close();
       dataRequest.current.abort();
     };

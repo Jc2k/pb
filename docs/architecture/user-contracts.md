@@ -430,9 +430,17 @@ live transition rather than an indistinguishable completed row. Reconnect cursor
 originating process identity. HTTP snapshots provide manual recovery data only and cannot replace
 the live stream's process generation. Session deletion runs its durable removal, live projection,
 usage accounting, revision publication, and cleanup in an owned transaction that continues if the
-request disconnects. Project mutations that change this collection return the same revisioned
-snapshot shape as the stream, so the browser can apply the authoritative result even while SSE is
-reconnecting and can continue displaying its last valid snapshot as stale data. Session deletion
+request disconnects. Project-registry mutations use the same ownership rule: the disk transaction
+returns the exact registry it committed, and an independently owned task reconciles sessions, usage
+caches, and collection revision under one lock order. There is no fallible post-commit registry
+reload and a disconnected HTTP or RPC caller cannot strand memory behind disk. Project mutations
+return the same revisioned snapshot shape as the stream, so the browser can apply the authoritative
+result even while SSE is reconnecting and can continue displaying its last valid snapshot as stale data.
+Session projection changes emitted by the runner append their event and publish the matching
+collection revision while the session lock is held. Terminal publication additionally captures the
+immutable task, title, handoff, and registered-project projection at that transition; the asynchronous
+event watcher only handles producers that have not already completed this publication boundary.
+Session deletion
 does not report failure after removing the authoritative record: a
 durable-record failure leaves the session intact, while later environment or workspace cleanup
 problems are returned as warnings on a successful deletion.

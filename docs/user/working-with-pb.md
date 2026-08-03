@@ -343,6 +343,12 @@ the CLI therefore appear without a browser reload, a session that finishes while
 is being built still produces one finish notification, and project/session identity and usage cannot
 drift between separate requests.
 
+The browser validates the complete v5 session envelope, event variant fields, authored chatter,
+evidence, and transcript metadata before applying an update. A replaced EventSource connection no
+longer owns callbacks, so a queued message from the previous calendar-day usage stream cannot roll
+the page back after midnight. A registered project with no session is shown as having “No sessions”;
+it is not presented as if queued work exists.
+
 Deleting a session continues its authoritative durable removal, usage update, and live publication
 even if the browser or terminal disconnects while the request is in flight. A durable deletion error
 leaves the session visible. Environment or managed-workspace cleanup failures after deletion are

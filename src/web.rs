@@ -492,7 +492,10 @@ struct SessionState {
 #[derive(Debug, Default)]
 struct ProjectSessionPublication {
     terminal_transitions: VecDeque<ProjectSessionTerminalTransition>,
+    directly_published_events: VecDeque<(String, String)>,
 }
+
+const MAX_DIRECTLY_PUBLISHED_PROJECT_SESSION_EVENTS: usize = 512;
 
 #[derive(Debug, Clone)]
 struct AppState {
@@ -509,6 +512,41 @@ struct AppState {
 }
 
 impl AppState {
+    fn mark_project_session_event_published(&self, session_id: &str, entry_key: String) {
+        let mut publication = self
+            .project_session_publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publication
+            .directly_published_events
+            .push_back((session_id.to_string(), entry_key));
+        while publication.directly_published_events.len()
+            > MAX_DIRECTLY_PUBLISHED_PROJECT_SESSION_EVENTS
+        {
+            publication.directly_published_events.pop_front();
+        }
+    }
+
+    fn consume_direct_project_session_publication(
+        &self,
+        session_id: &str,
+        entry_key: &str,
+    ) -> bool {
+        let mut publication = self
+            .project_session_publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(index) = publication
+            .directly_published_events
+            .iter()
+            .position(|published| published.0 == session_id && published.1 == entry_key)
+        else {
+            return false;
+        };
+        publication.directly_published_events.remove(index);
+        true
+    }
+
     fn publish_project_session_update(
         &self,
         mut terminal_transition: Option<ProjectSessionTerminalTransition>,
@@ -562,15 +600,13 @@ impl AppState {
         self.project_session_revision.load(Ordering::SeqCst)
     }
 
-    async fn terminal_transition(
-        &self,
+    fn terminal_transition(
+        projects: &[ProjectEntry],
         session_id: &str,
         entry_key: String,
         status: SessionStatus,
-    ) -> Option<ProjectSessionTerminalTransition> {
-        let projects = self.projects.lock().await;
-        let sessions = self.sessions.lock().await;
-        let session = sessions.get(session_id)?;
+        session: &SessionState,
+    ) -> ProjectSessionTerminalTransition {
         let (title, handoff_outcome, _) = session_history_summary(session);
         let project = session.durable.project.as_ref().and_then(|stored| {
             projects
@@ -578,7 +614,7 @@ impl AppState {
                 .find(|project| project.id == stored.id)
                 .cloned()
         });
-        Some(ProjectSessionTerminalTransition {
+        ProjectSessionTerminalTransition {
             entry_key,
             revision: 0,
             session_id: session_id.to_string(),
@@ -587,7 +623,7 @@ impl AppState {
             title,
             handoff_outcome,
             project,
-        })
+        }
     }
 
     fn watch_session_changes(
@@ -600,6 +636,12 @@ impl AppState {
             loop {
                 match receiver.recv().await {
                     Ok(envelope) if envelope.affects_project_session_snapshot() => {
+                        if state.consume_direct_project_session_publication(
+                            &session_id,
+                            &envelope.transcript.entry_key,
+                        ) {
+                            continue;
+                        }
                         let status = match envelope.event {
                             AgentEvent::SessionStateChanged {
                                 status: crate::events::SessionLifecycleStatus::Completed,
@@ -612,13 +654,17 @@ impl AppState {
                             _ => None,
                         };
                         let transition = if let Some(status) = status {
-                            state
-                                .terminal_transition(
+                            let projects = state.projects.lock().await;
+                            let sessions = state.sessions.lock().await;
+                            sessions.get(&session_id).map(|session| {
+                                Self::terminal_transition(
+                                    &projects,
                                     &session_id,
                                     envelope.transcript.entry_key,
                                     status,
+                                    session,
                                 )
-                                .await
+                            })
                         } else {
                             None
                         };
@@ -3150,6 +3196,7 @@ async fn cancel_session(
 }
 
 async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResponse> {
+    let projects = state.projects.lock().await;
     let mut sessions = state.sessions.lock().await;
     let session = sessions
         .get_mut(&id)
@@ -3232,7 +3279,7 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
         session.running = false;
         session.paused = false;
         session.status = SessionStatus::Completed;
-        publish_session_state_changed(session);
+        publish_terminal_session_state_changed(&state, &projects, &id, session);
     }
     session.updated_at_ms = now_millis();
     let request = session.request_template.clone();
@@ -3249,6 +3296,7 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionResp
     let durable = session.durable.clone();
     let status = session.status;
     drop(sessions);
+    drop(projects);
     persist_session_snapshot(
         &id,
         &request,
@@ -4002,46 +4050,15 @@ impl WebEventSink {
                 Some(PathBuf::from(focus_root.as_deref().unwrap_or(workspace)));
             self.persisted_branch = Some(branch.clone());
         }
-        if let Some(metrics) = SessionMetricsSnapshot::from_event(&envelope.event) {
-            tokio::runtime::Handle::current().block_on(async {
-                let mut sessions = self.state.sessions.lock().await;
-                let Some(session) = sessions.get_mut(&self.session_id) else {
-                    return;
-                };
-                self.usage_records
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(metrics.clone());
-                if let Some(existing) = session.metrics.as_mut() {
-                    existing.add_assign(&metrics);
-                } else {
-                    session.metrics = Some(metrics.clone());
-                }
-                session.updated_at_ms = now_millis();
-                let project_id = session
-                    .durable
-                    .project
-                    .as_ref()
-                    .map(|project| project.id.as_str());
-                self.state
-                    .project_usage_windows
-                    .lock()
-                    .await
-                    .record_metrics(project_id, &metrics);
-            });
-        }
-        if let AgentEvent::SessionTitle { title, .. } = &envelope.event {
-            let title = title.trim().to_string();
-            if !title.is_empty() {
-                tokio::runtime::Handle::current().block_on(async {
-                    let mut sessions = self.state.sessions.lock().await;
-                    if let Some(session) = sessions.get_mut(&self.session_id) {
-                        session.title = Some(title);
-                        session.updated_at_ms = now_millis();
-                    }
-                });
+        let metrics = SessionMetricsSnapshot::from_event(&envelope.event);
+        let title = match &envelope.event {
+            AgentEvent::SessionTitle { title, .. } => {
+                let title = title.trim();
+                (!title.is_empty()).then(|| title.to_string())
             }
-        }
+            _ => None,
+        };
+        let mut delivery_proposal = None;
         if let AgentEvent::DeliveryProposed {
             proposal_id,
             source_turn_id,
@@ -4055,14 +4072,9 @@ impl WebEventSink {
                 task_summary: task_summary.clone(),
             };
             self.durable.pending_delivery_proposal = Some(proposal.clone());
-            tokio::runtime::Handle::current().block_on(async {
-                let mut sessions = self.state.sessions.lock().await;
-                if let Some(session) = sessions.get_mut(&self.session_id) {
-                    session.durable.pending_delivery_proposal = Some(proposal);
-                    session.updated_at_ms = now_millis();
-                }
-            });
+            delivery_proposal = Some(proposal);
         }
+        let mut goal_proposal = None;
         if let AgentEvent::GoalProposed {
             proposal_id,
             source_turn_id,
@@ -4078,15 +4090,65 @@ impl WebEventSink {
                 criteria: criteria.clone(),
             };
             self.durable.pending_goal_proposal = Some(proposal.clone());
+            goal_proposal = Some(proposal);
+        }
+        if envelope.affects_project_session_snapshot() {
             tokio::runtime::Handle::current().block_on(async {
                 let mut sessions = self.state.sessions.lock().await;
                 if let Some(session) = sessions.get_mut(&self.session_id) {
-                    session.durable.pending_goal_proposal = Some(proposal);
+                    if let Some(metrics) = metrics {
+                        self.usage_records
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(metrics.clone());
+                        if let Some(existing) = session.metrics.as_mut() {
+                            existing.add_assign(&metrics);
+                        } else {
+                            session.metrics = Some(metrics.clone());
+                        }
+                        let project_id = session
+                            .durable
+                            .project
+                            .as_ref()
+                            .map(|project| project.id.as_str());
+                        self.state
+                            .project_usage_windows
+                            .lock()
+                            .await
+                            .record_metrics(project_id, &metrics);
+                    }
+                    if let Some(title) = title {
+                        session.title = Some(title);
+                    }
+                    if let Some(proposal) = delivery_proposal {
+                        session.durable.pending_delivery_proposal = Some(proposal);
+                    }
+                    if let Some(proposal) = goal_proposal {
+                        session.durable.pending_goal_proposal = Some(proposal);
+                    }
                     session.updated_at_ms = now_millis();
+                    self.state
+                        .mark_project_session_event_published(&self.session_id, entry_key.clone());
+                    if publish_event_envelope_linked(
+                        &self.sender,
+                        &self.history,
+                        envelope,
+                        supersedes,
+                    ) {
+                        self.state.publish_project_session_change();
+                    }
+                } else {
+                    publish_event_envelope_linked(
+                        &self.sender,
+                        &self.history,
+                        envelope,
+                        supersedes,
+                    );
                 }
             });
+        } else {
+            publish_event_envelope_linked(&self.sender, &self.history, envelope, supersedes);
         }
-        publish_event_envelope_linked(&self.sender, &self.history, envelope, supersedes);
         if self.goal.is_some() {
             self.goal = tokio::runtime::Handle::current().block_on(async {
                 let sessions = self.state.sessions.lock().await;
@@ -4621,6 +4683,14 @@ impl EventSink for WebEventSink {
 }
 
 fn publish_session_state_changed(session: &SessionState) {
+    publish_event(
+        &session.sender,
+        &session.history,
+        session_state_changed_event(session),
+    );
+}
+
+fn session_state_changed_event(session: &SessionState) -> AgentEvent {
     let status = match session.status {
         SessionStatus::Queued => crate::events::SessionLifecycleStatus::Queued,
         SessionStatus::Running => crate::events::SessionLifecycleStatus::Running,
@@ -4628,16 +4698,33 @@ fn publish_session_state_changed(session: &SessionState) {
         SessionStatus::Completed => crate::events::SessionLifecycleStatus::Completed,
         SessionStatus::Failed => crate::events::SessionLifecycleStatus::Failed,
     };
-    publish_event(
-        &session.sender,
-        &session.history,
-        AgentEvent::SessionStateChanged {
-            status,
-            running: session.running,
-            paused: session.paused,
-            timestamp_ms: Some(now_millis()),
-        },
-    );
+    AgentEvent::SessionStateChanged {
+        status,
+        running: session.running,
+        paused: session.paused,
+        timestamp_ms: Some(now_millis()),
+    }
+}
+
+fn publish_terminal_session_state_changed(
+    state: &AppState,
+    projects: &[ProjectEntry],
+    session_id: &str,
+    session: &SessionState,
+) {
+    debug_assert!(matches!(
+        session.status,
+        SessionStatus::Completed | SessionStatus::Failed
+    ));
+    let envelope = EventEnvelope::with_timestamp(session_state_changed_event(session));
+    let entry_key = envelope.transcript.entry_key.clone();
+    state.mark_project_session_event_published(session_id, entry_key.clone());
+    if !publish_event_envelope_linked(&session.sender, &session.history, envelope, Vec::new()) {
+        return;
+    }
+    let transition =
+        AppState::terminal_transition(projects, session_id, entry_key, session.status, session);
+    state.publish_project_session_update(Some(transition));
 }
 
 fn dispatch_next_session(state: AppState) {
@@ -4817,11 +4904,12 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
         })
         .await;
 
+        let projects = state.projects.lock().await;
         let goal_projects = if matches!(
             &result,
             Ok(Ok(run_result)) if run_result.requested_goal.is_some()
         ) {
-            Some(state.projects.lock().await.clone())
+            Some(projects.clone())
         } else {
             None
         };
@@ -5021,7 +5109,14 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
             session.cancel_token.store(false, Ordering::SeqCst);
             session.pause_token.store(false, Ordering::SeqCst);
             session.status = final_status;
-            publish_session_state_changed(session);
+            if matches!(
+                final_status,
+                SessionStatus::Completed | SessionStatus::Failed
+            ) {
+                publish_terminal_session_state_changed(&state, &projects, &session_id, session);
+            } else {
+                publish_session_state_changed(session);
+            }
             persist_session_snapshot(
                 &session_id,
                 &session.request_template,
@@ -5040,6 +5135,7 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
             );
         }
         drop(sessions);
+        drop(projects);
         if terminate_environment
             && let Err(error) = crate::session_environment::terminate_global_session(&session_id)
         {
@@ -6865,7 +6961,17 @@ async fn reload_projects(state: &AppState) -> Result<()> {
     let projects = tokio::task::spawn_blocking(projects::load_projects)
         .await
         .context("project registry reload task failed")??;
+    reconcile_project_registry(state, &mut current_projects, projects).await;
+    Ok(())
+}
+
+async fn reconcile_project_registry(
+    state: &AppState,
+    current_projects: &mut Vec<ProjectEntry>,
+    projects: Vec<ProjectEntry>,
+) {
     let mut sessions = state.sessions.lock().await;
+    let mut session_projection_changed = false;
     for session in sessions.values_mut() {
         let Some(stored_project) = session.durable.project.as_ref() else {
             continue;
@@ -6878,6 +6984,9 @@ async fn reload_projects(state: &AppState) -> Result<()> {
         };
         let previous_path = PathBuf::from(&stored_project.path);
         let current_path = PathBuf::from(&current_project.path);
+        let previous_project = session.durable.project.clone();
+        let previous_workdir = session.workdir.clone();
+        let previous_request_workdir = session.request_template.workdir.clone();
         session.durable.project = Some(SessionProject {
             id: current_project.id.clone(),
             name: current_project.name.clone(),
@@ -6889,33 +6998,39 @@ async fn reload_projects(state: &AppState) -> Result<()> {
         if !session.running && session.request_template.workdir.as_ref() == Some(&previous_path) {
             session.request_template.workdir = Some(current_path);
         }
+        session_projection_changed |= session.durable.project != previous_project
+            || session.workdir != previous_workdir
+            || session.request_template.workdir != previous_request_workdir;
     }
-    let changed = *current_projects != projects;
+    let registry_changed = *current_projects != projects;
     *current_projects = projects;
-    if changed {
+    if registry_changed {
         state.project_usage_windows.lock().await.invalidate();
     }
-    drop(sessions);
-    drop(current_projects);
-    if changed {
+    if registry_changed || session_projection_changed {
+        // Publication belongs to the same critical section as the projected
+        // state. A snapshot can therefore observe either side of the registry
+        // replacement, never the new registry under the previous revision.
         state.publish_project_session_change();
     }
-    Ok(())
 }
 
 async fn mutate_project_registry<T, F>(state: &AppState, mutation: F) -> Result<T>
 where
     T: Send + 'static,
-    F: FnOnce() -> Result<T> + Send + 'static,
+    F: FnOnce() -> Result<projects::ProjectRegistryMutation<T>> + Send + 'static,
 {
-    let result = {
-        let _registry_guard = state.projects.lock().await;
-        tokio::task::spawn_blocking(mutation)
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut current_projects = state.projects.lock().await;
+        let mutation = tokio::task::spawn_blocking(mutation)
             .await
-            .context("project registry mutation task failed")??
-    };
-    reload_projects(state).await?;
-    Ok(result)
+            .context("project registry mutation task failed")??;
+        reconcile_project_registry(&state, &mut current_projects, mutation.projects).await;
+        Ok(mutation.value)
+    })
+    .await
+    .context("project registry transaction task failed")?
 }
 
 async fn project_list_snapshot(state: &AppState) -> Vec<ProjectEntry> {
@@ -7120,8 +7235,8 @@ fn publish_event(
     sender: &broadcast::Sender<EventEnvelope>,
     history: &StdMutex<Vec<EventEnvelope>>,
     event: AgentEvent,
-) {
-    publish_event_linked(sender, history, event, Vec::new());
+) -> bool {
+    publish_event_linked(sender, history, event, Vec::new())
 }
 
 fn publish_event_linked(
@@ -7129,9 +7244,9 @@ fn publish_event_linked(
     history: &StdMutex<Vec<EventEnvelope>>,
     event: AgentEvent,
     supersedes: Vec<String>,
-) {
+) -> bool {
     let envelope = EventEnvelope::with_timestamp(event);
-    publish_event_envelope_linked(sender, history, envelope, supersedes);
+    publish_event_envelope_linked(sender, history, envelope, supersedes)
 }
 
 fn publish_event_envelope_linked(
@@ -7139,14 +7254,14 @@ fn publish_event_envelope_linked(
     history: &StdMutex<Vec<EventEnvelope>>,
     mut envelope: EventEnvelope,
     supersedes: Vec<String>,
-) {
+) -> bool {
     envelope.transcript.supersedes = supersedes;
     let Ok(mut entries) = history.lock() else {
         tracing::error!(
             entry_key = %envelope.transcript.entry_key,
             "refusing to publish an event because session history is poisoned"
         );
-        return;
+        return false;
     };
     let sequence = entries
         .last()
@@ -7159,6 +7274,7 @@ fn publish_event_envelope_linked(
             session_store::trim_event_history(std::mem::take(&mut *entries), MAX_HISTORY_EVENTS);
     }
     let _ = sender.send(envelope);
+    true
 }
 
 #[cfg(test)]
@@ -7320,6 +7436,67 @@ mod workflow_tests {
         assert_eq!(second.terminal_transitions[0].entry_key, "three");
     }
 
+    #[tokio::test]
+    async fn cancelled_project_registry_caller_cannot_split_committed_projection() {
+        let (project_session_sender, _) = broadcast::channel(16);
+        let mut changes = project_session_sender.subscribe();
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            projects: Arc::new(Mutex::new(Vec::new())),
+            project_usage_windows: Arc::new(Mutex::new(ProjectUsageWindowCache::default())),
+            project_session_stream_id: Arc::new("test-stream".to_string()),
+            project_session_revision: Arc::new(AtomicU64::new(0)),
+            project_session_publication: Arc::new(StdMutex::new(
+                ProjectSessionPublication::default(),
+            )),
+            project_session_sender,
+            sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+            tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
+                8311, 8311, false,
+            ))),
+            web_listen: "127.0.0.1".to_string(),
+        };
+        let session_guard = state.sessions.lock().await;
+        let project = ProjectEntry {
+            id: "project-1".to_string(),
+            name: "pb".to_string(),
+            path: "/workspace/pb".to_string(),
+            repository_root: None,
+            notify_on_finish: false,
+        };
+        let caller_state = state.clone();
+        let caller = tokio::spawn(async move {
+            mutate_project_registry(&caller_state, move || {
+                Ok(projects::ProjectRegistryMutation {
+                    value: (),
+                    projects: vec![project],
+                })
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.projects.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        caller.abort();
+        drop(session_guard);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), changes.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert_eq!(state.projects.lock().await[0].id, "project-1");
+    }
+
     #[test]
     fn project_session_reconnect_cursor_is_scoped_to_the_server_process() {
         let mut headers = HeaderMap::new();
@@ -7382,8 +7559,15 @@ mod workflow_tests {
         };
         state.watch_session_changes(session_id.clone(), sender.subscribe());
         {
-            let sessions = state.sessions.lock().await;
-            publish_session_state_changed(sessions.get(&session_id).unwrap());
+            let projects = state.projects.lock().await;
+            let mut sessions = state.sessions.lock().await;
+            publish_terminal_session_state_changed(
+                &state,
+                &projects,
+                &session_id,
+                sessions.get(&session_id).unwrap(),
+            );
+            sessions.remove(&session_id);
         }
 
         assert_eq!(
@@ -7392,6 +7576,12 @@ mod workflow_tests {
                 .unwrap()
                 .unwrap(),
             1
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), changes.recv())
+                .await
+                .is_err(),
+            "the watcher must not republish a directly published terminal event"
         );
         let snapshot = project_session_snapshot(
             &state,
@@ -7408,6 +7598,7 @@ mod workflow_tests {
             SessionStatus::Completed
         );
         assert_eq!(snapshot.terminal_transitions[0].session_id, session_id);
+        assert!(!snapshot.terminal_transitions[0].task.is_empty());
         assert!(snapshot.terminal_transitions[0].revision > transition_floor);
     }
 

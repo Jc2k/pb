@@ -3,6 +3,7 @@ import { deepEqual, equal, ok } from "node:assert/strict";
 import {
   currentUsageWindow,
   LatestRequest,
+  LatestSubscription,
   ProjectSessionStreamCursor,
 } from "../lib/hooks.ts";
 import type {
@@ -32,6 +33,19 @@ Deno.test("latest request ownership aborts and rejects stale responses", () => {
   requests.abort();
   equal(second.signal.aborted, true);
   equal(requests.owns(second), false);
+});
+
+Deno.test("latest stream subscription rejects callbacks queued by a closed source", () => {
+  const subscriptions = new LatestSubscription();
+  const oldSource = subscriptions.start();
+  const currentSource = subscriptions.start();
+
+  equal(subscriptions.owns(oldSource), false);
+  equal(subscriptions.owns(currentSource), true);
+  subscriptions.close(oldSource);
+  equal(subscriptions.owns(currentSource), true);
+  subscriptions.close(currentSource);
+  equal(subscriptions.owns(currentSource), false);
 });
 
 function terminalTransition(
@@ -214,6 +228,9 @@ Deno.test("project sessions leave branch selection to the managed workspace", as
   ok(source.includes("project_id: project.id"));
   ok(!source.includes("project_name: project.name"));
   ok(!source.includes("workdir: project.path"));
+  ok(source.includes("currentStatus={projectSessions[0]?.status ?? null}"));
+  ok(source.includes(': "No sessions"'));
+  ok(!source.includes('projectSessions[0]?.status || "queued"'));
 });
 
 Deno.test("project pages share live session data and finish notifications", async () => {

@@ -556,7 +556,7 @@ export function ProjectPage() {
                 )}
                 {activeDetailsTab === "overview" && (
                   <ProjectOverview
-                    currentStatus={projectSessions[0]?.status || "queued"}
+                    currentStatus={projectSessions[0]?.status ?? null}
                     latestBranch={latestBranch}
                     lastActive={lastActive}
                     sessionCount={projectSessions.length}
@@ -586,7 +586,7 @@ export function ProjectPage() {
               <div className="card-body">
                 <h2>Project overview</h2>
                 <ProjectOverview
-                  currentStatus={projectSessions[0]?.status || "queued"}
+                  currentStatus={projectSessions[0]?.status ?? null}
                   latestBranch={latestBranch}
                   lastActive={lastActive}
                   sessionCount={projectSessions.length}
@@ -621,7 +621,7 @@ export function ProjectPage() {
 
 function ProjectOverview(
   { currentStatus, latestBranch, lastActive, sessionCount }: {
-    currentStatus: SessionItem["status"];
+    currentStatus: SessionItem["status"] | null;
     latestBranch: string;
     lastActive: string;
     sessionCount: number;
@@ -632,7 +632,13 @@ function ProjectOverview(
       <div>
         <span>Current session</span>
         <strong>
-          <span className={`state-pill ${currentStatus}`}>{currentStatus}</span>
+          {currentStatus
+            ? (
+              <span className={`state-pill ${currentStatus}`}>
+                {currentStatus}
+              </span>
+            )
+            : "No sessions"}
         </strong>
       </div>
       <div>

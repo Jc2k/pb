@@ -41,6 +41,12 @@ pub struct UpdateProjectNotificationsRequest {
     pub notify_on_finish: bool,
 }
 
+#[derive(Debug)]
+pub struct ProjectRegistryMutation<T> {
+    pub value: T,
+    pub projects: Vec<ProjectEntry>,
+}
+
 pub fn registry_path() -> Result<PathBuf> {
     let config_dir = dirs::config_dir().context("cannot determine config directory")?;
     Ok(config_dir.join("pb").join("projects.toml"))
@@ -110,11 +116,19 @@ fn load_projects_from(path: &Path) -> Result<Vec<ProjectEntry>> {
     Ok(projects)
 }
 
-pub fn add_project(request: AddProjectRequest) -> Result<ProjectEntry> {
-    add_project_at(request, &registry_path()?)
+pub fn add_project(request: AddProjectRequest) -> Result<ProjectRegistryMutation<ProjectEntry>> {
+    add_project_at_with_snapshot(request, &registry_path()?)
 }
 
+#[cfg(test)]
 fn add_project_at(request: AddProjectRequest, registry_path: &Path) -> Result<ProjectEntry> {
+    Ok(add_project_at_with_snapshot(request, registry_path)?.value)
+}
+
+fn add_project_at_with_snapshot(
+    request: AddProjectRequest,
+    registry_path: &Path,
+) -> Result<ProjectRegistryMutation<ProjectEntry>> {
     let path = canonical_project_path(&request.path)?;
     let name = match request.name {
         Some(name) if !name.trim().is_empty() => name.trim().to_string(),
@@ -153,10 +167,13 @@ fn add_project_at(request: AddProjectRequest, registry_path: &Path) -> Result<Pr
     projects.push(entry.clone());
     sort_projects(&mut projects);
     save_projects_to(registry_path, &projects)?;
-    Ok(entry)
+    Ok(ProjectRegistryMutation {
+        value: entry,
+        projects,
+    })
 }
 
-pub fn remove_project(name: &str) -> Result<ProjectEntry> {
+pub fn remove_project(name: &str) -> Result<ProjectRegistryMutation<ProjectEntry>> {
     validate_project_name(name)?;
     let mut projects = load_projects()?;
     let Some(index) = projects.iter().position(|project| project.name == name) else {
@@ -164,22 +181,43 @@ pub fn remove_project(name: &str) -> Result<ProjectEntry> {
     };
     let removed = projects.remove(index);
     save_projects(&projects)?;
-    Ok(removed)
+    Ok(ProjectRegistryMutation {
+        value: removed,
+        projects,
+    })
 }
 
-pub fn set_project_notifications(name: &str, notify_on_finish: bool) -> Result<ProjectEntry> {
-    set_project_notifications_at(&registry_path()?, name, notify_on_finish)
+pub fn set_project_notifications(
+    name: &str,
+    notify_on_finish: bool,
+) -> Result<ProjectRegistryMutation<ProjectEntry>> {
+    set_project_notifications_at_with_snapshot(&registry_path()?, name, notify_on_finish)
 }
 
-pub fn set_project_notifications_by_id(id: &str, notify_on_finish: bool) -> Result<ProjectEntry> {
-    set_project_notifications_by_id_at(&registry_path()?, id, notify_on_finish)
+pub fn set_project_notifications_by_id(
+    id: &str,
+    notify_on_finish: bool,
+) -> Result<ProjectRegistryMutation<ProjectEntry>> {
+    set_project_notifications_by_id_at_with_snapshot(&registry_path()?, id, notify_on_finish)
 }
 
+#[cfg(test)]
 fn set_project_notifications_by_id_at(
     registry_path: &Path,
     id: &str,
     notify_on_finish: bool,
 ) -> Result<ProjectEntry> {
+    Ok(
+        set_project_notifications_by_id_at_with_snapshot(registry_path, id, notify_on_finish)?
+            .value,
+    )
+}
+
+fn set_project_notifications_by_id_at_with_snapshot(
+    registry_path: &Path,
+    id: &str,
+    notify_on_finish: bool,
+) -> Result<ProjectRegistryMutation<ProjectEntry>> {
     let mut projects = load_projects_from(registry_path)?;
     let Some(project) = projects.iter_mut().find(|project| project.id == id) else {
         bail!("project not found: {id}");
@@ -187,14 +225,26 @@ fn set_project_notifications_by_id_at(
     project.notify_on_finish = notify_on_finish;
     let updated = project.clone();
     save_projects_to(registry_path, &projects)?;
-    Ok(updated)
+    Ok(ProjectRegistryMutation {
+        value: updated,
+        projects,
+    })
 }
 
+#[cfg(test)]
 fn set_project_notifications_at(
     registry_path: &Path,
     name: &str,
     notify_on_finish: bool,
 ) -> Result<ProjectEntry> {
+    Ok(set_project_notifications_at_with_snapshot(registry_path, name, notify_on_finish)?.value)
+}
+
+fn set_project_notifications_at_with_snapshot(
+    registry_path: &Path,
+    name: &str,
+    notify_on_finish: bool,
+) -> Result<ProjectRegistryMutation<ProjectEntry>> {
     validate_project_name(name)?;
     let mut projects = load_projects_from(registry_path)?;
     let Some(project) = projects.iter_mut().find(|project| project.name == name) else {
@@ -203,7 +253,10 @@ fn set_project_notifications_at(
     project.notify_on_finish = notify_on_finish;
     let updated = project.clone();
     save_projects_to(registry_path, &projects)?;
-    Ok(updated)
+    Ok(ProjectRegistryMutation {
+        value: updated,
+        projects,
+    })
 }
 
 fn save_projects(projects: &[ProjectEntry]) -> Result<()> {
