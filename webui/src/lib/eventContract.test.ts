@@ -5,6 +5,7 @@ import {
   parseEventEnvelopeJson,
   parseProjectSessionSnapshotJson,
   parseSessionDetailsJson,
+  parseSessionStreamSnapshotJson,
 } from "./eventContract.ts";
 
 function rustEnumVariants(source: string, enumName: string): string[] {
@@ -323,6 +324,20 @@ Deno.test("v5 browser parsing rejects obsolete event envelopes", () => {
   throws(
     () => parseEventEnvelopeJson('{"version":"v4"}'),
     /unsupported event schema 'v4'; expected 'v5'/,
+  );
+});
+
+Deno.test("v5 session stream parsing rejects wrapper drift", () => {
+  throws(
+    () =>
+      parseSessionStreamSnapshotJson(
+        JSON.stringify({ session: {}, reset_history: true, refresh: true }),
+      ),
+    /session stream snapshot contains unknown field refresh/,
+  );
+  throws(
+    () => parseSessionStreamSnapshotJson(JSON.stringify({ session: {} })),
+    /session stream snapshot is missing field reset_history/,
   );
 });
 

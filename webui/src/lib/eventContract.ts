@@ -1475,6 +1475,16 @@ export function parseSessionStreamSnapshotJson(
     json(text, "session stream snapshot"),
     "session stream snapshot",
   );
+  exactKeys(
+    snapshot,
+    ["session", "reset_history"],
+    "session stream snapshot",
+  );
+  requiredKeys(
+    snapshot,
+    ["session", "reset_history"],
+    "session stream snapshot",
+  );
   if (typeof snapshot.reset_history !== "boolean") {
     throw new Error("session reset_history must be a boolean");
   }
