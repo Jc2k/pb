@@ -53,7 +53,6 @@ function currentSession(values: Partial<SessionItem>): SessionItem {
     handoff_outcome: null,
     pending_question: null,
     updated_at_ms: 0,
-    metrics: null,
     workflow_id: null,
     workflow_stage: null,
     workflow_outcome: null,

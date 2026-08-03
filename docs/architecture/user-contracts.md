@@ -417,9 +417,12 @@ and evidence remain. Editing after work begins similarly cannot rewrite complete
 supersedes only unfinished plan material after the replacement digest is approved.
 
 The web collection boundary publishes project, session, usage, and terminal-transition state under
-one process identity and monotonic revision clock. Usage includes complete total and requested
-calendar-window summaries for the whole service and every registered project; collection rows do
-not ship per-turn usage records for the browser to aggregate. An SSE subscription records its
+one process identity and monotonic revision clock. Usage totals are derived from the same captured
+session projection as the collection rows. Requested calendar-window summaries for the whole
+service and every registered project use a bounded server cache that is updated with new metrics
+and invalidated atomically with session deletion or project-registry changes; a new window scans
+retained turn records once instead of once per publication and subscriber. Collection rows do not
+ship cumulative metrics or per-turn usage records for the browser to aggregate. An SSE subscription records its
 transition floor inside that same publication boundary. Its first snapshot contains retained
 transitions newer than that floor, and each later snapshot advances the connection floor and carries
 only the next delta. Work that finishes while the first snapshot is being built is therefore still a
@@ -427,7 +430,10 @@ live transition rather than an indistinguishable completed row. Reconnect cursor
 originating process identity. HTTP snapshots provide manual recovery data only and cannot replace
 the live stream's process generation. Session deletion runs its durable removal, live projection,
 usage accounting, revision publication, and cleanup in an owned transaction that continues if the
-request disconnects. It does not report failure after removing the authoritative record: a
+request disconnects. Project mutations that change this collection return the same revisioned
+snapshot shape as the stream, so the browser can apply the authoritative result even while SSE is
+reconnecting and can continue displaying its last valid snapshot as stale data. Session deletion
+does not report failure after removing the authoritative record: a
 durable-record failure leaves the session intact, while later environment or workspace cleanup
 problems are returned as warnings on a successful deletion.
 

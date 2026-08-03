@@ -1420,7 +1420,6 @@ export interface SessionItem {
   } | null;
   started_at_ms: number;
   updated_at_ms: number;
-  metrics: SessionMetricsSnapshot | null;
   workflow_id: string | null;
   workflow_stage: WorkflowStage | null;
   workflow_outcome: WorkflowOutcome | null;

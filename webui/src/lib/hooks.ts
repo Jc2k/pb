@@ -53,7 +53,7 @@ export function currentUsageWindow(now = new Date()): UsageWindow {
   return { start_ms: start.getTime(), end_ms: end.getTime() };
 }
 
-function projectSessionUrl(
+export function projectSessionUrl(
   path: string,
   window: UsageWindow,
   lastEventId?: string,
@@ -66,13 +66,15 @@ function projectSessionUrl(
   return `${path}?${query}`;
 }
 
+const MAX_RETIRED_PROJECT_STREAM_IDS = 8;
+
 export class ProjectSessionStreamCursor {
   private eventStreamId: string | null = null;
   private eventRevision = -1;
   private dataStreamId: string | null = null;
   private revision = -1;
   private usageWindowStartMs = -1;
-  private readonly retiredStreamIds = new Set<string>();
+  private readonly retiredStreamIds: string[] = [];
 
   accept(
     snapshot: ProjectSessionSnapshot,
@@ -88,8 +90,13 @@ export class ProjectSessionStreamCursor {
         this.revision = -1;
       }
     } else if (snapshot.stream_id !== this.eventStreamId) {
-      if (this.retiredStreamIds.has(snapshot.stream_id)) return null;
-      if (this.eventStreamId) this.retiredStreamIds.add(this.eventStreamId);
+      if (this.retiredStreamIds.includes(snapshot.stream_id)) return null;
+      if (this.eventStreamId) {
+        this.retiredStreamIds.push(this.eventStreamId);
+        if (
+          this.retiredStreamIds.length > MAX_RETIRED_PROJECT_STREAM_IDS
+        ) this.retiredStreamIds.shift();
+      }
       this.eventStreamId = snapshot.stream_id;
       this.eventRevision = -1;
       if (snapshot.stream_id !== this.dataStreamId) {
@@ -144,6 +151,7 @@ export function useProjectSessionData(
   );
   const [dataLoading, setDataLoading] = useState(true);
   const [dataError, setDataError] = useState("");
+  const [hasSnapshot, setHasSnapshot] = useState(false);
   const dataRequest = useRef(new LatestRequest());
   const streamCursor = useRef(new ProjectSessionStreamCursor());
 
@@ -167,11 +175,16 @@ export function useProjectSessionData(
       }
     }
     if (!decision.applyData) return;
+    setHasSnapshot(true);
     setProjects(snapshot.projects);
     setSessions(snapshot.sessions);
     setOverallUsage(snapshot.overall_usage);
     setProjectUsage(snapshot.project_usage);
   }, [finishNotifications]);
+
+  const applyServerSnapshot = useCallback((text: string) => {
+    applySnapshot(text, "http");
+  }, [applySnapshot]);
 
   const fetchData = useCallback(async () => {
     const controller = dataRequest.current.start();
@@ -247,6 +260,9 @@ export function useProjectSessionData(
     projectUsage,
     dataLoading,
     dataError,
+    hasSnapshot,
+    usageWindow,
+    applyServerSnapshot,
     refresh: fetchData,
   };
 }

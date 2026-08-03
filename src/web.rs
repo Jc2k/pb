@@ -210,7 +210,6 @@ pub struct SessionListItem {
     pub pending_question: Option<PendingQuestionView>,
     pub started_at_ms: u64,
     pub updated_at_ms: u64,
-    pub metrics: Option<SessionMetricsSnapshot>,
     pub workflow_id: Option<String>,
     pub workflow_stage: Option<crate::workflow::WorkflowStage>,
     pub workflow_outcome: Option<crate::workflow::WorkflowOutcome>,
@@ -287,21 +286,6 @@ impl ProjectUsageStats {
         if let Some(energy_joules) = metrics_energy_joules(metrics) {
             self.energy_joules = Some(self.energy_joules.unwrap_or(0.0) + energy_joules);
             self.energy_kwh = Some(self.energy_joules.unwrap_or(0.0) / 3_600_000.0);
-        }
-    }
-
-    fn subtract_metrics(&mut self, metrics: &SessionMetricsSnapshot) {
-        self.tokens = self.tokens.saturating_sub(
-            metrics
-                .prompt_tokens
-                .saturating_add(metrics.generated_tokens),
-        );
-        self.runtime_ms = self.runtime_ms.saturating_sub(metrics_runtime_ms(metrics));
-        self.tool_calls = self.tool_calls.saturating_sub(metrics.tool_calls);
-        if let Some(energy) = metrics_energy_joules(metrics) {
-            let remaining = (self.energy_joules.unwrap_or(0.0) - energy).max(0.0);
-            self.energy_joules = (remaining > 0.0).then_some(remaining);
-            self.energy_kwh = self.energy_joules.map(|joules| joules / 3_600_000.0);
         }
     }
 }
@@ -461,6 +445,20 @@ struct DurableSessionProjection {
     pending_goal_change: Option<PendingGoalChange>,
 }
 
+const MAX_PROJECT_USAGE_WINDOW_CACHE_ENTRIES: usize = 16;
+
+#[derive(Debug)]
+struct CachedProjectUsageWindow {
+    window: UsageWindow,
+    overall_today: WindowedUsageAccumulator,
+    project_today: HashMap<String, WindowedUsageAccumulator>,
+}
+
+#[derive(Debug, Default)]
+struct ProjectUsageWindowCache {
+    entries: VecDeque<CachedProjectUsageWindow>,
+}
+
 #[derive(Debug)]
 struct SessionState {
     task: String,
@@ -500,7 +498,7 @@ struct ProjectSessionPublication {
 struct AppState {
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
     projects: Arc<Mutex<Vec<ProjectEntry>>>,
-    project_usage: Arc<Mutex<HashMap<String, ProjectUsageStats>>>,
+    project_usage_windows: Arc<Mutex<ProjectUsageWindowCache>>,
     project_session_stream_id: Arc<String>,
     project_session_revision: Arc<AtomicU64>,
     project_session_publication: Arc<StdMutex<ProjectSessionPublication>>,
@@ -681,7 +679,6 @@ pub async fn run_server_with_ready(
         }
     };
     let restored_sessions = restore_sessions(&project_entries);
-    let project_usage = build_project_usage_cache(&restored_sessions);
     let user_config = match crate::config::UserConfig::load() {
         Ok(config) => config,
         Err(error) => {
@@ -726,7 +723,7 @@ pub async fn run_server_with_ready(
     let state = AppState {
         sessions: Arc::new(Mutex::new(restored_sessions)),
         projects: Arc::new(Mutex::new(project_entries)),
-        project_usage: Arc::new(Mutex::new(project_usage)),
+        project_usage_windows: Arc::new(Mutex::new(ProjectUsageWindowCache::default())),
         project_session_stream_id: Arc::new(new_durable_id("project-session-stream")),
         project_session_revision: Arc::new(AtomicU64::new(0)),
         project_session_publication: Arc::new(StdMutex::new(ProjectSessionPublication::default())),
@@ -936,7 +933,7 @@ struct ProjectSessionQuery {
     last_event_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UsageWindow {
     start_ms: u64,
     end_ms: u64,
@@ -3598,7 +3595,7 @@ async fn delete_session_transaction(
     state: AppState,
     id: String,
 ) -> Result<DeleteSessionResponse, DeleteSessionError> {
-    let session = {
+    {
         let mut sessions = state.sessions.lock().await;
         let Some(session) = sessions.get(&id) else {
             return Err(DeleteSessionError::NotFound(format!(
@@ -3626,23 +3623,10 @@ async fn delete_session_transaction(
             .map_err(|error| anyhow::anyhow!("session persistence deletion task failed: {error}"))?
             .map_err(anyhow::Error::from)?;
         }
-        sessions.remove(&id).expect("session exists")
-    };
-
-    let project_id = session
-        .durable
-        .project
-        .as_ref()
-        .map(|project| project.id.clone());
-    if let Some(metrics) = &session.metrics
-        && let Some(project_id) = project_id
-    {
-        let mut usage = state.project_usage.lock().await;
-        if let Some(stats) = usage.get_mut(&project_id) {
-            stats.subtract_metrics(metrics);
-        }
+        sessions.remove(&id).expect("session exists");
+        state.project_usage_windows.lock().await.invalidate();
+        state.publish_project_session_change();
     }
-    state.publish_project_session_change();
     let cleanup_session_id = id.clone();
     let cleanup_warnings = match tokio::task::spawn_blocking(move || {
         cleanup_deleted_session_resources(&cleanup_session_id)
@@ -3818,10 +3802,12 @@ fn project_session_snapshot_sse_event(snapshot: &ProjectSessionSnapshot) -> Opti
 async fn update_project_notifications(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
+    Query(query): Query<ProjectSessionQuery>,
     Json(req): Json<UpdateProjectNotificationsRequest>,
-) -> Result<Json<ProjectEntry>, ApiError> {
+) -> Result<Json<ProjectSessionSnapshot>, ApiError> {
+    let usage_window = query.usage_window()?;
     let notify_on_finish = req.notify_on_finish;
-    let updated = mutate_project_registry(&state, move || {
+    mutate_project_registry(&state, move || {
         projects::set_project_notifications_by_id(&id, notify_on_finish)
     })
     .await
@@ -3832,7 +3818,10 @@ async fn update_project_notifications(
             error,
         )
     })?;
-    Ok(Json(updated))
+    let transition_floor = state.project_session_revision_baseline();
+    Ok(Json(
+        project_session_snapshot(&state, transition_floor, usage_window).await,
+    ))
 }
 
 async fn get_settings(
@@ -4014,33 +4003,31 @@ impl WebEventSink {
             self.persisted_branch = Some(branch.clone());
         }
         if let Some(metrics) = SessionMetricsSnapshot::from_event(&envelope.event) {
-            if let Ok(mut records) = self.usage_records.lock() {
-                records.push(metrics.clone());
-            }
             tokio::runtime::Handle::current().block_on(async {
-                let project_id = {
-                    let mut sessions = self.state.sessions.lock().await;
-                    let Some(session) = sessions.get_mut(&self.session_id) else {
-                        return;
-                    };
-                    let project_id = session
-                        .durable
-                        .project
-                        .as_ref()
-                        .map(|project| project.id.clone());
-                    if let Some(existing) = session.metrics.as_mut() {
-                        existing.add_assign(&metrics);
-                    } else {
-                        session.metrics = Some(metrics.clone());
-                    }
-                    session.updated_at_ms = now_millis();
-                    project_id
+                let mut sessions = self.state.sessions.lock().await;
+                let Some(session) = sessions.get_mut(&self.session_id) else {
+                    return;
                 };
-                if let Some(project_id) = project_id {
-                    let mut usage = self.state.project_usage.lock().await;
-                    let stats = usage.entry(project_id).or_default();
-                    stats.add_metrics(&metrics);
+                self.usage_records
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(metrics.clone());
+                if let Some(existing) = session.metrics.as_mut() {
+                    existing.add_assign(&metrics);
+                } else {
+                    session.metrics = Some(metrics.clone());
                 }
+                session.updated_at_ms = now_millis();
+                let project_id = session
+                    .durable
+                    .project
+                    .as_ref()
+                    .map(|project| project.id.as_str());
+                self.state
+                    .project_usage_windows
+                    .lock()
+                    .await
+                    .record_metrics(project_id, &metrics);
             });
         }
         if let AgentEvent::SessionTitle { title, .. } = &envelope.event {
@@ -6426,25 +6413,6 @@ fn apply_intrinsic_controller_actions(request: &mut AgentRequest) {
     request.observation_rendering = crate::workflow::ObservationRendering::ControllerBlock;
 }
 
-fn build_project_usage_cache(
-    sessions: &HashMap<String, SessionState>,
-) -> HashMap<String, ProjectUsageStats> {
-    let mut cache: HashMap<String, ProjectUsageStats> = HashMap::new();
-    for session in sessions.values() {
-        let Some(project) = &session.durable.project else {
-            continue;
-        };
-        let Some(metrics) = &session.metrics else {
-            continue;
-        };
-        cache
-            .entry(project.id.clone())
-            .or_default()
-            .add_metrics(metrics);
-    }
-    cache
-}
-
 fn session_from_persisted(mut persisted: PersistedSession) -> (String, SessionState) {
     let (sender, _) = broadcast::channel(256);
     let session_id = persisted.session_id.clone();
@@ -6646,7 +6614,6 @@ fn session_list_items(sessions: &HashMap<String, SessionState>) -> Vec<SessionLi
                 pending_question: session.pending_question.as_ref().map(pending_question_view),
                 started_at_ms: session.started_at_ms,
                 updated_at_ms: session.updated_at_ms,
-                metrics: session.metrics.clone(),
                 workflow_id: workflow.as_ref().map(|workflow| workflow.id.clone()),
                 workflow_stage: workflow.as_ref().map(|workflow| workflow.stage),
                 workflow_outcome: workflow.as_ref().and_then(|workflow| workflow.outcome),
@@ -6663,7 +6630,7 @@ fn session_list_items(sessions: &HashMap<String, SessionState>) -> Vec<SessionLi
     items
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct WindowedUsageAccumulator {
     tokens: f64,
     runtime_ms: f64,
@@ -6694,7 +6661,7 @@ impl WindowedUsageAccumulator {
         }
     }
 
-    fn finish(self) -> ProjectUsageStats {
+    fn finish(&self) -> ProjectUsageStats {
         let energy_joules = self.energy_joules;
         ProjectUsageStats {
             tokens: self.tokens.round() as usize,
@@ -6703,6 +6670,97 @@ impl WindowedUsageAccumulator {
             energy_kwh: energy_joules.map(|joules| joules / 3_600_000.0),
             energy_joules,
         }
+    }
+}
+
+impl CachedProjectUsageWindow {
+    fn from_sessions(
+        window: UsageWindow,
+        projects: &[ProjectEntry],
+        sessions: &HashMap<String, SessionState>,
+    ) -> Self {
+        let mut cached = Self {
+            window,
+            overall_today: WindowedUsageAccumulator::default(),
+            project_today: projects
+                .iter()
+                .map(|project| (project.id.clone(), WindowedUsageAccumulator::default()))
+                .collect(),
+        };
+        for session in sessions.values() {
+            let project_id = session
+                .durable
+                .project
+                .as_ref()
+                .map(|project| project.id.as_str());
+            let records = session
+                .usage_records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for metrics in records.iter() {
+                cached.add_metrics(project_id, metrics);
+            }
+        }
+        cached
+    }
+
+    fn add_metrics(&mut self, project_id: Option<&str>, metrics: &SessionMetricsSnapshot) {
+        self.overall_today.add_metrics(metrics, self.window);
+        if let Some(accumulator) = project_id.and_then(|id| self.project_today.get_mut(id)) {
+            accumulator.add_metrics(metrics, self.window);
+        }
+    }
+}
+
+impl ProjectUsageWindowCache {
+    fn invalidate(&mut self) {
+        self.entries.clear();
+    }
+
+    fn record_metrics(&mut self, project_id: Option<&str>, metrics: &SessionMetricsSnapshot) {
+        for cached in &mut self.entries {
+            cached.add_metrics(project_id, metrics);
+        }
+    }
+
+    fn summaries(
+        &mut self,
+        projects: &[ProjectEntry],
+        sessions: &HashMap<String, SessionState>,
+        window: UsageWindow,
+    ) -> (ProjectUsageStats, HashMap<String, ProjectUsageStats>) {
+        let position = self
+            .entries
+            .iter()
+            .position(|cached| cached.window == window);
+        let cached = if let Some(position) = position {
+            let cached = self.entries.remove(position).expect("cached window exists");
+            self.entries.push_back(cached);
+            self.entries.back().expect("cached window was restored")
+        } else {
+            if self.entries.len() == MAX_PROJECT_USAGE_WINDOW_CACHE_ENTRIES {
+                self.entries.pop_front();
+            }
+            self.entries
+                .push_back(CachedProjectUsageWindow::from_sessions(
+                    window, projects, sessions,
+                ));
+            self.entries.back().expect("cached window was inserted")
+        };
+        let project_today = projects
+            .iter()
+            .map(|project| {
+                (
+                    project.id.clone(),
+                    cached
+                        .project_today
+                        .get(&project.id)
+                        .map(WindowedUsageAccumulator::finish)
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        (cached.overall_today.finish(), project_today)
     }
 }
 
@@ -6719,48 +6777,40 @@ fn metrics_runtime_ms(metrics: &SessionMetricsSnapshot) -> u64 {
 fn usage_summaries(
     projects: &[ProjectEntry],
     sessions: &HashMap<String, SessionState>,
-    project_totals: &HashMap<String, ProjectUsageStats>,
+    usage_windows: &mut ProjectUsageWindowCache,
     window: UsageWindow,
 ) -> (ProjectUsageSummary, HashMap<String, ProjectUsageSummary>) {
     let mut overall_total = ProjectUsageStats::default();
-    let mut overall_today = WindowedUsageAccumulator::default();
-    let mut project_today = projects
+    let mut project_totals = projects
         .iter()
-        .map(|project| (project.id.clone(), WindowedUsageAccumulator::default()))
+        .map(|project| (project.id.clone(), ProjectUsageStats::default()))
         .collect::<HashMap<_, _>>();
 
     for session in sessions.values() {
-        if let Some(metrics) = &session.metrics {
-            overall_total.add_metrics(metrics);
-        }
-        let project_id = session
+        let Some(metrics) = &session.metrics else {
+            continue;
+        };
+        overall_total.add_metrics(metrics);
+        if let Some(total) = session
             .durable
             .project
             .as_ref()
-            .map(|project| project.id.as_str());
-        let Ok(records) = session.usage_records.lock() else {
-            continue;
-        };
-        for metrics in records.iter() {
-            overall_today.add_metrics(metrics, window);
-            if let Some(accumulator) = project_id.and_then(|id| project_today.get_mut(id)) {
-                accumulator.add_metrics(metrics, window);
-            }
+            .and_then(|project| project_totals.get_mut(&project.id))
+        {
+            total.add_metrics(metrics);
         }
     }
+
+    let (overall_today, mut project_today) = usage_windows.summaries(projects, sessions, window);
 
     let project_usage = projects
         .iter()
         .map(|project| {
-            let today = project_today
-                .remove(&project.id)
-                .unwrap_or_default()
-                .finish();
             (
                 project.id.clone(),
                 ProjectUsageSummary {
-                    total: project_totals.get(&project.id).cloned().unwrap_or_default(),
-                    today,
+                    total: project_totals.remove(&project.id).unwrap_or_default(),
+                    today: project_today.remove(&project.id).unwrap_or_default(),
                 },
             )
         })
@@ -6768,7 +6818,7 @@ fn usage_summaries(
     (
         ProjectUsageSummary {
             total: overall_total,
-            today: overall_today.finish(),
+            today: overall_today,
         },
         project_usage,
     )
@@ -6781,14 +6831,14 @@ async fn project_session_snapshot(
 ) -> ProjectSessionSnapshot {
     let projects = state.projects.lock().await;
     let sessions = state.sessions.lock().await;
-    let project_usage = state.project_usage.lock().await;
+    let mut usage_windows = state.project_usage_windows.lock().await;
     let publication = state
         .project_session_publication
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let revision = state.project_session_revision.load(Ordering::SeqCst);
     let (overall_usage, project_usage) =
-        usage_summaries(&projects, &sessions, &project_usage, usage_window);
+        usage_summaries(&projects, &sessions, &mut usage_windows, usage_window);
     ProjectSessionSnapshot {
         stream_id: (*state.project_session_stream_id).clone(),
         revision,
@@ -6842,6 +6892,9 @@ async fn reload_projects(state: &AppState) -> Result<()> {
     }
     let changed = *current_projects != projects;
     *current_projects = projects;
+    if changed {
+        state.project_usage_windows.lock().await.invalidate();
+    }
     drop(sessions);
     drop(current_projects);
     if changed {
@@ -7124,13 +7177,7 @@ mod workflow_tests {
                 repository_root: None,
                 notify_on_finish: false,
             }])),
-            project_usage: Arc::new(Mutex::new(HashMap::from([(
-                "project-1".to_string(),
-                ProjectUsageStats {
-                    tokens: 7,
-                    ..ProjectUsageStats::default()
-                },
-            )]))),
+            project_usage_windows: Arc::new(Mutex::new(ProjectUsageWindowCache::default())),
             project_session_stream_id: Arc::new("test-stream".to_string()),
             project_session_revision: Arc::new(AtomicU64::new(0)),
             project_session_publication: Arc::new(StdMutex::new(
@@ -7198,7 +7245,7 @@ mod workflow_tests {
         assert_eq!(snapshot.terminal_transition_floor, 0);
         assert_eq!(snapshot.terminal_transitions.len(), 1);
         assert_eq!(snapshot.terminal_transitions[0].revision, 2);
-        assert_eq!(snapshot.project_usage["project-1"].total.tokens, 7);
+        assert_eq!(snapshot.project_usage["project-1"].total.tokens, 0);
         assert_eq!(snapshot.project_usage["project-1"].today.tokens, 0);
         assert_eq!(snapshot.overall_usage.total.tokens, 0);
         assert!(
@@ -7217,7 +7264,7 @@ mod workflow_tests {
         let state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             projects: Arc::new(Mutex::new(Vec::new())),
-            project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_usage_windows: Arc::new(Mutex::new(ProjectUsageWindowCache::default())),
             project_session_stream_id: Arc::new("test-stream".to_string()),
             project_session_revision: Arc::new(AtomicU64::new(0)),
             project_session_publication: Arc::new(StdMutex::new(
@@ -7315,7 +7362,7 @@ mod workflow_tests {
         let state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), session)]))),
             projects: Arc::new(Mutex::new(Vec::new())),
-            project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_usage_windows: Arc::new(Mutex::new(ProjectUsageWindowCache::default())),
             project_session_stream_id: Arc::new("test-stream".to_string()),
             project_session_revision: Arc::new(AtomicU64::new(0)),
             project_session_publication: Arc::new(StdMutex::new(
@@ -7599,7 +7646,7 @@ mod workflow_tests {
         let state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), session)]))),
             projects: Arc::new(Mutex::new(Vec::new())),
-            project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_usage_windows: Arc::new(Mutex::new(ProjectUsageWindowCache::default())),
             project_session_stream_id: Arc::new("test-stream".to_string()),
             project_session_revision: Arc::new(AtomicU64::new(0)),
             project_session_publication: Arc::new(StdMutex::new(
@@ -7671,7 +7718,7 @@ mod workflow_tests {
         let state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), session)]))),
             projects: Arc::new(Mutex::new(Vec::new())),
-            project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_usage_windows: Arc::new(Mutex::new(ProjectUsageWindowCache::default())),
             project_session_stream_id: Arc::new("test-stream".to_string()),
             project_session_revision: Arc::new(AtomicU64::new(0)),
             project_session_publication: Arc::new(StdMutex::new(
@@ -7729,14 +7776,14 @@ mod workflow_tests {
         let mut changes = project_session_sender.subscribe();
         let state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), session)]))),
-            projects: Arc::new(Mutex::new(Vec::new())),
-            project_usage: Arc::new(Mutex::new(HashMap::from([(
-                "project-1".to_string(),
-                ProjectUsageStats {
-                    tokens: 10,
-                    ..ProjectUsageStats::default()
-                },
-            )]))),
+            projects: Arc::new(Mutex::new(vec![ProjectEntry {
+                id: "project-1".to_string(),
+                name: "pb".to_string(),
+                path: "/workspace/pb".to_string(),
+                repository_root: None,
+                notify_on_finish: false,
+            }])),
+            project_usage_windows: Arc::new(Mutex::new(ProjectUsageWindowCache::default())),
             project_session_stream_id: Arc::new("test-stream".to_string()),
             project_session_revision: Arc::new(AtomicU64::new(0)),
             project_session_publication: Arc::new(StdMutex::new(
@@ -7750,7 +7797,7 @@ mod workflow_tests {
             web_listen: "127.0.0.1".to_string(),
         };
 
-        let usage_guard = state.project_usage.lock().await;
+        let usage_guard = state.project_usage_windows.lock().await;
         let caller_state = state.clone();
         let caller_session_id = session_id.clone();
         let caller =
@@ -7759,7 +7806,7 @@ mod workflow_tests {
             );
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if !state.sessions.lock().await.contains_key(&session_id) {
+                if state.sessions.try_lock().is_err() {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -7767,6 +7814,28 @@ mod workflow_tests {
         })
         .await
         .expect("owned deletion should reach the accounting boundary");
+        assert!(matches!(
+            changes.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        let snapshot_state = state.clone();
+        let mut snapshot_caller = tokio::spawn(async move {
+            project_session_snapshot(
+                &snapshot_state,
+                1,
+                UsageWindow {
+                    start_ms: 0,
+                    end_ms: 86_400_000,
+                },
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut snapshot_caller)
+                .await
+                .is_err(),
+            "snapshots must wait for the complete deletion projection"
+        );
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         drop(usage_guard);
@@ -7778,8 +7847,14 @@ mod workflow_tests {
                 .unwrap(),
             1
         );
-        assert_eq!(state.project_usage.lock().await["project-1"].tokens, 0);
         assert!(!state.sessions.lock().await.contains_key(&session_id));
+        let snapshot = tokio::time::timeout(Duration::from_secs(1), snapshot_caller)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.sessions.is_empty());
+        assert_eq!(snapshot.project_usage["project-1"].total.tokens, 0);
+        assert_eq!(snapshot.project_usage["project-1"].today.tokens, 0);
     }
 
     fn request(workdir: &std::path::Path) -> AgentRequest {
@@ -7948,12 +8023,12 @@ mod workflow_tests {
         persisted.usage_records = vec![metrics];
         let (session_id, session) = session_from_persisted(persisted);
         let sessions = HashMap::from([(session_id, session)]);
-        let totals = build_project_usage_cache(&sessions);
+        let mut usage_windows = ProjectUsageWindowCache::default();
 
         let (overall, project_usage) = usage_summaries(
             &projects,
             &sessions,
-            &totals,
+            &mut usage_windows,
             UsageWindow {
                 start_ms: 120_000,
                 end_ms: 240_000,
@@ -7972,6 +8047,53 @@ mod workflow_tests {
             ProjectUsageStats::default().tokens
         );
         assert_eq!(project_usage["project-empty"].today.tokens, 0);
+    }
+
+    #[test]
+    fn usage_window_cache_updates_incrementally_and_stays_bounded() {
+        let projects = vec![ProjectEntry {
+            id: "project-1".to_string(),
+            name: "pb".to_string(),
+            path: "/workspace/pb".to_string(),
+            repository_root: None,
+            notify_on_finish: false,
+        }];
+        let sessions = HashMap::new();
+        let mut usage_windows = ProjectUsageWindowCache::default();
+        let window = UsageWindow {
+            start_ms: 0,
+            end_ms: 86_400_000,
+        };
+        let (_, initial) = usage_summaries(&projects, &sessions, &mut usage_windows, window);
+        assert_eq!(initial["project-1"].today.tokens, 0);
+
+        let metrics = SessionMetricsSnapshot {
+            prompt_tokens: 7,
+            generated_tokens: 3,
+            started_at_ms: 1_000,
+            ended_at_ms: 2_000,
+            ..Default::default()
+        };
+        usage_windows.record_metrics(Some("project-1"), &metrics);
+        let (_, updated) = usage_summaries(&projects, &sessions, &mut usage_windows, window);
+        assert_eq!(updated["project-1"].today.tokens, 10);
+
+        for offset in 1..=MAX_PROJECT_USAGE_WINDOW_CACHE_ENTRIES + 4 {
+            let start_ms = offset as u64 * 1_000;
+            usage_summaries(
+                &projects,
+                &sessions,
+                &mut usage_windows,
+                UsageWindow {
+                    start_ms,
+                    end_ms: start_ms + 86_400_000,
+                },
+            );
+        }
+        assert_eq!(
+            usage_windows.entries.len(),
+            MAX_PROJECT_USAGE_WINDOW_CACHE_ENTRIES
+        );
     }
 
     #[tokio::test]
@@ -8025,7 +8147,7 @@ mod workflow_tests {
         let state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), restored)]))),
             projects: Arc::new(Mutex::new(Vec::new())),
-            project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_usage_windows: Arc::new(Mutex::new(ProjectUsageWindowCache::default())),
             project_session_stream_id: Arc::new("test-stream".to_string()),
             project_session_revision: Arc::new(AtomicU64::new(0)),
             project_session_publication: Arc::new(StdMutex::new(
@@ -8100,7 +8222,7 @@ mod workflow_tests {
         let state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), restored)]))),
             projects: Arc::new(Mutex::new(Vec::new())),
-            project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_usage_windows: Arc::new(Mutex::new(ProjectUsageWindowCache::default())),
             project_session_stream_id: Arc::new("test-stream".to_string()),
             project_session_revision: Arc::new(AtomicU64::new(0)),
             project_session_publication: Arc::new(StdMutex::new(
@@ -8193,7 +8315,7 @@ mod workflow_tests {
         let state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), restored)]))),
             projects: Arc::new(Mutex::new(Vec::new())),
-            project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_usage_windows: Arc::new(Mutex::new(ProjectUsageWindowCache::default())),
             project_session_stream_id: Arc::new("test-stream".to_string()),
             project_session_revision: Arc::new(AtomicU64::new(0)),
             project_session_publication: Arc::new(StdMutex::new(
@@ -8257,7 +8379,7 @@ mod workflow_tests {
                 repository_root: None,
                 notify_on_finish: false,
             }])),
-            project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_usage_windows: Arc::new(Mutex::new(ProjectUsageWindowCache::default())),
             project_session_stream_id: Arc::new("test-stream".to_string()),
             project_session_revision: Arc::new(AtomicU64::new(0)),
             project_session_publication: Arc::new(StdMutex::new(
@@ -8330,7 +8452,7 @@ mod workflow_tests {
                 repository_root: None,
                 notify_on_finish: false,
             }])),
-            project_usage: Arc::new(Mutex::new(HashMap::new())),
+            project_usage_windows: Arc::new(Mutex::new(ProjectUsageWindowCache::default())),
             project_session_stream_id: Arc::new("test-stream".to_string()),
             project_session_revision: Arc::new(AtomicU64::new(0)),
             project_session_publication: Arc::new(StdMutex::new(

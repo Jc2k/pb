@@ -154,12 +154,22 @@ function typescriptStringUnion(source: string, typeName: string): string[] {
   );
 }
 
+function runtimeContractSet(source: string, name: string): string[] {
+  const start = source.indexOf(`const ${name} = new Set([`);
+  if (start < 0) throw new Error(`missing runtime contract set ${name}`);
+  const end = source.indexOf("]);", start);
+  return [...source.slice(start, end).matchAll(/"([^"]+)"/g)].map((match) =>
+    match[1]
+  );
+}
+
 Deno.test("Rust and TypeScript expose the same event and profile variants", async () => {
-  const [events, agents, workflow, types] = await Promise.all([
+  const [events, agents, workflow, types, runtimeContract] = await Promise.all([
     Deno.readTextFile("src/events.rs"),
     Deno.readTextFile("src/agent_core.rs"),
     Deno.readTextFile("src/workflow/mod.rs"),
     Deno.readTextFile("webui/src/types/index.ts"),
+    Deno.readTextFile("webui/src/lib/eventContract.ts"),
   ]);
 
   deepEqual(
@@ -222,6 +232,27 @@ Deno.test("Rust and TypeScript expose the same event and profile variants", asyn
     deepEqual(
       typescriptStringUnion(types, typeName).sort(),
       rustEnumVariants(rustSource, typeName).map(snakeCase).sort(),
+    );
+  }
+
+  for (
+    const [typeName, contractSet] of [
+      ["HandoffOutcome", "handoffOutcomes"],
+      ["SessionStatus", "sessionStatuses"],
+      ["TurnIntent", "turnIntents"],
+      ["WorkflowStage", "workflowStages"],
+      ["WorkflowOutcome", "workflowOutcomes"],
+      ["GoalStage", "goalStages"],
+      ["GoalOutcome", "goalOutcomes"],
+      ["GoalCompletionBasis", "goalCompletionBases"],
+      ["MultiTaskStage", "multiTaskStages"],
+      ["MultiTaskOutcome", "multiTaskOutcomes"],
+    ] as const
+  ) {
+    deepEqual(
+      runtimeContractSet(runtimeContract, contractSet).sort(),
+      typescriptStringUnion(types, typeName).sort(),
+      `${contractSet} drifted from ${typeName}`,
     );
   }
 
@@ -303,7 +334,35 @@ Deno.test("project snapshot parsing validates terminal transition semantics", ()
       path: "/workspace/pb",
       notify_on_finish: true,
     }],
-    sessions: [],
+    sessions: [{
+      session_id: "session-1",
+      task: "finish the event boundary",
+      title: "Boundary complete",
+      running: false,
+      paused: false,
+      status: "completed",
+      intent: "deliver",
+      branch: "feature/boundary",
+      workdir: "/workspace/pb",
+      project: {
+        id: "project-1",
+        name: "pb",
+        path: "/workspace/pb",
+      },
+      handoff_outcome: "ready",
+      pending_question: null,
+      started_at_ms: 1,
+      updated_at_ms: 2,
+      workflow_id: null,
+      workflow_stage: null,
+      workflow_outcome: null,
+      strict_workflow: false,
+      goal: null,
+      active_goal: false,
+      multi_task: null,
+      active_multi_task: false,
+      revision: 2,
+    }],
     overall_usage: {
       total: { tokens: 3, runtime_ms: 4, tool_calls: 1 },
       today: { tokens: 2, runtime_ms: 3, tool_calls: 1 },
@@ -339,6 +398,18 @@ Deno.test("project snapshot parsing validates terminal transition semantics", ()
   throws(
     () => parseProjectSessionSnapshotJson(JSON.stringify(missingProjectUsage)),
     /contain every project exactly once/,
+  );
+  const invalidSession = structuredClone(snapshot);
+  invalidSession.sessions[0].status = "finished";
+  throws(
+    () => parseProjectSessionSnapshotJson(JSON.stringify(invalidSession)),
+    /session 0 status is invalid/,
+  );
+  const obsoleteSession = structuredClone(snapshot);
+  Object.assign(obsoleteSession.sessions[0], { usage_records: [] });
+  throws(
+    () => parseProjectSessionSnapshotJson(JSON.stringify(obsoleteSession)),
+    /session 0 contains unknown field usage_records/,
   );
   snapshot.terminal_transitions[0].status = "running";
   throws(

@@ -26,7 +26,6 @@ function session(status: SessionItem["status"]): SessionItem {
     pending_question: null,
     started_at_ms: Date.now(),
     updated_at_ms: Date.now(),
-    metrics: null,
     workflow_id: null,
     workflow_stage: null,
     workflow_outcome: null,

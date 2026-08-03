@@ -10,7 +10,9 @@ import type {
   ProjectSessionTerminalTransition,
 } from "../types/index.ts";
 import {
+  applyProjectSessionMutationResponse,
   nextProjectNotificationPreference,
+  projectUsageAvailability,
   recoverProjectSettings,
 } from "./ProjectsPage.tsx";
 
@@ -108,6 +110,16 @@ Deno.test("project stream authority rejects stale process generations", () => {
   equal(startup.accept(projectSnapshot("process-a", 5), "stream"), null);
 });
 
+Deno.test("project stream retains only a bounded set of stale generations", () => {
+  const cursor = new ProjectSessionStreamCursor();
+  for (let generation = 0; generation < 20; generation += 1) {
+    cursor.accept(projectSnapshot(`process-${generation}`, 1), "stream");
+  }
+  const state = cursor as unknown as { retiredStreamIds: string[] };
+  equal(state.retiredStreamIds.length, 8);
+  equal(cursor.accept(projectSnapshot("process-18", 2), "stream"), null);
+});
+
 Deno.test("project stream trusts server-authored per-connection terminal deltas", () => {
   const cursor = new ProjectSessionStreamCursor();
   const racedWithInitialSnapshot = terminalTransition("fast", 4);
@@ -151,6 +163,34 @@ Deno.test("project settings recovery clears the presented mutation error before 
     (message) => events.push(`clear:${message}`),
   );
   deepEqual(events, ["clear:", "refresh"]);
+});
+
+Deno.test("project mutations apply their revisioned server snapshot", async () => {
+  const applied: string[] = [];
+  await applyProjectSessionMutationResponse(
+    new Response('{"stream_id":"process-a","revision":3}'),
+    (snapshot) => applied.push(snapshot),
+  );
+  deepEqual(applied, ['{"stream_id":"process-a","revision":3}']);
+});
+
+Deno.test("project usage remains visible while a loaded stream reconnects", () => {
+  deepEqual(
+    projectUsageAvailability(
+      true,
+      false,
+      "Live project updates are temporarily unavailable",
+    ),
+    { loading: false, error: "" },
+  );
+  deepEqual(projectUsageAvailability(false, true, ""), {
+    loading: true,
+    error: "",
+  });
+  deepEqual(projectUsageAvailability(false, false, "Project request failed"), {
+    loading: false,
+    error: "Project request failed",
+  });
 });
 
 Deno.test("project index uses the shared workspace frame", async () => {

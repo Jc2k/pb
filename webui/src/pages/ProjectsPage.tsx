@@ -46,6 +46,7 @@ import {
 import {
   isAbortError,
   LatestRequest,
+  projectSessionUrl,
   useProjectSessionData,
 } from "../lib/hooks";
 
@@ -185,6 +186,24 @@ export async function recoverProjectSettings(
   await refresh();
 }
 
+export async function applyProjectSessionMutationResponse(
+  response: Response,
+  applySnapshot: (snapshot: string) => void,
+): Promise<void> {
+  applySnapshot(await response.text());
+}
+
+export function projectUsageAvailability(
+  hasSnapshot: boolean,
+  dataLoading: boolean,
+  dataError: string,
+): { loading: boolean; error: string } {
+  return {
+    loading: dataLoading && !hasSnapshot,
+    error: hasSnapshot ? "" : dataError,
+  };
+}
+
 function projectMcpIntegrations(
   entries: InstalledIntegration[],
 ): InstalledIntegration[] {
@@ -204,6 +223,7 @@ export function ProjectPage() {
     projectUsage,
     dataLoading,
     dataError,
+    hasSnapshot,
     refresh,
   } = useProjectSessionData();
   const [task, setTask] = useState("");
@@ -223,8 +243,11 @@ export function ProjectPage() {
     : "";
   const project = projects.find((entry) => entry.id === projectId);
   const usage = project ? projectUsage[project.id] : EMPTY_USAGE_SUMMARY;
-  const usageLoading = dataLoading && !project;
-  const usageError = dataError;
+  const { loading: usageLoading, error: usageError } = projectUsageAvailability(
+    hasSnapshot,
+    dataLoading,
+    dataError,
+  );
   const projectSessions = useMemo(
     () =>
       project
@@ -680,6 +703,8 @@ export function ProjectSettingsPage() {
     projects,
     dataLoading: projectsLoading,
     dataError: projectsDataError,
+    usageWindow,
+    applyServerSnapshot,
     refresh: fetchProjects,
   } = useProjectSessionData({ finishNotifications: false });
   const [projectsMutationError, setProjectsMutationError] = useState("");
@@ -848,7 +873,10 @@ export function ProjectSettingsPage() {
     const controller = notificationRequest.current.start();
     try {
       const res = await fetch(
-        `/api/projects/${encodeURIComponent(project.id)}/notifications`,
+        projectSessionUrl(
+          `/api/projects/${encodeURIComponent(project.id)}/notifications`,
+          usageWindow,
+        ),
         {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
@@ -861,7 +889,8 @@ export function ProjectSettingsPage() {
           await apiErrorMessage(res, "Could not update notifications"),
         );
       }
-      await res.text();
+      if (!notificationRequest.current.owns(controller)) return;
+      await applyProjectSessionMutationResponse(res, applyServerSnapshot);
       if (!notificationRequest.current.owns(controller)) return;
       setProjectsMutationError("");
     } catch (error) {
