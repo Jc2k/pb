@@ -471,7 +471,7 @@ struct SessionState {
     paused: bool,
     status: SessionStatus,
     pending_question: Option<PendingQuestionState>,
-    sender: broadcast::Sender<EventEnvelope>,
+    sender: SessionEventSender,
     history: Arc<StdMutex<Vec<EventEnvelope>>>,
     metrics: Option<SessionMetricsSnapshot>,
     usage_records: Arc<StdMutex<Vec<SessionMetricsSnapshot>>>,
@@ -489,74 +489,77 @@ struct SessionState {
     updated_at_ms: u64,
 }
 
-#[derive(Debug, Default)]
-struct ProjectSessionPublication {
-    terminal_transitions: VecDeque<ProjectSessionTerminalTransition>,
-    directly_published_events: VecDeque<(String, String)>,
-}
-
-const MAX_DIRECTLY_PUBLISHED_PROJECT_SESSION_EVENTS: usize = 512;
-
 #[derive(Debug, Clone)]
-struct AppState {
-    sessions: Arc<Mutex<HashMap<String, SessionState>>>,
-    projects: Arc<Mutex<Vec<ProjectEntry>>>,
-    project_usage_windows: Arc<Mutex<ProjectUsageWindowCache>>,
-    project_session_stream_id: Arc<String>,
-    project_session_revision: Arc<AtomicU64>,
-    project_session_publication: Arc<StdMutex<ProjectSessionPublication>>,
-    project_session_sender: broadcast::Sender<u64>,
-    sleep_prevention: Arc<StdMutex<SleepPrevention>>,
-    tailscale: Arc<StdMutex<crate::tailscale::TailscaleIntegration>>,
-    web_listen: String,
+struct SessionEventSender {
+    sender: broadcast::Sender<EventEnvelope>,
+    project_session_publisher: Arc<StdMutex<Option<ProjectSessionChangePublisher>>>,
 }
 
-impl AppState {
-    fn mark_project_session_event_published(&self, session_id: &str, entry_key: String) {
-        let mut publication = self
-            .project_session_publication
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        publication
-            .directly_published_events
-            .push_back((session_id.to_string(), entry_key));
-        while publication.directly_published_events.len()
-            > MAX_DIRECTLY_PUBLISHED_PROJECT_SESSION_EVENTS
-        {
-            publication.directly_published_events.pop_front();
+#[derive(Debug, Clone, Copy)]
+enum CollectionPublication {
+    Automatic,
+    CallerOwned,
+}
+
+impl SessionEventSender {
+    fn new(capacity: usize) -> Self {
+        Self {
+            sender: broadcast::channel(capacity).0,
+            project_session_publisher: Arc::new(StdMutex::new(None)),
         }
     }
 
-    fn consume_direct_project_session_publication(
-        &self,
-        session_id: &str,
-        entry_key: &str,
-    ) -> bool {
-        let mut publication = self
-            .project_session_publication
+    fn attach_project_session_publisher(&self, publisher: ProjectSessionChangePublisher) {
+        *self
+            .project_session_publisher
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(index) = publication
-            .directly_published_events
-            .iter()
-            .position(|published| published.0 == session_id && published.1 == entry_key)
-        else {
-            return false;
-        };
-        publication.directly_published_events.remove(index);
-        true
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(publisher);
     }
 
-    fn publish_project_session_update(
+    fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
+        self.sender.subscribe()
+    }
+
+    fn send(&self, envelope: EventEnvelope, publication: CollectionPublication) {
+        let publisher = (matches!(publication, CollectionPublication::Automatic)
+            && envelope.affects_project_session_snapshot())
+        .then(|| {
+            self.project_session_publisher
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+        .flatten();
+        let _ = self.sender.send(envelope);
+        if let Some(publisher) = publisher {
+            publisher.publish_update(None);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ProjectSessionPublication {
+    terminal_transitions: VecDeque<ProjectSessionTerminalTransition>,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectSessionChangePublisher {
+    revision: Arc<AtomicU64>,
+    publication: Arc<StdMutex<ProjectSessionPublication>>,
+    sender: broadcast::Sender<u64>,
+}
+
+impl ProjectSessionChangePublisher {
+    fn publish_update(
         &self,
         mut terminal_transition: Option<ProjectSessionTerminalTransition>,
     ) -> u64 {
         let mut publication = self
-            .project_session_publication
+            .publication
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let revision = self
-            .project_session_revision
+            .revision
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 Some(current.saturating_add(1))
             })
@@ -573,8 +576,40 @@ impl AppState {
                 publication.terminal_transitions.pop_front();
             }
         }
-        let _ = self.project_session_sender.send(revision);
+        let _ = self.sender.send(revision);
         revision
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AppState {
+    sessions: Arc<Mutex<HashMap<String, SessionState>>>,
+    projects: Arc<Mutex<Vec<ProjectEntry>>>,
+    project_usage_windows: Arc<Mutex<ProjectUsageWindowCache>>,
+    project_session_stream_id: Arc<String>,
+    project_session_revision: Arc<AtomicU64>,
+    project_session_publication: Arc<StdMutex<ProjectSessionPublication>>,
+    project_session_sender: broadcast::Sender<u64>,
+    sleep_prevention: Arc<StdMutex<SleepPrevention>>,
+    tailscale: Arc<StdMutex<crate::tailscale::TailscaleIntegration>>,
+    web_listen: String,
+}
+
+impl AppState {
+    fn project_session_change_publisher(&self) -> ProjectSessionChangePublisher {
+        ProjectSessionChangePublisher {
+            revision: Arc::clone(&self.project_session_revision),
+            publication: Arc::clone(&self.project_session_publication),
+            sender: self.project_session_sender.clone(),
+        }
+    }
+
+    fn publish_project_session_update(
+        &self,
+        terminal_transition: Option<ProjectSessionTerminalTransition>,
+    ) -> u64 {
+        self.project_session_change_publisher()
+            .publish_update(terminal_transition)
     }
 
     fn publish_project_session_change(&self) -> u64 {
@@ -624,60 +659,6 @@ impl AppState {
             handoff_outcome,
             project,
         }
-    }
-
-    fn watch_session_changes(
-        &self,
-        session_id: String,
-        mut receiver: broadcast::Receiver<EventEnvelope>,
-    ) {
-        let state = self.clone();
-        tokio::spawn(async move {
-            loop {
-                match receiver.recv().await {
-                    Ok(envelope) if envelope.affects_project_session_snapshot() => {
-                        if state.consume_direct_project_session_publication(
-                            &session_id,
-                            &envelope.transcript.entry_key,
-                        ) {
-                            continue;
-                        }
-                        let status = match envelope.event {
-                            AgentEvent::SessionStateChanged {
-                                status: crate::events::SessionLifecycleStatus::Completed,
-                                ..
-                            } => Some(SessionStatus::Completed),
-                            AgentEvent::SessionStateChanged {
-                                status: crate::events::SessionLifecycleStatus::Failed,
-                                ..
-                            } => Some(SessionStatus::Failed),
-                            _ => None,
-                        };
-                        let transition = if let Some(status) = status {
-                            let projects = state.projects.lock().await;
-                            let sessions = state.sessions.lock().await;
-                            sessions.get(&session_id).map(|session| {
-                                Self::terminal_transition(
-                                    &projects,
-                                    &session_id,
-                                    envelope.transcript.entry_key,
-                                    status,
-                                    session,
-                                )
-                            })
-                        } else {
-                            None
-                        };
-                        state.publish_project_session_update(transition);
-                    }
-                    Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        state.publish_project_session_change();
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
     }
 
     fn update_sleep_prevention_working(&self, working: bool) {
@@ -787,8 +768,10 @@ pub async fn run_server_with_ready(
 
     {
         let sessions = state.sessions.lock().await;
-        for (session_id, session) in sessions.iter() {
-            state.watch_session_changes(session_id.clone(), session.sender.subscribe());
+        for session in sessions.values() {
+            session
+                .sender
+                .attach_project_session_publisher(state.project_session_change_publisher());
         }
     }
     let project_watch_state = state.clone();
@@ -1225,7 +1208,7 @@ async fn start_session_inner(
     req: StartSessionRequest,
 ) -> Result<SessionResponse> {
     let session_id = new_session_id();
-    let (sender, _) = broadcast::channel(256);
+    let sender = SessionEventSender::new(256);
     let task = req.task.trim().to_string();
     if task.is_empty() {
         bail!("session task must not be empty");
@@ -1354,6 +1337,7 @@ async fn start_session_inner(
         started_at_ms: now,
         updated_at_ms: now,
     };
+    sender.attach_project_session_publisher(state.project_session_change_publisher());
 
     {
         let mut sessions = state.sessions.lock().await;
@@ -1362,7 +1346,6 @@ async fn start_session_inner(
         }
         sessions.insert(session_id.clone(), session);
     }
-    state.watch_session_changes(session_id.clone(), sender.subscribe());
     state.publish_project_session_change();
 
     let empty_history = StdMutex::new(Vec::new());
@@ -1520,7 +1503,7 @@ async fn start_goal_inner(
         now,
     )?;
     let checkpoint = crate::goal::GoalCheckpoint::new(run)?;
-    let (sender, _) = broadcast::channel(256);
+    let sender = SessionEventSender::new(256);
     let history = Arc::new(StdMutex::new(Vec::new()));
     let usage_records = Arc::new(StdMutex::new(Vec::new()));
     let mut request = defaults;
@@ -1576,9 +1559,9 @@ async fn start_goal_inner(
     };
     publish_goal_started(&mut session, &checkpoint);
     persist_live_session(&session_id, &session);
+    session_sender.attach_project_session_publisher(state.project_session_change_publisher());
     sessions.insert(session_id.clone(), session);
     drop(sessions);
-    state.watch_session_changes(session_id.clone(), session_sender.subscribe());
     state.publish_project_session_change();
     Ok(GoalResponse {
         session_id,
@@ -1857,6 +1840,7 @@ async fn cancel_goal(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<GoalDigestRequest>,
 ) -> Result<Json<GoalResponse>, ApiError> {
+    let projects = state.projects.lock().await;
     let mut sessions = state.sessions.lock().await;
     let (session_id, session) = find_active_goal_session_mut(&mut sessions, &id)?;
     let checkpoint = session.goal.as_ref().ok_or(StatusCode::NOT_FOUND)?;
@@ -1893,6 +1877,14 @@ async fn cancel_goal(
     session.status = fold_terminal_goal_task(session, &checkpoint).map_err(internal_status)?;
     session.paused = false;
     session.updated_at_ms = now_millis();
+    if matches!(
+        session.status,
+        SessionStatus::Completed | SessionStatus::Failed
+    ) {
+        publish_terminal_session_state_changed(&state, &projects, &session_id, session);
+    } else {
+        publish_session_state_changed(session);
+    }
     persist_live_session(&session_id, session);
     Ok(Json(GoalResponse {
         session_id,
@@ -1906,6 +1898,7 @@ async fn accept_goal(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<GoalDigestRequest>,
 ) -> Result<Json<GoalResponse>, ApiError> {
+    let projects = state.projects.lock().await;
     let mut sessions = state.sessions.lock().await;
     let (session_id, session) = find_active_goal_session_mut(&mut sessions, &id)?;
     let mut checkpoint = session.goal.take().ok_or(StatusCode::NOT_FOUND)?;
@@ -1937,6 +1930,15 @@ async fn accept_goal(
     session.completed_goals.push(checkpoint.clone());
     session.status = fold_terminal_goal_task(session, &checkpoint).map_err(internal_status)?;
     session.paused = false;
+    session.updated_at_ms = now_millis();
+    if matches!(
+        session.status,
+        SessionStatus::Completed | SessionStatus::Failed
+    ) {
+        publish_terminal_session_state_changed(&state, &projects, &session_id, session);
+    } else {
+        publish_session_state_changed(session);
+    }
     let dispatch = session.status == SessionStatus::Queued;
     persist_live_session(&session_id, session);
     let response = Json(GoalResponse {
@@ -1945,6 +1947,7 @@ async fn accept_goal(
         goal_sha256: checkpoint.sha256,
     });
     drop(sessions);
+    drop(projects);
     if dispatch {
         dispatch_next_session(state);
     }
@@ -2815,6 +2818,7 @@ async fn send_session_message(
     );
     drop(pending);
     session.updated_at_ms = now_millis();
+    state.publish_project_session_change();
     persist_live_session(&id, session);
     Ok(Json(SendSessionMessageResponse { message_id }))
 }
@@ -4014,7 +4018,7 @@ struct WebEventSink {
     state: AppState,
     session_id: String,
     request_template: AgentRequest,
-    sender: broadcast::Sender<EventEnvelope>,
+    sender: SessionEventSender,
     history: Arc<StdMutex<Vec<EventEnvelope>>>,
     usage_records: Arc<StdMutex<Vec<SessionMetricsSnapshot>>>,
     persisted_branch: Option<String>,
@@ -4127,16 +4131,12 @@ impl WebEventSink {
                         session.durable.pending_goal_proposal = Some(proposal);
                     }
                     session.updated_at_ms = now_millis();
-                    self.state
-                        .mark_project_session_event_published(&self.session_id, entry_key.clone());
-                    if publish_event_envelope_linked(
+                    publish_event_envelope_linked(
                         &self.sender,
                         &self.history,
                         envelope,
                         supersedes,
-                    ) {
-                        self.state.publish_project_session_change();
-                    }
+                    );
                 } else {
                     publish_event_envelope_linked(
                         &self.sender,
@@ -4324,6 +4324,7 @@ impl EventSink for WebEventSink {
                 session.workflow = None;
                 session.request_template.workflow_checkpoint = None;
                 session.updated_at_ms = now_millis();
+                self.state.publish_project_session_change();
                 Ok::<(), anyhow::Error>(())
             })?;
             persist_session_snapshot(
@@ -4391,6 +4392,7 @@ impl EventSink for WebEventSink {
                 session.workflow = None;
                 session.request_template.workflow_checkpoint = None;
                 session.updated_at_ms = now_millis();
+                self.state.publish_project_session_change();
                 Ok::<(), anyhow::Error>(())
             })?;
             persist_session_snapshot(
@@ -4454,6 +4456,7 @@ impl EventSink for WebEventSink {
                 session.workflow.clone()
             };
             session.updated_at_ms = now_millis();
+            self.state.publish_project_session_change();
             Ok::<(), anyhow::Error>(())
         })?;
         persist_session_snapshot(
@@ -4491,6 +4494,7 @@ impl EventSink for WebEventSink {
             session.workflow = None;
             session.request_template.workflow_checkpoint = None;
             session.updated_at_ms = now_millis();
+            self.state.publish_project_session_change();
             Ok::<(), anyhow::Error>(())
         })?;
         persist_session_snapshot(
@@ -4683,6 +4687,10 @@ impl EventSink for WebEventSink {
 }
 
 fn publish_session_state_changed(session: &SessionState) {
+    debug_assert!(!matches!(
+        session.status,
+        SessionStatus::Completed | SessionStatus::Failed
+    ));
     publish_event(
         &session.sender,
         &session.history,
@@ -4718,8 +4726,12 @@ fn publish_terminal_session_state_changed(
     ));
     let envelope = EventEnvelope::with_timestamp(session_state_changed_event(session));
     let entry_key = envelope.transcript.entry_key.clone();
-    state.mark_project_session_event_published(session_id, entry_key.clone());
-    if !publish_event_envelope_linked(&session.sender, &session.history, envelope, Vec::new()) {
+    if !publish_caller_owned_collection_event_envelope_linked(
+        &session.sender,
+        &session.history,
+        envelope,
+        Vec::new(),
+    ) {
         return;
     }
     let transition =
@@ -6510,7 +6522,7 @@ fn apply_intrinsic_controller_actions(request: &mut AgentRequest) {
 }
 
 fn session_from_persisted(mut persisted: PersistedSession) -> (String, SessionState) {
-    let (sender, _) = broadcast::channel(256);
+    let sender = SessionEventSender::new(256);
     let session_id = persisted.session_id.clone();
     let title = persisted.title;
     let usage_records = persisted.usage_records.clone();
@@ -7232,7 +7244,7 @@ fn now_millis() -> u64 {
 }
 
 fn publish_event(
-    sender: &broadcast::Sender<EventEnvelope>,
+    sender: &SessionEventSender,
     history: &StdMutex<Vec<EventEnvelope>>,
     event: AgentEvent,
 ) -> bool {
@@ -7240,7 +7252,7 @@ fn publish_event(
 }
 
 fn publish_event_linked(
-    sender: &broadcast::Sender<EventEnvelope>,
+    sender: &SessionEventSender,
     history: &StdMutex<Vec<EventEnvelope>>,
     event: AgentEvent,
     supersedes: Vec<String>,
@@ -7250,10 +7262,41 @@ fn publish_event_linked(
 }
 
 fn publish_event_envelope_linked(
-    sender: &broadcast::Sender<EventEnvelope>,
+    sender: &SessionEventSender,
+    history: &StdMutex<Vec<EventEnvelope>>,
+    envelope: EventEnvelope,
+    supersedes: Vec<String>,
+) -> bool {
+    publish_event_envelope_with_collection_state(
+        sender,
+        history,
+        envelope,
+        supersedes,
+        CollectionPublication::Automatic,
+    )
+}
+
+fn publish_caller_owned_collection_event_envelope_linked(
+    sender: &SessionEventSender,
+    history: &StdMutex<Vec<EventEnvelope>>,
+    envelope: EventEnvelope,
+    supersedes: Vec<String>,
+) -> bool {
+    publish_event_envelope_with_collection_state(
+        sender,
+        history,
+        envelope,
+        supersedes,
+        CollectionPublication::CallerOwned,
+    )
+}
+
+fn publish_event_envelope_with_collection_state(
+    sender: &SessionEventSender,
     history: &StdMutex<Vec<EventEnvelope>>,
     mut envelope: EventEnvelope,
     supersedes: Vec<String>,
+    collection_publication: CollectionPublication,
 ) -> bool {
     envelope.transcript.supersedes = supersedes;
     let Ok(mut entries) = history.lock() else {
@@ -7273,7 +7316,7 @@ fn publish_event_envelope_linked(
         *entries =
             session_store::trim_event_history(std::mem::take(&mut *entries), MAX_HISTORY_EVENTS);
     }
-    let _ = sender.send(envelope);
+    sender.send(envelope, collection_publication);
     true
 }
 
@@ -7317,8 +7360,8 @@ mod workflow_tests {
         );
         let (mut changes, transition_floor) = state.subscribe_project_session_changes();
         assert_eq!(transition_floor, 0);
-        let (session_sender, _) = broadcast::channel(16);
-        state.watch_session_changes("session-1".to_string(), session_sender.subscribe());
+        let session_sender = SessionEventSender::new(16);
+        session_sender.attach_project_session_publisher(state.project_session_change_publisher());
         publish_event(
             &session_sender,
             &StdMutex::new(Vec::new()),
@@ -7334,6 +7377,12 @@ mod workflow_tests {
                 .unwrap()
                 .unwrap(),
             1
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), changes.recv())
+                .await
+                .is_err(),
+            "one state-affecting event must produce exactly one collection revision"
         );
         let terminal_transition = ProjectSessionTerminalTransition {
             entry_key: "terminal-entry".to_string(),
@@ -7553,11 +7602,6 @@ mod workflow_tests {
             web_listen: "127.0.0.1".to_string(),
         };
         let (mut changes, transition_floor) = state.subscribe_project_session_changes();
-        let sender = {
-            let sessions = state.sessions.lock().await;
-            sessions.get(&session_id).unwrap().sender.clone()
-        };
-        state.watch_session_changes(session_id.clone(), sender.subscribe());
         {
             let projects = state.projects.lock().await;
             let mut sessions = state.sessions.lock().await;
@@ -7581,7 +7625,7 @@ mod workflow_tests {
             tokio::time::timeout(Duration::from_millis(50), changes.recv())
                 .await
                 .is_err(),
-            "the watcher must not republish a directly published terminal event"
+            "one terminal event must produce exactly one collection revision"
         );
         let snapshot = project_session_snapshot(
             &state,
@@ -7733,7 +7777,8 @@ mod workflow_tests {
 
     #[test]
     fn timestamped_publication_preserves_the_stream_and_history_entry_key() {
-        let (sender, mut receiver) = broadcast::channel(4);
+        let sender = SessionEventSender::new(4);
+        let mut receiver = sender.subscribe();
         let history = StdMutex::new(Vec::new());
         let envelope = EventEnvelope::with_timestamp(AgentEvent::UserMessage {
             message_id: "message-1".to_string(),
@@ -7754,7 +7799,8 @@ mod workflow_tests {
 
     #[test]
     fn poisoned_history_never_publishes_an_unsequenced_event() {
-        let (sender, mut receiver) = broadcast::channel(4);
+        let sender = SessionEventSender::new(4);
+        let mut receiver = sender.subscribe();
         let history = StdMutex::new(Vec::new());
         let _ = std::panic::catch_unwind(|| {
             let _guard = history.lock().unwrap();
@@ -7850,6 +7896,7 @@ mod workflow_tests {
             ))),
             web_listen: "127.0.0.1".to_string(),
         };
+        let mut collection_changes = state.project_session_sender.subscribe();
 
         let response = send_session_message(
             Path(session_id.clone()),
@@ -7861,6 +7908,7 @@ mod workflow_tests {
         .await
         .unwrap()
         .0;
+        assert_eq!(collection_changes.recv().await.unwrap(), 1);
 
         let accepting_user_messages = {
             let sessions = state.sessions.lock().await;
@@ -8708,6 +8756,26 @@ mod workflow_tests {
             .unwrap();
         assert!(!details.active_goal);
         assert_eq!(details.status, SessionStatus::Completed);
+        assert!(details.events.iter().any(|envelope| matches!(
+            envelope.event,
+            AgentEvent::SessionStateChanged {
+                status: crate::events::SessionLifecycleStatus::Completed,
+                ..
+            }
+        )));
+        let snapshot = project_session_snapshot(
+            &state,
+            0,
+            UsageWindow {
+                start_ms: 0,
+                end_ms: 86_400_000,
+            },
+        )
+        .await;
+        assert!(snapshot.terminal_transitions.iter().any(|transition| {
+            transition.session_id == cancelled.session_id
+                && transition.status == SessionStatus::Completed
+        }));
         let archived = get_goal(Path(started.goal_id), State((state, defaults)))
             .await
             .unwrap()

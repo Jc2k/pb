@@ -997,9 +997,45 @@ function eventEnvelope(value: unknown): EventEnvelope {
   envelope.chatter.forEach((value, index) =>
     eventChatter(value, `event chatter ${index}`)
   );
+  const event = envelope.event as Record<string, unknown>;
+  const chatterAudiences = envelope.chatter.map((value) =>
+    record(value, "event chatter").audience
+  );
+  if (
+    event.type === "correction" &&
+    (chatterAudiences.length !== 1 || chatterAudiences[0] !== "team")
+  ) {
+    throw new Error(
+      "correction event must include exactly one server-authored team chatter projection",
+    );
+  }
+  if (
+    event.type === "workflow_blocked" &&
+    (chatterAudiences.length !== 2 ||
+      chatterAudiences.filter((audience) => audience === "team").length !== 1 ||
+      chatterAudiences.filter((audience) => audience === "current_user")
+          .length !== 1)
+  ) {
+    throw new Error(
+      "blocked workflow event must include team and current-user chatter projections",
+    );
+  }
+  if (
+    event.type !== "correction" && event.type !== "workflow_blocked" &&
+    chatterAudiences.length !== 0
+  ) {
+    throw new Error(
+      `${String(event.type)} event does not support chatter projections`,
+    );
+  }
   envelope.evidence.forEach((value, index) =>
     eventEvidence(value, `event evidence ${index}`)
   );
+  if (event.type !== "team_message" && envelope.evidence.length !== 0) {
+    throw new Error(
+      `${String(event.type)} event does not support evidence projections`,
+    );
+  }
   transcriptMetadata(envelope.transcript);
   return envelope as unknown as EventEnvelope;
 }
@@ -1201,22 +1237,56 @@ function planningTranscript(value: unknown, label: string): void {
     const attempt = record(value, `${label} attempt ${index}`);
     exactKeys(
       attempt,
-      ["attempt", "stage", "prompt", "schema", "raw_output", "normalized_output", "failure", "prompt_tokens", "generated_tokens", "duration_ms"],
+      [
+        "attempt",
+        "stage",
+        "prompt",
+        "schema",
+        "raw_output",
+        "normalized_output",
+        "failure",
+        "prompt_tokens",
+        "generated_tokens",
+        "duration_ms",
+      ],
       `${label} attempt ${index}`,
     );
     requiredKeys(
       attempt,
-      ["attempt", "stage", "prompt", "schema", "prompt_tokens", "generated_tokens", "duration_ms"],
+      [
+        "attempt",
+        "stage",
+        "prompt",
+        "schema",
+        "prompt_tokens",
+        "generated_tokens",
+        "duration_ms",
+      ],
       `${label} attempt ${index}`,
     );
-    enumValue(attempt.stage, new Set(["planner", "reviewer"]), `${label} attempt stage`);
+    enumValue(
+      attempt.stage,
+      new Set(["planner", "reviewer"]),
+      `${label} attempt stage`,
+    );
   });
 }
 
 function rejectedTaskPlan(value: unknown, label: string): void {
   const rejected = record(value, label);
-  exactKeys(rejected, ["outcome", "attempts", "failures", "recovery_actions", "transcript"], label);
-  requiredKeys(rejected, ["outcome", "attempts", "failures", "recovery_actions"], label);
+  exactKeys(rejected, [
+    "outcome",
+    "attempts",
+    "failures",
+    "recovery_actions",
+    "transcript",
+  ], label);
+  requiredKeys(rejected, [
+    "outcome",
+    "attempts",
+    "failures",
+    "recovery_actions",
+  ], label);
   enumValue(
     rejected.outcome,
     new Set([

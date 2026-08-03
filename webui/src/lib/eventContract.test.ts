@@ -360,6 +360,38 @@ Deno.test("v5 browser parsing rejects incomplete event and session projections",
     () => parseEventEnvelopeJson(JSON.stringify(envelope)),
     /event chatter 0 is missing field audience/,
   );
+  envelope.event = {
+    type: "correction",
+    message: "Use the server projection.",
+    kind: "lifecycle",
+    summary: "Boundary correction",
+    actor: { kind: "automation", id: "trinity" },
+  } as typeof envelope.event;
+  envelope.chatter = [];
+  throws(
+    () => parseEventEnvelopeJson(JSON.stringify(envelope)),
+    /must include exactly one server-authored team chatter projection/,
+  );
+  envelope.event = {
+    type: "workflow_blocked",
+    workflow_id: "workflow-1",
+    outcome: "executor_unavailable",
+    cause: "executor_unavailable",
+    reason: "No executor is available.",
+  } as typeof envelope.event;
+  Object.assign(envelope, {
+    chatter: [{
+      actor: { kind: "automation", id: "trinity" },
+      tone: "warning",
+      message: "The workflow is blocked.",
+      detail: "No executor is available.",
+      audience: "team",
+    }],
+  });
+  throws(
+    () => parseEventEnvelopeJson(JSON.stringify(envelope)),
+    /must include team and current-user chatter projections/,
+  );
   throws(
     () =>
       parseSessionDetailsJson('{"session_id":"s","revision":0,"events":[]}'),

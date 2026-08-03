@@ -436,10 +436,11 @@ caches, and collection revision under one lock order. There is no fallible post-
 reload and a disconnected HTTP or RPC caller cannot strand memory behind disk. Project mutations
 return the same revisioned snapshot shape as the stream, so the browser can apply the authoritative
 result even while SSE is reconnecting and can continue displaying its last valid snapshot as stale data.
-Session projection changes emitted by the runner append their event and publish the matching
-collection revision while the session lock is held. Terminal publication additionally captures the
-immutable task, title, handoff, and registered-project projection at that transition; the asynchronous
-event watcher only handles producers that have not already completed this publication boundary.
+Each session event sender owns the collection publisher, so every state-affecting event appends its
+history entry and publishes the matching collection revision synchronously while the caller holds the
+session lock. There is no asynchronous watcher reconstructing collection transitions after delivery.
+Checkpoint-only projection changes publish through that same boundary. Terminal publication additionally
+captures the immutable task, title, handoff, and registered-project projection at that transition.
 Session deletion
 does not report failure after removing the authoritative record: a
 durable-record failure leaves the session intact, while later environment or workspace cleanup
