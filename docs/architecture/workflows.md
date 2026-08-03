@@ -486,7 +486,15 @@ The model-facing Goal tools are deliberately asymmetric:
 
 The daemon exposes digest-checked HTTP and Unix-RPC operations; `pb goal` uses the same controller.
 Session list/detail projections embed Goal summaries while retaining the child workflow only inside
-its milestone, avoiding two canonical copies of workflow state.
+its milestone, avoiding two canonical copies of workflow state. A control mutation is staged with an
+isolated event history until its new Goal checkpoint and any containing multi-Task checkpoint have
+both validated. Before publication, pb rebases the staged events over the latest live transcript and
+saves that exact checkpoint, lifecycle state, and event sequence under the shared session-persistence
+lock. Validation or Git-note failure leaves the live Goal, lifecycle state, and transcript at the prior
+digest, while a later autonomous snapshot cannot overwrite the acknowledged control.
+Accepting or cancelling one Goal Task may activate the next Task, but the RPC acknowledgement still
+names the Goal checkpoint that the caller changed rather than trying to recover it from the session's
+new active-Goal projection.
 
 ## Stage capability matrix
 

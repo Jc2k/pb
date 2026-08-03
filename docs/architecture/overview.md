@@ -40,6 +40,14 @@ state event before its mutation response completes. Existing-session mutations a
 revisioned session snapshot shape used by SSE, so the initiating browser applies the committed state
 immediately and never has to refetch or wait for stream delivery to discover it. A running cancellation
 remains `running` with an explicit server-authored cancellation-requested flag until the terminal event.
+Goal and cancellation controls stage checkpoint changes and their events away from the live sender
+until every fallible validation and parent-Task fold has succeeded. The daemon rebases that staged
+history over any concurrent transcript-only events, saves the exact resulting session projection,
+and only then installs and broadcasts it. Snapshot capture and Git-note writes share one persistence
+lock, so an older autonomous snapshot cannot overwrite an acknowledged control. Validation or
+persistence failure therefore leaves the live checkpoint and transcript unchanged. A terminal Goal
+response identifies the Goal checkpoint that the caller changed even when completing it advances the
+session to a following Goal Task.
 The `started` event projects the runner's resolved branch and focus root into live session state before
 publication, keeping browser, terminal, collection rows, and persistence on the same workspace identity.
 

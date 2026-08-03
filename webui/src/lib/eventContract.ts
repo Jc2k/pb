@@ -1,4 +1,5 @@
 import type {
+  DeleteSessionMutationResponse,
   EventEnvelope,
   ProjectEntry,
   ProjectSessionSnapshot,
@@ -1500,8 +1501,14 @@ export function parseSessionStreamSnapshotJson(
 export function parseProjectSessionSnapshotJson(
   text: string,
 ): ProjectSessionSnapshot {
-  const snapshot = record(
+  return projectSessionSnapshot(
     json(text, "project session snapshot"),
+  );
+}
+
+function projectSessionSnapshot(value: unknown): ProjectSessionSnapshot {
+  const snapshot = record(
+    value,
     "project session snapshot",
   );
   exactKeys(
@@ -1612,4 +1619,73 @@ export function parseProjectSessionSnapshotJson(
     projects,
     sessions,
   } as unknown as ProjectSessionSnapshot;
+}
+
+export function parseDeleteSessionMutationResponseJson(
+  text: string,
+): DeleteSessionMutationResponse {
+  const response = record(
+    json(text, "session deletion response"),
+    "session deletion response",
+  );
+  exactKeys(
+    response,
+    ["deletion", "snapshot"],
+    "session deletion response",
+  );
+  requiredKeys(
+    response,
+    ["deletion", "snapshot"],
+    "session deletion response",
+  );
+  const deletion = record(response.deletion, "session deletion result");
+  exactKeys(
+    deletion,
+    ["session_id", "deleted", "cleanup_warnings"],
+    "session deletion result",
+  );
+  requiredKeys(
+    deletion,
+    ["session_id", "deleted", "cleanup_warnings"],
+    "session deletion result",
+  );
+  if (typeof deletion.session_id !== "string" || !deletion.session_id) {
+    throw new Error("deleted session id must be a non-empty string");
+  }
+  if (deletion.deleted !== true) {
+    throw new Error("session deletion result must confirm deletion");
+  }
+  if (!Array.isArray(deletion.cleanup_warnings)) {
+    throw new Error("session deletion cleanup warnings must be an array");
+  }
+  const cleanupWarnings = deletion.cleanup_warnings.map((warning) => {
+    if (typeof warning !== "string") {
+      throw new Error("session deletion cleanup warnings must be strings");
+    }
+    return warning;
+  });
+  const snapshot = projectSessionSnapshot(response.snapshot);
+  if (
+    snapshot.sessions.some((session: SessionItem) =>
+      session.session_id === deletion.session_id
+    )
+  ) {
+    throw new Error("deleted session remains in the committed snapshot");
+  }
+  if (
+    snapshot.terminal_transition_floor !== snapshot.revision ||
+    snapshot.terminal_transitions.length !== 0
+  ) {
+    throw new Error(
+      "session deletion snapshot must suppress terminal transition deltas at its committed revision",
+    );
+  }
+  return {
+    deletion: {
+      session_id: deletion.session_id,
+      deleted: deletion.deleted,
+      cleanup_warnings: cleanupWarnings,
+    },
+    snapshot,
+  };
 }

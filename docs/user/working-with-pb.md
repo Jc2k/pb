@@ -356,7 +356,10 @@ it is not presented as if queued work exists.
 Deleting a session continues its authoritative durable removal, usage update, and live publication
 even if the browser or terminal disconnects while the request is in flight. A durable deletion error
 leaves the session visible. Environment or managed-workspace cleanup failures after deletion are
-reported as warnings on the successful result.
+reported as warnings on the successful result. The HTTP deletion control accepts the same bounded
+calendar usage window as the project/session collection endpoint and returns those warnings together
+with the exact post-deletion collection snapshot, so a reconnecting client need not refetch or wait
+for SSE to remove the row and update usage.
 
 The service records an event before making it live. Terminal reattachment atomically captures
 history and subscribes, recovers a lagged receiver from sequence-numbered history, and drains final
@@ -470,6 +473,11 @@ criterion, change the Task objective or repository authority, or exceed the Task
 **Stop goal** preserves commits, uncommitted workspace content, events, and evidence. It does not
 roll back repository work. A daemon restart likewise never silently resumes Goal mutation: active
 work restores paused and requires an explicit Resume.
+
+Goal and session cancellation controls are acknowledged only after pb has saved their exact
+checkpoint and event sequence. If the Git note cannot be written, the control fails and the live
+session remains at its previous digest; the browser and terminal therefore cannot display a control
+as accepted when a restart would restore the older state.
 
 ### How Goal mode ends
 

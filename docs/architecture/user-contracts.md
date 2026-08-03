@@ -430,7 +430,9 @@ live transition rather than an indistinguishable completed row. Reconnect cursor
 originating process identity. HTTP snapshots provide manual recovery data only and cannot replace
 the live stream's process generation. Session deletion runs its durable removal, live projection,
 usage accounting, revision publication, and cleanup in an owned transaction that continues if the
-request disconnects. Project-registry mutations use the same ownership rule: the disk transaction
+request disconnects. Its successful HTTP result carries both typed cleanup warnings and the exact
+committed project/session snapshot captured at the deletion revision, using the caller's requested
+usage window. Project-registry mutations use the same ownership rule: the disk transaction
 returns the exact registry it committed, and an independently owned task reconciles sessions, usage
 caches, and collection revision under one lock order. There is no fallible post-commit registry
 reload and a disconnected HTTP or RPC caller cannot strand memory behind disk. Project mutations
@@ -440,7 +442,14 @@ Existing-session and Goal mutations likewise return the exact revisioned session
 session stream. New-session creation returns identity for navigation; starting a Goal in an existing
 session uses the session mutation endpoint and returns the session snapshot. Cancellation requests and
 the runner-resolved branch and focus root are explicit session state rather than browser inference or
-event-sink-only persistence.
+event-sink-only persistence. Goal and cancellation mutations publish only after their digest checks,
+checkpoint rebuild, any parent-Task fold, and the exact durable session write all succeed. The durable
+write is serialized with autonomous event snapshots and includes terminal lifecycle events, preventing
+an older writer from replacing an acknowledged checkpoint. A rejected or unpersistable mutation cannot
+leak partial state or transcript events. Terminal RPC results retain the changed Goal's identity and
+committed digest even if the session snapshot has already advanced to another Goal Task. A missing
+session on the session-scoped Goal route is a typed `session_not_found` response rather than Goal-input
+rejection.
 Each session event sender owns the collection publisher, so every state-affecting event appends its
 history entry and publishes the matching collection revision synchronously while the caller holds the
 session lock. There is no asynchronous watcher reconstructing collection transitions after delivery.

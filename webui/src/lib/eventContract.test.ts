@@ -2,6 +2,7 @@
 import { deepEqual, throws } from "node:assert/strict";
 import {
   eventFields,
+  parseDeleteSessionMutationResponseJson,
   parseEventEnvelopeJson,
   parseProjectSessionSnapshotJson,
   parseSessionDetailsJson,
@@ -485,6 +486,75 @@ Deno.test("project snapshot parsing validates terminal transition semantics", ()
     parseProjectSessionSnapshotJson(JSON.stringify(snapshot)),
     snapshot,
   );
+  const deletionResponse = {
+    deletion: {
+      session_id: "session-1",
+      deleted: true,
+      cleanup_warnings: ["temporary transcript cleanup was deferred"],
+    },
+    snapshot: {
+      ...structuredClone(snapshot),
+      revision: 3,
+      terminal_transition_floor: 3,
+      terminal_transitions: [],
+      sessions: [],
+      overall_usage: {
+        total: { tokens: 0, runtime_ms: 0, tool_calls: 0 },
+        today: { tokens: 0, runtime_ms: 0, tool_calls: 0 },
+      },
+      project_usage: {
+        "project-1": {
+          total: { tokens: 0, runtime_ms: 0, tool_calls: 0 },
+          today: { tokens: 0, runtime_ms: 0, tool_calls: 0 },
+        },
+      },
+    },
+  };
+  deepEqual(
+    parseDeleteSessionMutationResponseJson(JSON.stringify(deletionResponse)),
+    deletionResponse,
+  );
+  const deletionWithUnknownField = structuredClone(deletionResponse);
+  Object.assign(deletionWithUnknownField.deletion, { refresh: true });
+  throws(
+    () =>
+      parseDeleteSessionMutationResponseJson(
+        JSON.stringify(deletionWithUnknownField),
+      ),
+    /session deletion result contains unknown field refresh/,
+  );
+  const deletionWithoutCommittedSnapshot = structuredClone(deletionResponse);
+  Reflect.deleteProperty(deletionWithoutCommittedSnapshot, "snapshot");
+  throws(
+    () =>
+      parseDeleteSessionMutationResponseJson(
+        JSON.stringify(deletionWithoutCommittedSnapshot),
+      ),
+    /session deletion response is missing field snapshot/,
+  );
+  const deletionWithRetainedSession = structuredClone(deletionResponse);
+  Object.assign(deletionWithRetainedSession.snapshot, {
+    sessions: structuredClone(snapshot.sessions),
+  });
+  throws(
+    () =>
+      parseDeleteSessionMutationResponseJson(
+        JSON.stringify(deletionWithRetainedSession),
+      ),
+    /deleted session remains in the committed snapshot/,
+  );
+  const deletionWithTransitionDelta = structuredClone(deletionResponse);
+  deletionWithTransitionDelta.snapshot.terminal_transition_floor = 0;
+  Object.assign(deletionWithTransitionDelta.snapshot, {
+    terminal_transitions: structuredClone(snapshot.terminal_transitions),
+  });
+  throws(
+    () =>
+      parseDeleteSessionMutationResponseJson(
+        JSON.stringify(deletionWithTransitionDelta),
+      ),
+    /session deletion snapshot must suppress terminal transition deltas/,
+  );
   const staleTransition = structuredClone(snapshot);
   staleTransition.terminal_transitions[0].revision = 1;
   throws(
@@ -535,6 +605,8 @@ Deno.test("Rust and TypeScript collection structs keep exact fields", async () =
       "ProjectSessionSnapshot",
       "ProjectSessionTerminalTransition",
       "ProjectUsageSummary",
+      "DeleteSessionResponse",
+      "DeleteSessionMutationResponse",
     ]
   ) {
     deepEqual(
@@ -683,7 +755,7 @@ Deno.test("web endpoints and consumers preserve structured API failures", async 
   for (
     const signature of [
       ") -> Result<Json<SessionDetails>, ApiError>",
-      ") -> Result<Json<DeleteSessionResponse>, ApiError>",
+      ") -> Result<Json<DeleteSessionMutationResponse>, ApiError>",
       ") -> Result<Json<crate::goal::GoalCheckpoint>, ApiError>",
       ") -> Result<Json<WebSettingsResponse>, ApiError>",
       ") -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError>",

@@ -1520,6 +1520,17 @@ export interface ProjectSessionSnapshot {
   project_usage: Record<string, ProjectUsageSummary>;
 }
 
+export interface DeleteSessionResponse {
+  session_id: string;
+  deleted: boolean;
+  cleanup_warnings: string[];
+}
+
+export interface DeleteSessionMutationResponse {
+  deletion: DeleteSessionResponse;
+  snapshot: ProjectSessionSnapshot;
+}
+
 export interface ProjectSessionTerminalTransition {
   entry_key: string;
   revision: number;

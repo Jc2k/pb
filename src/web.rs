@@ -46,6 +46,7 @@ const MAX_PENDING_USER_MESSAGES: usize = 32;
 const MAX_PROJECT_SESSION_TERMINAL_TRANSITIONS: usize = 256;
 static USER_MESSAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static ID_FALLBACK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static SESSION_PERSISTENCE_LOCK: StdMutex<()> = StdMutex::new(());
 
 const SERVICE_WORKER_JS: &str = r#"self.addEventListener("install",(event)=>{self.skipWaiting();});
 self.addEventListener("activate",(event)=>{event.waitUntil(self.clients.claim());});
@@ -350,10 +351,24 @@ struct SessionMutationResult {
     snapshot: SessionStreamSnapshot,
 }
 
+#[derive(Debug)]
+struct GoalMutationResult {
+    response: GoalResponse,
+    snapshot: SessionStreamSnapshot,
+}
+
 struct StartGoalResult {
     response: GoalResponse,
     snapshot: Option<SessionStreamSnapshot>,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("session not found: {0}")]
+struct GoalSessionNotFound(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("session persistence failed: {0:#}")]
+struct SessionPersistenceError(#[source] anyhow::Error);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingQuestionView {
@@ -367,6 +382,17 @@ pub struct DeleteSessionResponse {
     pub session_id: String,
     pub deleted: bool,
     pub cleanup_warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeleteSessionMutationResponse {
+    pub deletion: DeleteSessionResponse,
+    pub snapshot: ProjectSessionSnapshot,
+}
+
+struct DeleteSessionTransactionResult {
+    deletion: DeleteSessionResponse,
+    snapshot: ProjectSessionSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1391,10 +1417,7 @@ async fn start_goal(
     start_goal_inner(state, defaults, req)
         .await
         .map(|result| Json(result.response))
-        .map_err(|error| {
-            tracing::warn!(%error, "failed to start goal");
-            ApiError::new(StatusCode::BAD_REQUEST, "goal_start_rejected", error)
-        })
+        .map_err(goal_start_api_error)
 }
 
 async fn start_session_goal(
@@ -1416,10 +1439,7 @@ async fn start_session_goal(
     req.session_id = Some(id);
     let result = start_goal_inner(state, defaults, req)
         .await
-        .map_err(|error| {
-            tracing::warn!(%error, "failed to start session goal");
-            ApiError::new(StatusCode::BAD_REQUEST, "goal_start_rejected", error)
-        })?;
+        .map_err(goal_start_api_error)?;
     result.snapshot.map(Json).ok_or_else(|| {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1491,22 +1511,24 @@ async fn start_goal_inner(
             now,
         )?;
         let checkpoint = crate::goal::GoalCheckpoint::new(run)?;
-        session.task = objective.clone();
-        session.title = Some(objective.clone());
-        session.request_template.task = objective.clone();
-        session.request_template.intent = Some(crate::workflow::TurnIntent::Discuss);
-        session.request_template.goal_context = None;
-        session.request_template.workflow_checkpoint = None;
-        session.request_template.workflow_stage = None;
-        session.durable.pending_goal_proposal = None;
-        session.durable.pending_goal_change = None;
-        session.goal = Some(checkpoint.clone());
-        session.running = false;
-        session.paused = true;
-        session.status = SessionStatus::Paused;
-        session.updated_at_ms = now;
-        publish_goal_started(session, &checkpoint);
-        persist_live_session(&session_id, session);
+        let (mut staged, base_revision) = stage_session_state(session)?;
+        staged.task = objective.clone();
+        staged.title = Some(objective.clone());
+        staged.request_template.task = objective.clone();
+        staged.request_template.intent = Some(crate::workflow::TurnIntent::Discuss);
+        staged.request_template.goal_context = None;
+        staged.request_template.workflow_checkpoint = None;
+        staged.request_template.workflow_stage = None;
+        staged.durable.pending_goal_proposal = None;
+        staged.durable.pending_goal_change = None;
+        staged.goal = Some(checkpoint.clone());
+        staged.running = false;
+        staged.paused = true;
+        staged.status = SessionStatus::Paused;
+        staged.updated_at_ms = now;
+        publish_goal_started(&mut staged, &checkpoint);
+        commit_staged_session_state(&session_id, session, staged, base_revision, None)
+            .map_err(|error| anyhow::Error::new(SessionPersistenceError(error)))?;
         let snapshot = session_mutation_snapshot_for_session(&session_id, session);
         return Ok(StartGoalResult {
             response: GoalResponse {
@@ -1516,6 +1538,9 @@ async fn start_goal_inner(
             },
             snapshot: Some(snapshot),
         });
+    }
+    if requested_existing_session {
+        return Err(GoalSessionNotFound(session_id).into());
     }
 
     if req.project_id.is_some() && req.workdir.is_some() {
@@ -1607,7 +1632,7 @@ async fn start_goal_inner(
         updated_at_ms: now,
     };
     publish_goal_started(&mut session, &checkpoint);
-    persist_live_session(&session_id, &session);
+    persist_exact_session_state(&session_id, &session).map_err(anyhow::Error::from)?;
     session_sender.attach_project_session_publisher(state.project_session_change_publisher());
     sessions.insert(session_id.clone(), session);
     state.publish_project_session_change();
@@ -1620,6 +1645,22 @@ async fn start_goal_inner(
         },
         snapshot: None,
     })
+}
+
+fn goal_start_api_error(error: anyhow::Error) -> ApiError {
+    if error.downcast_ref::<GoalSessionNotFound>().is_some() {
+        return ApiError::new(StatusCode::NOT_FOUND, "session_not_found", error);
+    }
+    if error.downcast_ref::<SessionPersistenceError>().is_some() {
+        tracing::error!(%error, "failed to persist goal start");
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session_persistence_failed",
+            error,
+        );
+    }
+    tracing::warn!(%error, "failed to start goal");
+    ApiError::new(StatusCode::BAD_REQUEST, "goal_start_rejected", error)
 }
 
 fn ensure_goal_workdir_registered(
@@ -1789,7 +1830,7 @@ async fn approve_goal_plan(
     })
     .await?;
     dispatch_next_session(state.clone());
-    Ok(Json(result))
+    Ok(Json(result.snapshot))
 }
 
 async fn revise_goal_draft(
@@ -1822,7 +1863,7 @@ async fn revise_goal_draft(
         Ok(())
     })
     .await?;
-    Ok(Json(result))
+    Ok(Json(result.snapshot))
 }
 
 async fn pause_goal(
@@ -1830,7 +1871,17 @@ async fn pause_goal(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<GoalDigestRequest>,
 ) -> Result<Json<SessionStreamSnapshot>, ApiError> {
-    let result = mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
+    pause_goal_inner(&state, &id, &req)
+        .await
+        .map(|result| Json(result.snapshot))
+}
+
+async fn pause_goal_inner(
+    state: &AppState,
+    id: &str,
+    req: &GoalDigestRequest,
+) -> Result<GoalMutationResult, ApiError> {
+    mutate_active_goal(state, id, &req.goal_sha256, |session, run| {
         let paused = run.request_pause(now_millis())?;
         session.pause_token.store(true, Ordering::SeqCst);
         publish_event(
@@ -1855,8 +1906,7 @@ async fn pause_goal(
         }
         Ok(())
     })
-    .await?;
-    Ok(Json(result))
+    .await
 }
 
 async fn resume_goal(
@@ -1864,7 +1914,17 @@ async fn resume_goal(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<GoalDigestRequest>,
 ) -> Result<Json<SessionStreamSnapshot>, ApiError> {
-    let result = mutate_active_goal(&state, &id, &req.goal_sha256, |session, run| {
+    resume_goal_inner(&state, &id, &req)
+        .await
+        .map(|result| Json(result.snapshot))
+}
+
+async fn resume_goal_inner(
+    state: &AppState,
+    id: &str,
+    req: &GoalDigestRequest,
+) -> Result<GoalMutationResult, ApiError> {
+    let result = mutate_active_goal(state, id, &req.goal_sha256, |session, run| {
         run.resume(now_millis())?;
         session.durable.pending_goal_change = None;
         session.pause_token.store(false, Ordering::SeqCst);
@@ -1884,7 +1944,7 @@ async fn resume_goal(
     })
     .await?;
     dispatch_next_session(state.clone());
-    Ok(Json(result))
+    Ok(result)
 }
 
 async fn cancel_goal(
@@ -1892,9 +1952,19 @@ async fn cancel_goal(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<GoalDigestRequest>,
 ) -> Result<Json<SessionStreamSnapshot>, ApiError> {
+    cancel_goal_inner(&state, &id, &req)
+        .await
+        .map(|result| Json(result.snapshot))
+}
+
+async fn cancel_goal_inner(
+    state: &AppState,
+    id: &str,
+    req: &GoalDigestRequest,
+) -> Result<GoalMutationResult, ApiError> {
     let projects = state.projects.lock().await;
     let mut sessions = state.sessions.lock().await;
-    let (session_id, session) = find_active_goal_session_mut(&mut sessions, &id)?;
+    let (session_id, session) = find_active_goal_session_mut(&mut sessions, id)?;
     let checkpoint = session.goal.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     if checkpoint.sha256 != req.goal_sha256 {
         return Err(ApiError::new(
@@ -1903,60 +1973,90 @@ async fn cancel_goal(
             "the goal changed; refresh before retrying",
         ));
     }
+    let goal_sha256 = checkpoint.sha256.clone();
     if session.running {
-        session.pause_token.store(false, Ordering::SeqCst);
-        session.cancel_token.store(true, Ordering::SeqCst);
-        session.updated_at_ms = now_millis();
+        let (mut staged, base_revision) = stage_session_state(session).map_err(internal_status)?;
+        staged.pause_token.store(false, Ordering::SeqCst);
+        staged.cancel_token.store(true, Ordering::SeqCst);
+        staged.updated_at_ms = now_millis();
         publish_event(
-            &session.sender,
-            &session.history,
+            &staged.sender,
+            &staged.history,
             AgentEvent::Correction {
                 kind: crate::events::CorrectionKind::Lifecycle,
                 message: "Cancellation requested. Completed goal milestones and repository evidence will be preserved."
                     .to_string(),
                 summary: "Cancellation requested".to_string(),
                 actor: crate::events::TeamActor::workflow_steward(),
-                assisting_profile: Some(session.request_template.profile),
+                assisting_profile: Some(staged.request_template.profile),
                 nesting_depth: None,
                 timestamp_ms: Some(now_millis()),
             },
         );
-        persist_live_session(&session_id, session);
+        commit_staged_session_state(&session_id, session, staged, base_revision, None)
+            .map_err(internal_status)?;
         let snapshot = session_mutation_snapshot_for_session(&session_id, session);
         drop(sessions);
         drop(projects);
-        return Ok(Json(snapshot));
+        return Ok(GoalMutationResult {
+            response: GoalResponse {
+                session_id,
+                goal_id: id.to_string(),
+                goal_sha256,
+            },
+            snapshot,
+        });
     }
-    let mut run = session.goal.take().unwrap().run;
+    let (mut staged, base_revision) = stage_session_state(session).map_err(internal_status)?;
+    let mut run = staged.goal.take().ok_or(StatusCode::NOT_FOUND)?.run;
     run.cancel(now_millis());
-    session.durable.pending_goal_change = None;
+    staged.durable.pending_goal_change = None;
     let checkpoint = crate::goal::GoalCheckpoint::new(run).map_err(internal_status)?;
     publish_event(
-        &session.sender,
-        &session.history,
+        &staged.sender,
+        &staged.history,
         AgentEvent::GoalCancelled {
             goal_id: checkpoint.run.id.clone(),
             checkpoint_sha256: checkpoint.sha256.clone(),
             timestamp_ms: Some(now_millis()),
         },
     );
-    session.completed_goals.push(checkpoint.clone());
-    session.status = fold_terminal_goal_task(session, &checkpoint).map_err(internal_status)?;
-    session.paused = false;
-    session.updated_at_ms = now_millis();
-    if matches!(
-        session.status,
+    staged.completed_goals.push(checkpoint.clone());
+    staged.status = fold_terminal_goal_task(&mut staged, &checkpoint).map_err(internal_status)?;
+    staged.paused = false;
+    staged.updated_at_ms = now_millis();
+    let terminal = matches!(
+        staged.status,
         SessionStatus::Completed | SessionStatus::Failed
-    ) {
-        publish_terminal_session_state_changed(&state, &projects, &session_id, session);
+    );
+    let terminal_entry_key = if terminal {
+        Some(stage_terminal_session_state_changed(&staged))
     } else {
-        publish_session_state_changed(session);
+        publish_session_state_changed(&staged);
+        None
+    };
+    commit_staged_session_state(
+        &session_id,
+        session,
+        staged,
+        base_revision,
+        terminal_entry_key.as_deref(),
+    )
+    .map_err(internal_status)?;
+    if let Some(entry_key) = terminal_entry_key {
+        publish_terminal_session_transition(state, &projects, &session_id, session, entry_key);
     }
-    persist_live_session(&session_id, session);
     let snapshot = session_mutation_snapshot_for_session(&session_id, session);
     drop(sessions);
     drop(projects);
-    Ok(Json(snapshot))
+    Ok(GoalMutationResult {
+        response: GoalResponse {
+            session_id,
+            goal_id: id.to_string(),
+            goal_sha256: checkpoint.sha256,
+        },
+        snapshot,
+    })
 }
 
 async fn accept_goal(
@@ -1964,27 +2064,38 @@ async fn accept_goal(
     State((state, _defaults)): State<(AppState, AgentRequest)>,
     Json(req): Json<GoalDigestRequest>,
 ) -> Result<Json<SessionStreamSnapshot>, ApiError> {
+    accept_goal_inner(&state, &id, &req)
+        .await
+        .map(|result| Json(result.snapshot))
+}
+
+async fn accept_goal_inner(
+    state: &AppState,
+    id: &str,
+    req: &GoalDigestRequest,
+) -> Result<GoalMutationResult, ApiError> {
     let projects = state.projects.lock().await;
     let mut sessions = state.sessions.lock().await;
-    let (session_id, session) = find_active_goal_session_mut(&mut sessions, &id)?;
-    let mut checkpoint = session.goal.take().ok_or(StatusCode::NOT_FOUND)?;
+    let (session_id, session) = find_active_goal_session_mut(&mut sessions, id)?;
+    let checkpoint = session.goal.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     if checkpoint.sha256 != req.goal_sha256 {
-        session.goal = Some(checkpoint);
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "goal_revision_conflict",
             "the goal changed; refresh before retrying",
         ));
     }
+    let (mut staged, base_revision) = stage_session_state(session).map_err(internal_status)?;
+    let mut checkpoint = staged.goal.take().ok_or(StatusCode::NOT_FOUND)?;
     checkpoint
         .run
         .accept(&req.goal_sha256, &checkpoint.sha256, now_millis())
         .map_err(conflict_status)?;
-    session.durable.pending_goal_change = None;
+    staged.durable.pending_goal_change = None;
     checkpoint = crate::goal::GoalCheckpoint::new(checkpoint.run).map_err(internal_status)?;
     publish_event(
-        &session.sender,
-        &session.history,
+        &staged.sender,
+        &staged.history,
         AgentEvent::GoalCompleted {
             goal_id: checkpoint.run.id.clone(),
             outcome: crate::goal::GoalOutcome::Complete,
@@ -1993,27 +2104,46 @@ async fn accept_goal(
             timestamp_ms: Some(now_millis()),
         },
     );
-    session.completed_goals.push(checkpoint.clone());
-    session.status = fold_terminal_goal_task(session, &checkpoint).map_err(internal_status)?;
-    session.paused = false;
-    session.updated_at_ms = now_millis();
-    if matches!(
-        session.status,
+    staged.completed_goals.push(checkpoint.clone());
+    staged.status = fold_terminal_goal_task(&mut staged, &checkpoint).map_err(internal_status)?;
+    staged.paused = false;
+    staged.updated_at_ms = now_millis();
+    let terminal = matches!(
+        staged.status,
         SessionStatus::Completed | SessionStatus::Failed
-    ) {
-        publish_terminal_session_state_changed(&state, &projects, &session_id, session);
+    );
+    let terminal_entry_key = if terminal {
+        Some(stage_terminal_session_state_changed(&staged))
     } else {
-        publish_session_state_changed(session);
+        publish_session_state_changed(&staged);
+        None
+    };
+    let dispatch = staged.status == SessionStatus::Queued;
+    commit_staged_session_state(
+        &session_id,
+        session,
+        staged,
+        base_revision,
+        terminal_entry_key.as_deref(),
+    )
+    .map_err(internal_status)?;
+    if let Some(entry_key) = terminal_entry_key {
+        publish_terminal_session_transition(state, &projects, &session_id, session, entry_key);
     }
-    let dispatch = session.status == SessionStatus::Queued;
-    persist_live_session(&session_id, session);
     let snapshot = session_mutation_snapshot_for_session(&session_id, session);
     drop(sessions);
     drop(projects);
     if dispatch {
         dispatch_next_session(state.clone());
     }
-    Ok(Json(snapshot))
+    Ok(GoalMutationResult {
+        response: GoalResponse {
+            session_id,
+            goal_id: id.to_string(),
+            goal_sha256: checkpoint.sha256,
+        },
+        snapshot,
+    })
 }
 
 async fn amend_goal(
@@ -2054,7 +2184,7 @@ async fn amend_goal(
         Ok(())
     })
     .await?;
-    Ok(Json(result))
+    Ok(Json(result.snapshot))
 }
 
 async fn approve_goal_amendment(
@@ -2099,7 +2229,7 @@ async fn approve_goal_amendment(
     })
     .await?;
     dispatch_next_session(state.clone());
-    Ok(Json(result))
+    Ok(Json(result.snapshot))
 }
 
 async fn discard_goal_amendment(
@@ -2131,7 +2261,187 @@ async fn discard_goal_amendment(
         Ok(())
     })
     .await?;
-    Ok(Json(result))
+    Ok(Json(result.snapshot))
+}
+
+fn stage_session_state(session: &SessionState) -> Result<(SessionState, u64)> {
+    let history = session
+        .history
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session history is unavailable"))?
+        .clone();
+    let base_revision = history
+        .last()
+        .map(|envelope| envelope.transcript.sequence)
+        .unwrap_or(0);
+    let pending_user_messages = session
+        .pending_user_messages
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session message queue is unavailable"))?
+        .clone();
+    Ok((
+        SessionState {
+            task: session.task.clone(),
+            title: session.title.clone(),
+            branch: session.branch.clone(),
+            workdir: session.workdir.clone(),
+            durable: session.durable.clone(),
+            request_template: session.request_template.clone(),
+            running: session.running,
+            paused: session.paused,
+            status: session.status,
+            pending_question: session.pending_question.clone(),
+            sender: SessionEventSender::new(16),
+            history: Arc::new(StdMutex::new(history)),
+            metrics: session.metrics.clone(),
+            usage_records: Arc::clone(&session.usage_records),
+            workflow: session.workflow.clone(),
+            completed_workflows: session.completed_workflows.clone(),
+            goal: session.goal.clone(),
+            completed_goals: session.completed_goals.clone(),
+            multi_task: session.multi_task.clone(),
+            completed_multi_tasks: session.completed_multi_tasks.clone(),
+            pending_user_messages: Arc::new(StdMutex::new(pending_user_messages)),
+            accepting_user_messages: Arc::new(AtomicBool::new(
+                session.accepting_user_messages.load(Ordering::SeqCst),
+            )),
+            pause_token: Arc::new(AtomicBool::new(session.pause_token.load(Ordering::SeqCst))),
+            cancel_token: Arc::new(AtomicBool::new(session.cancel_token.load(Ordering::SeqCst))),
+            started_at_ms: session.started_at_ms,
+            updated_at_ms: session.updated_at_ms,
+        },
+        base_revision,
+    ))
+}
+
+fn commit_staged_session_state(
+    session_id: &str,
+    session: &mut SessionState,
+    staged: SessionState,
+    base_revision: u64,
+    terminal_entry_key: Option<&str>,
+) -> Result<()> {
+    let staged_events = staged
+        .history
+        .lock()
+        .map_err(|_| anyhow::anyhow!("staged session history is unavailable"))?
+        .iter()
+        .filter(|envelope| envelope.transcript.sequence > base_revision)
+        .cloned()
+        .collect::<Vec<_>>();
+    commit_staged_session_state_with_terminal(
+        session_id,
+        session,
+        staged,
+        staged_events,
+        terminal_entry_key,
+    )
+}
+
+fn commit_staged_session_state_with_terminal(
+    session_id: &str,
+    session: &mut SessionState,
+    staged: SessionState,
+    staged_events: Vec<EventEnvelope>,
+    terminal_entry_key: Option<&str>,
+) -> Result<()> {
+    if terminal_entry_key.is_some_and(|entry_key| {
+        staged_events
+            .iter()
+            .filter(|envelope| envelope.transcript.entry_key == entry_key)
+            .count()
+            != 1
+    }) {
+        bail!("staged terminal event is missing or duplicated");
+    }
+
+    // Serialize snapshot capture with every other Git-note write so an older autonomous snapshot
+    // cannot overwrite this control after it commits.
+    let _persistence = SESSION_PERSISTENCE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session persistence lock is unavailable"))?;
+
+    // Freeze live history while rebasing the staged envelopes. Producers that do not need the
+    // session lock may still append transcript-only events while a control is being validated; the
+    // durable projection and the live publication must include those events in the same order.
+    let mut live_history = session
+        .history
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session history is unavailable"))?;
+    let mut committed_history = live_history.clone();
+    let mut committed_events = Vec::with_capacity(staged_events.len());
+    for mut envelope in staged_events {
+        if committed_history
+            .iter()
+            .any(|existing| existing.transcript.entry_key == envelope.transcript.entry_key)
+        {
+            bail!("staged event entry key already exists in live history");
+        }
+        let sequence = committed_history
+            .last()
+            .map_or(1, |entry| entry.transcript.sequence.saturating_add(1));
+        envelope.assign_sequence(sequence);
+        envelope.refresh_projections(&committed_history);
+        committed_history.push(envelope.clone());
+        if committed_history.len() > MAX_HISTORY_EVENTS {
+            committed_history = session_store::trim_event_history(
+                std::mem::take(&mut committed_history),
+                MAX_HISTORY_EVENTS,
+            );
+        }
+        committed_events.push(envelope);
+    }
+
+    let usage_records = session
+        .usage_records
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session usage history is unavailable"))?
+        .clone();
+    let persisted = exact_persisted_session(
+        session_id,
+        &staged,
+        committed_history.clone(),
+        usage_records,
+    );
+    session_store::save_session(&persisted)
+        .map_err(|error| anyhow::Error::new(SessionPersistenceError(error)))?;
+
+    session.task = staged.task;
+    session.title = staged.title;
+    session.branch = staged.branch;
+    session.workdir = staged.workdir;
+    session.durable = staged.durable;
+    session.request_template = staged.request_template;
+    session.running = staged.running;
+    session.paused = staged.paused;
+    session.status = staged.status;
+    session.pending_question = staged.pending_question;
+    session.workflow = staged.workflow;
+    session.completed_workflows = staged.completed_workflows;
+    session.goal = staged.goal;
+    session.completed_goals = staged.completed_goals;
+    session.multi_task = staged.multi_task;
+    session.completed_multi_tasks = staged.completed_multi_tasks;
+    session
+        .pause_token
+        .store(staged.pause_token.load(Ordering::SeqCst), Ordering::SeqCst);
+    session
+        .cancel_token
+        .store(staged.cancel_token.load(Ordering::SeqCst), Ordering::SeqCst);
+    session.updated_at_ms = staged.updated_at_ms;
+
+    *live_history = committed_history;
+    for envelope in committed_events {
+        let publication = if terminal_entry_key
+            .is_some_and(|entry_key| envelope.transcript.entry_key == entry_key)
+        {
+            CollectionPublication::CallerOwned
+        } else {
+            CollectionPublication::Automatic
+        };
+        session.sender.send(envelope, publication);
+    }
+    Ok(())
 }
 
 async fn mutate_active_goal(
@@ -2139,20 +2449,20 @@ async fn mutate_active_goal(
     goal_id: &str,
     expected_sha256: &str,
     mutate: impl FnOnce(&mut SessionState, &mut crate::goal::GoalRun) -> Result<()>,
-) -> Result<SessionStreamSnapshot, ApiError> {
+) -> Result<GoalMutationResult, ApiError> {
     let mut sessions = state.sessions.lock().await;
     let (session_id, session) = find_active_goal_session_mut(&mut sessions, goal_id)?;
-    let mut checkpoint = session.goal.take().ok_or(StatusCode::NOT_FOUND)?;
+    let checkpoint = session.goal.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     if checkpoint.sha256 != expected_sha256 {
-        session.goal = Some(checkpoint);
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "goal_revision_conflict",
             "the goal changed; refresh before retrying",
         ));
     }
-    if let Err(error) = mutate(session, &mut checkpoint.run) {
-        session.goal = Some(checkpoint);
+    let (mut staged, base_revision) = stage_session_state(session).map_err(internal_status)?;
+    let mut checkpoint = staged.goal.take().ok_or(StatusCode::NOT_FOUND)?;
+    if let Err(error) = mutate(&mut staged, &mut checkpoint.run) {
         tracing::warn!(%error, "goal mutation rejected");
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -2161,11 +2471,19 @@ async fn mutate_active_goal(
         ));
     }
     checkpoint = crate::goal::GoalCheckpoint::new(checkpoint.run).map_err(internal_status)?;
-    session.updated_at_ms = now_millis();
-    session.goal = Some(checkpoint.clone());
-    sync_multi_task_goal_checkpoint(session).map_err(internal_status)?;
-    persist_live_session(&session_id, session);
-    Ok(session_mutation_snapshot_for_session(&session_id, session))
+    staged.updated_at_ms = now_millis();
+    staged.goal = Some(checkpoint.clone());
+    sync_multi_task_goal_checkpoint(&mut staged).map_err(internal_status)?;
+    commit_staged_session_state(&session_id, session, staged, base_revision, None)
+        .map_err(internal_status)?;
+    Ok(GoalMutationResult {
+        response: GoalResponse {
+            session_id: session_id.clone(),
+            goal_id: goal_id.to_string(),
+            goal_sha256: checkpoint.sha256,
+        },
+        snapshot: session_mutation_snapshot_for_session(&session_id, session),
+    })
 }
 
 fn sync_multi_task_goal_checkpoint(session: &mut SessionState) -> Result<()> {
@@ -3268,7 +3586,17 @@ async fn cancel_session(
 ) -> Result<Json<SessionStreamSnapshot>, ApiError> {
     let result = cancel_session_inner(state.clone(), id)
         .await
-        .map_err(|error| ApiError::new(StatusCode::CONFLICT, "session_not_cancellable", error))?;
+        .map_err(|error| {
+            if error.downcast_ref::<SessionPersistenceError>().is_some() {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "session_persistence_failed",
+                    error,
+                )
+            } else {
+                ApiError::new(StatusCode::CONFLICT, "session_not_cancellable", error)
+            }
+        })?;
     Ok(Json(result.snapshot))
 }
 
@@ -3290,26 +3618,26 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionMuta
     {
         bail!("session is not cancellable");
     }
-    session.cancel_token.store(true, Ordering::SeqCst);
-    session.pending_question.take();
+    let terminate_environment = !session.running;
+    let (mut staged, base_revision) = stage_session_state(session)?;
+    staged.cancel_token.store(true, Ordering::SeqCst);
+    staged.pending_question.take();
     publish_event(
-        &session.sender,
-        &session.history,
+        &staged.sender,
+        &staged.history,
         AgentEvent::Correction {
             kind: crate::events::CorrectionKind::Lifecycle,
             message: "Cancellation requested. Repository content and workflow evidence will be preserved."
                 .to_string(),
             summary: "Cancellation requested".to_string(),
             actor: crate::events::TeamActor::workflow_steward(),
-            assisting_profile: Some(session.request_template.profile),
+            assisting_profile: Some(staged.request_template.profile),
             nesting_depth: None,
             timestamp_ms: Some(now_millis()),
         },
     );
-
-    let terminate_environment = !session.running;
-    if terminate_environment {
-        if let Some(checkpoint) = session.multi_task.take() {
+    let terminal_entry_key = if terminate_environment {
+        if let Some(checkpoint) = staged.multi_task.take() {
             let mut run = checkpoint.run;
             if !run.stage.is_terminal() {
                 let now = now_millis().max(run.updated_at_ms);
@@ -3318,9 +3646,12 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionMuta
                     now_ms: now,
                 })?;
             }
-            archive_multi_task(session, crate::task_queue::MultiTaskCheckpoint::new(run)?);
+            archive_multi_task(
+                &mut staged,
+                crate::task_queue::MultiTaskCheckpoint::new(run)?,
+            );
         }
-        if let Some(checkpoint) = session.workflow.take() {
+        if let Some(checkpoint) = staged.workflow.take() {
             let mut run = checkpoint.run;
             if run.stage == crate::workflow::WorkflowStage::Blocked {
                 run.apply(crate::workflow::WorkflowEvent::Resumed)?;
@@ -3333,16 +3664,16 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionMuta
             }
             let checkpoint = crate::workflow::WorkflowCheckpoint::new(run)?;
             let summary = crate::workflow::WorkflowSummary::from(&checkpoint.run);
-            if session
+            if staged
                 .completed_workflows
                 .last()
                 .is_none_or(|existing| existing.id != summary.id)
             {
-                session.completed_workflows.push(summary);
+                staged.completed_workflows.push(summary);
             }
             publish_event(
-                &session.sender,
-                &session.history,
+                &staged.sender,
+                &staged.history,
                 AgentEvent::WorkflowCompleted {
                     workflow_id: checkpoint.run.id,
                     outcome: crate::workflow::WorkflowOutcome::Cancelled,
@@ -3352,45 +3683,29 @@ async fn cancel_session_inner(state: AppState, id: String) -> Result<SessionMuta
                 },
             );
         }
-        session.request_template.workflow_checkpoint = None;
-        session.running = false;
-        session.paused = false;
-        session.status = SessionStatus::Completed;
-        publish_terminal_session_state_changed(&state, &projects, &id, session);
+        staged.request_template.workflow_checkpoint = None;
+        staged.running = false;
+        staged.paused = false;
+        staged.status = SessionStatus::Completed;
+        staged.updated_at_ms = now_millis();
+        Some(stage_terminal_session_state_changed(&staged))
+    } else {
+        staged.updated_at_ms = now_millis();
+        None
+    };
+    commit_staged_session_state(
+        &id,
+        session,
+        staged,
+        base_revision,
+        terminal_entry_key.as_deref(),
+    )?;
+    if let Some(entry_key) = terminal_entry_key {
+        publish_terminal_session_transition(&state, &projects, &id, session, entry_key);
     }
-    session.updated_at_ms = now_millis();
-    let request = session.request_template.clone();
-    let branch = session.branch.clone();
-    let workdir = session.workdir.clone();
-    let history = Arc::clone(&session.history);
-    let usage_records = Arc::clone(&session.usage_records);
-    let workflow = session.workflow.clone();
-    let completed_workflows = session.completed_workflows.clone();
-    let goal = session.goal.clone();
-    let completed_goals = session.completed_goals.clone();
-    let multi_task = session.multi_task.clone();
-    let completed_multi_tasks = session.completed_multi_tasks.clone();
-    let durable = session.durable.clone();
-    let status = session.status;
     let snapshot = session_mutation_snapshot_for_session(&id, session);
     drop(sessions);
     drop(projects);
-    persist_session_snapshot(
-        &id,
-        &request,
-        branch,
-        workdir,
-        status,
-        &history,
-        &usage_records,
-        workflow,
-        completed_workflows,
-        goal,
-        completed_goals,
-        multi_task,
-        completed_multi_tasks,
-        durable,
-    );
     if terminate_environment
         && let Err(error) = crate::session_environment::terminate_global_session(&id)
     {
@@ -3680,10 +3995,17 @@ async fn status(
 async fn delete_session(
     Path(id): Path<String>,
     State((state, _defaults)): State<(AppState, AgentRequest)>,
-) -> Result<Json<DeleteSessionResponse>, ApiError> {
-    delete_session_inner(state, &id)
+    Query(query): Query<ProjectSessionQuery>,
+) -> Result<Json<DeleteSessionMutationResponse>, ApiError> {
+    let usage_window = query.usage_window()?;
+    delete_session_transaction_owned(state, &id, usage_window)
         .await
-        .map(Json)
+        .map(|result| {
+            Json(DeleteSessionMutationResponse {
+                deletion: result.deletion,
+                snapshot: result.snapshot,
+            })
+        })
         .map_err(|error| match error {
             DeleteSessionError::NotFound(message) => {
                 ApiError::new(StatusCode::NOT_FOUND, "session_not_found", message)
@@ -3713,18 +4035,41 @@ async fn delete_session_inner(
     state: AppState,
     id: &str,
 ) -> Result<DeleteSessionResponse, DeleteSessionError> {
+    delete_session_transaction_owned(
+        state,
+        id,
+        UsageWindow {
+            start_ms: 0,
+            end_ms: 1,
+        },
+    )
+    .await
+    .map(|result| result.deletion)
+}
+
+async fn delete_session_transaction_owned(
+    state: AppState,
+    id: &str,
+    usage_window: UsageWindow,
+) -> Result<DeleteSessionTransactionResult, DeleteSessionError> {
     // Keep every authoritative phase in one owned task. Dropping a disconnected HTTP or RPC
     // response future then detaches this task instead of cancelling the transaction between awaits.
-    tokio::spawn(delete_session_transaction(state, id.to_string()))
-        .await
-        .map_err(|error| anyhow::anyhow!("session deletion transaction failed: {error}"))?
+    tokio::spawn(delete_session_transaction(
+        state,
+        id.to_string(),
+        usage_window,
+    ))
+    .await
+    .map_err(|error| anyhow::anyhow!("session deletion transaction failed: {error}"))?
 }
 
 async fn delete_session_transaction(
     state: AppState,
     id: String,
-) -> Result<DeleteSessionResponse, DeleteSessionError> {
-    {
+    usage_window: UsageWindow,
+) -> Result<DeleteSessionTransactionResult, DeleteSessionError> {
+    let snapshot = {
+        let projects = state.projects.lock().await;
         let mut sessions = state.sessions.lock().await;
         let Some(session) = sessions.get(&id) else {
             return Err(DeleteSessionError::NotFound(format!(
@@ -3753,9 +4098,24 @@ async fn delete_session_transaction(
             .map_err(anyhow::Error::from)?;
         }
         sessions.remove(&id).expect("session exists");
-        state.project_usage_windows.lock().await.invalidate();
-        state.publish_project_session_change();
-    }
+        let mut usage_windows = state.project_usage_windows.lock().await;
+        usage_windows.invalidate();
+        let revision = state.publish_project_session_change();
+        let publication = state
+            .project_session_publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        project_session_snapshot_from_locked(
+            &state,
+            &projects,
+            &sessions,
+            &mut usage_windows,
+            &publication,
+            revision,
+            revision,
+            usage_window,
+        )
+    };
     let cleanup_session_id = id.clone();
     let cleanup_warnings = match tokio::task::spawn_blocking(move || {
         cleanup_deleted_session_resources(&cleanup_session_id)
@@ -3769,10 +4129,13 @@ async fn delete_session_transaction(
         tracing::warn!(session_id = %id, %warning, "session was deleted with cleanup warnings");
     }
 
-    Ok(DeleteSessionResponse {
-        session_id: id,
-        deleted: true,
-        cleanup_warnings,
+    Ok(DeleteSessionTransactionResult {
+        deletion: DeleteSessionResponse {
+            session_id: id,
+            deleted: true,
+            cleanup_warnings,
+        },
+        snapshot,
     })
 }
 
@@ -4107,7 +4470,6 @@ struct WebEventSink {
     goal: Option<crate::goal::GoalCheckpoint>,
     completed_goals: Vec<crate::goal::GoalCheckpoint>,
     multi_task: Option<crate::task_queue::MultiTaskCheckpoint>,
-    completed_multi_tasks: Vec<crate::task_queue::MultiTaskCheckpoint>,
     durable: DurableSessionProjection,
     pending_user_messages: Arc<StdMutex<VecDeque<QueuedUserMessage>>>,
     accepting_user_messages: Arc<AtomicBool>,
@@ -4117,6 +4479,22 @@ struct WebEventSink {
 }
 
 impl WebEventSink {
+    fn persist_authoritative_session(&self) {
+        tokio::runtime::Handle::current().block_on(async {
+            let sessions = self.state.sessions.lock().await;
+            let Some(session) = sessions.get(&self.session_id) else {
+                return;
+            };
+            if let Err(error) = persist_exact_session_state(&self.session_id, session) {
+                tracing::warn!(
+                    %error,
+                    session_id = %self.session_id,
+                    "failed to persist authoritative runtime session state"
+                );
+            }
+        });
+    }
+
     fn emit_timestamped(&mut self, event: AgentEvent, supersedes: Vec<String>) -> String {
         let envelope = EventEnvelope::with_timestamp(event);
         let entry_key = envelope.transcript.entry_key.clone();
@@ -4237,22 +4615,7 @@ impl WebEventSink {
                     .and_then(|session| session.multi_task.clone())
             });
         }
-        persist_session_snapshot(
-            &self.session_id,
-            &self.request_template,
-            self.persisted_branch.clone(),
-            self.persisted_workdir.clone(),
-            SessionStatus::Running,
-            &self.history,
-            &self.usage_records,
-            self.workflow.clone(),
-            self.completed_workflows.clone(),
-            self.goal.clone(),
-            self.completed_goals.clone(),
-            self.multi_task.clone(),
-            self.completed_multi_tasks.clone(),
-            self.durable.clone(),
-        );
+        self.persist_authoritative_session();
         entry_key
     }
 }
@@ -4336,22 +4699,7 @@ impl EventSink for WebEventSink {
             );
         }
         drop(pending);
-        persist_session_snapshot(
-            &self.session_id,
-            &self.request_template,
-            self.persisted_branch.clone(),
-            self.persisted_workdir.clone(),
-            SessionStatus::Running,
-            &self.history,
-            &self.usage_records,
-            self.workflow.clone(),
-            self.completed_workflows.clone(),
-            self.goal.clone(),
-            self.completed_goals.clone(),
-            self.multi_task.clone(),
-            self.completed_multi_tasks.clone(),
-            self.durable.clone(),
-        );
+        self.persist_authoritative_session();
         messages
     }
 
@@ -4425,22 +4773,7 @@ impl EventSink for WebEventSink {
                 self.state.publish_project_session_change();
                 Ok::<(), anyhow::Error>(())
             })?;
-            persist_session_snapshot(
-                &self.session_id,
-                &self.request_template,
-                self.persisted_branch.clone(),
-                self.persisted_workdir.clone(),
-                SessionStatus::Running,
-                &self.history,
-                &self.usage_records,
-                None,
-                self.completed_workflows.clone(),
-                self.goal.clone(),
-                self.completed_goals.clone(),
-                self.multi_task.clone(),
-                self.completed_multi_tasks.clone(),
-                self.durable.clone(),
-            );
+            self.persist_authoritative_session();
             return Ok(());
         }
         if let Some(parent) = self.multi_task.take() {
@@ -4493,22 +4826,7 @@ impl EventSink for WebEventSink {
                 self.state.publish_project_session_change();
                 Ok::<(), anyhow::Error>(())
             })?;
-            persist_session_snapshot(
-                &self.session_id,
-                &self.request_template,
-                self.persisted_branch.clone(),
-                self.persisted_workdir.clone(),
-                SessionStatus::Running,
-                &self.history,
-                &self.usage_records,
-                None,
-                self.completed_workflows.clone(),
-                self.goal.clone(),
-                self.completed_goals.clone(),
-                self.multi_task.clone(),
-                self.completed_multi_tasks.clone(),
-                self.durable.clone(),
-            );
+            self.persist_authoritative_session();
             return Ok(());
         }
         if let Some(goal) = self.goal.take() {
@@ -4557,22 +4875,7 @@ impl EventSink for WebEventSink {
             self.state.publish_project_session_change();
             Ok::<(), anyhow::Error>(())
         })?;
-        persist_session_snapshot(
-            &self.session_id,
-            &self.request_template,
-            self.persisted_branch.clone(),
-            self.persisted_workdir.clone(),
-            SessionStatus::Running,
-            &self.history,
-            &self.usage_records,
-            self.workflow.clone(),
-            self.completed_workflows.clone(),
-            self.goal.clone(),
-            self.completed_goals.clone(),
-            self.multi_task.clone(),
-            self.completed_multi_tasks.clone(),
-            self.durable.clone(),
-        );
+        self.persist_authoritative_session();
         Ok(())
     }
 
@@ -4595,22 +4898,7 @@ impl EventSink for WebEventSink {
             self.state.publish_project_session_change();
             Ok::<(), anyhow::Error>(())
         })?;
-        persist_session_snapshot(
-            &self.session_id,
-            &self.request_template,
-            self.persisted_branch.clone(),
-            self.persisted_workdir.clone(),
-            SessionStatus::Running,
-            &self.history,
-            &self.usage_records,
-            None,
-            self.completed_workflows.clone(),
-            self.goal.clone(),
-            self.completed_goals.clone(),
-            self.multi_task.clone(),
-            self.completed_multi_tasks.clone(),
-            self.durable.clone(),
-        );
+        self.persist_authoritative_session();
         Ok(())
     }
 
@@ -4635,7 +4923,8 @@ impl EventSink for WebEventSink {
             let session = sessions
                 .get_mut(&self.session_id)
                 .with_context(|| format!("session not found: {}", self.session_id))?;
-            let mut run = session
+            let (mut staged, base_revision) = stage_session_state(session)?;
+            let mut run = staged
                 .goal
                 .as_ref()
                 .context("goal pause request lost its durable goal")?
@@ -4643,29 +4932,31 @@ impl EventSink for WebEventSink {
                 .clone();
             let goal_id = run.id.clone();
             let paused = run.request_pause(now_millis())?;
-            session.goal = Some(crate::goal::GoalCheckpoint::new(run)?);
-            session.pause_token.store(true, Ordering::SeqCst);
+            staged.goal = Some(crate::goal::GoalCheckpoint::new(run)?);
+            sync_multi_task_goal_checkpoint(&mut staged)?;
+            staged.pause_token.store(true, Ordering::SeqCst);
             publish_event(
-                &session.sender,
-                &session.history,
+                &staged.sender,
+                &staged.history,
                 AgentEvent::GoalPauseRequested {
                     goal_id: goal_id.clone(),
                     timestamp_ms: Some(now_millis()),
                 },
             );
             if paused {
-                session.status = SessionStatus::Paused;
-                session.paused = true;
+                staged.status = SessionStatus::Paused;
+                staged.paused = true;
                 publish_event(
-                    &session.sender,
-                    &session.history,
+                    &staged.sender,
+                    &staged.history,
                     AgentEvent::GoalPaused {
                         goal_id: goal_id.clone(),
                         timestamp_ms: Some(now_millis()),
                     },
                 );
             }
-            persist_live_session(&self.session_id, session);
+            staged.updated_at_ms = now_millis();
+            commit_staged_session_state(&self.session_id, session, staged, base_revision, None)?;
             Ok::<String, anyhow::Error>(goal_id)
         })?;
         Ok(format!(
@@ -4684,7 +4975,8 @@ impl EventSink for WebEventSink {
             let session = sessions
                 .get_mut(&self.session_id)
                 .with_context(|| format!("session not found: {}", self.session_id))?;
-            let goal_id = session
+            let (mut staged, base_revision) = stage_session_state(session)?;
+            let goal_id = staged
                 .goal
                 .as_ref()
                 .context("goal change request lost its durable goal")?
@@ -4696,21 +4988,51 @@ impl EventSink for WebEventSink {
                 kind: kind.clone(),
                 summary: summary.clone(),
             };
-            session.durable.pending_goal_change = Some(pending.clone());
+            staged.durable.pending_goal_change = Some(pending.clone());
             publish_event(
-                &session.sender,
-                &session.history,
+                &staged.sender,
+                &staged.history,
                 AgentEvent::GoalChangeRequested {
-                    goal_id,
+                    goal_id: goal_id.clone(),
                     kind: kind.clone(),
                     summary: summary.clone(),
                     timestamp_ms: Some(now_millis()),
                 },
             );
+            let mut run = staged
+                .goal
+                .take()
+                .context("goal change request lost its durable goal")?
+                .run;
+            let paused = run.request_pause(now_millis())?;
+            staged.goal = Some(crate::goal::GoalCheckpoint::new(run)?);
+            sync_multi_task_goal_checkpoint(&mut staged)?;
+            staged.pause_token.store(true, Ordering::SeqCst);
+            publish_event(
+                &staged.sender,
+                &staged.history,
+                AgentEvent::GoalPauseRequested {
+                    goal_id: goal_id.clone(),
+                    timestamp_ms: Some(now_millis()),
+                },
+            );
+            if paused {
+                staged.status = SessionStatus::Paused;
+                staged.paused = true;
+                publish_event(
+                    &staged.sender,
+                    &staged.history,
+                    AgentEvent::GoalPaused {
+                        goal_id,
+                        timestamp_ms: Some(now_millis()),
+                    },
+                );
+            }
+            staged.updated_at_ms = now_millis();
+            commit_staged_session_state(&self.session_id, session, staged, base_revision, None)?;
             Ok::<PendingGoalChange, anyhow::Error>(pending)
         })?;
         self.durable.pending_goal_change = Some(pending);
-        self.request_goal_pause(&format!("{kind} review requested: {summary}"))?;
         Ok(format!(
             "{kind} request recorded and the goal will pause for human review"
         ))
@@ -4832,6 +5154,29 @@ fn publish_terminal_session_state_changed(
     ) {
         return;
     }
+    publish_terminal_session_transition(state, projects, session_id, session, entry_key);
+}
+
+fn stage_terminal_session_state_changed(session: &SessionState) -> String {
+    debug_assert!(matches!(
+        session.status,
+        SessionStatus::Completed | SessionStatus::Failed
+    ));
+    let envelope = EventEnvelope::with_timestamp(session_state_changed_event(session));
+    let entry_key = envelope.transcript.entry_key.clone();
+    let published =
+        publish_event_envelope_linked(&session.sender, &session.history, envelope, Vec::new());
+    debug_assert!(published, "staged history must accept its terminal event");
+    entry_key
+}
+
+fn publish_terminal_session_transition(
+    state: &AppState,
+    projects: &[ProjectEntry],
+    session_id: &str,
+    session: &SessionState,
+    entry_key: String,
+) {
     let transition =
         AppState::terminal_transition(projects, session_id, entry_key, session.status, session);
     state.publish_project_session_update(Some(transition));
@@ -4858,32 +5203,24 @@ fn dispatch_next_session(state: AppState) {
                 let session = sessions
                     .get_mut(&session_id)
                     .expect("queued session selected from sessions map");
-                session.running = true;
-                session.paused = false;
-                session.status = SessionStatus::Running;
-                session
-                    .accepting_user_messages
-                    .store(true, Ordering::SeqCst);
-                session.updated_at_ms = now_millis();
-                publish_session_state_changed(session);
-                (
-                    Some((
-                        session_id,
-                        session.request_template.clone(),
-                        session.branch.clone(),
-                        session.workdir.clone(),
-                        Arc::clone(&session.history),
-                        Arc::clone(&session.usage_records),
-                        session.workflow.clone(),
-                        session.completed_workflows.clone(),
-                        session.goal.clone(),
-                        session.completed_goals.clone(),
-                        session.multi_task.clone(),
-                        session.completed_multi_tasks.clone(),
-                        session.durable.clone(),
-                    )),
-                    true,
-                )
+                let Ok((mut staged, base_revision)) = stage_session_state(session) else {
+                    tracing::warn!(%session_id, "failed to stage queued session dispatch");
+                    return;
+                };
+                staged.running = true;
+                staged.paused = false;
+                staged.status = SessionStatus::Running;
+                staged.accepting_user_messages.store(true, Ordering::SeqCst);
+                staged.updated_at_ms = now_millis();
+                publish_session_state_changed(&staged);
+                if let Err(error) =
+                    commit_staged_session_state(&session_id, session, staged, base_revision, None)
+                {
+                    tracing::warn!(%error, %session_id, "failed to persist queued session dispatch");
+                    (None, false)
+                } else {
+                    (Some((session_id, session.request_template.clone())), true)
+                }
             } else {
                 (None, false)
             }
@@ -4894,37 +5231,7 @@ fn dispatch_next_session(state: AppState) {
             return;
         };
 
-        let (
-            session_id,
-            request,
-            branch,
-            workdir,
-            history,
-            usage_records,
-            workflow,
-            completed_workflows,
-            goal,
-            completed_goals,
-            multi_task,
-            completed_multi_tasks,
-            durable,
-        ) = next;
-        persist_session_snapshot(
-            &session_id,
-            &request,
-            branch,
-            workdir,
-            SessionStatus::Running,
-            &history,
-            &usage_records,
-            workflow,
-            completed_workflows,
-            goal,
-            completed_goals,
-            multi_task,
-            completed_multi_tasks,
-            durable.clone(),
-        );
+        let (session_id, request) = next;
         spawn_agent_run(state, session_id, request);
     });
 }
@@ -4941,7 +5248,6 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
             goal,
             completed_goals,
             multi_task,
-            completed_multi_tasks,
             durable,
             pending_user_messages,
             accepting_user_messages,
@@ -4965,7 +5271,6 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 session.goal.clone(),
                 session.completed_goals.clone(),
                 session.multi_task.clone(),
-                session.completed_multi_tasks.clone(),
                 session.durable.clone(),
                 Arc::clone(&session.pending_user_messages),
                 Arc::clone(&session.accepting_user_messages),
@@ -5002,7 +5307,6 @@ fn spawn_agent_run(state: AppState, session_id: String, request: AgentRequest) {
                 goal,
                 completed_goals,
                 multi_task,
-                completed_multi_tasks,
                 durable,
                 pending_user_messages,
                 accepting_user_messages,
@@ -6267,46 +6571,20 @@ async fn handle_rpc_connection(
         "pb.goal.pause" | "pb.goal.resume" | "pb.goal.cancel" | "pb.goal.accept" => {
             let params: GoalRpcMutationRequest = serde_json::from_value(request.params)?;
             let goal_id = params.goal_id;
-            let response_goal_id = goal_id.clone();
             let digest = GoalDigestRequest {
                 goal_sha256: params.goal_sha256,
                 plan_sha256: params.plan_sha256,
             };
             let result = match request.method.as_str() {
-                "pb.goal.pause" => {
-                    pause_goal(Path(goal_id), State((state, defaults)), Json(digest)).await
-                }
-                "pb.goal.resume" => {
-                    resume_goal(Path(goal_id), State((state, defaults)), Json(digest)).await
-                }
-                "pb.goal.cancel" => {
-                    cancel_goal(Path(goal_id), State((state, defaults)), Json(digest)).await
-                }
-                "pb.goal.accept" => {
-                    accept_goal(Path(goal_id), State((state, defaults)), Json(digest)).await
-                }
+                "pb.goal.pause" => pause_goal_inner(&state, &goal_id, &digest).await,
+                "pb.goal.resume" => resume_goal_inner(&state, &goal_id, &digest).await,
+                "pb.goal.cancel" => cancel_goal_inner(&state, &goal_id, &digest).await,
+                "pb.goal.accept" => accept_goal_inner(&state, &goal_id, &digest).await,
                 _ => unreachable!(),
             };
             match result {
-                Ok(Json(result)) => {
-                    let goal = result
-                        .session
-                        .goal
-                        .as_ref()
-                        .filter(|goal| goal.run.id == response_goal_id)
-                        .with_context(|| {
-                            format!("goal mutation response lost checkpoint {response_goal_id}")
-                        })?;
-                    write_rpc_response(
-                        reader.get_mut(),
-                        request.id,
-                        GoalResponse {
-                            session_id: result.session.session_id.clone(),
-                            goal_id: response_goal_id,
-                            goal_sha256: goal.sha256.clone(),
-                        },
-                    )
-                    .await?
+                Ok(result) => {
+                    write_rpc_response(reader.get_mut(), request.id, result.response).await?
                 }
                 Err(status) => {
                     write_rpc_error(
@@ -6724,6 +7002,9 @@ fn persist_session_snapshot(
     completed_multi_tasks: Vec<crate::task_queue::MultiTaskCheckpoint>,
     durable: DurableSessionProjection,
 ) {
+    let _persistence = SESSION_PERSISTENCE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let events = history
         .lock()
         .map(|history| history.clone())
@@ -6800,6 +7081,77 @@ fn persist_live_session(session_id: &str, session: &SessionState) {
         session.completed_multi_tasks.clone(),
         session.durable.clone(),
     );
+}
+
+fn persist_exact_session_state(
+    session_id: &str,
+    session: &SessionState,
+) -> std::result::Result<(), SessionPersistenceError> {
+    let _persistence = SESSION_PERSISTENCE_LOCK.lock().map_err(|_| {
+        SessionPersistenceError(anyhow::anyhow!("session persistence lock is unavailable"))
+    })?;
+    let events = session
+        .history
+        .lock()
+        .map_err(|_| SessionPersistenceError(anyhow::anyhow!("session history is unavailable")))?
+        .clone();
+    let usage_records = session
+        .usage_records
+        .lock()
+        .map_err(|_| {
+            SessionPersistenceError(anyhow::anyhow!("session usage history is unavailable"))
+        })?
+        .clone();
+    let persisted = exact_persisted_session(session_id, session, events, usage_records);
+    session_store::save_session(&persisted).map_err(SessionPersistenceError)
+}
+
+fn exact_persisted_session(
+    session_id: &str,
+    session: &SessionState,
+    events: Vec<EventEnvelope>,
+    usage_records: Vec<SessionMetricsSnapshot>,
+) -> PersistedSession {
+    let pending_user_messages = pending_user_messages_from_events(&events);
+    let mut persisted = PersistedSession::from_parts(
+        session_id.to_string(),
+        session.request_template.clone(),
+        session.branch.clone(),
+        session.workdir.clone(),
+        session.running,
+        session.status,
+        events,
+    );
+    persisted.task.clone_from(&session.task);
+    persisted.title.clone_from(&session.title);
+    persisted.started_at_ms = session.started_at_ms;
+    persisted.updated_at_ms = session.updated_at_ms;
+    persisted.metrics = combined_metrics(&usage_records);
+    persisted.usage_records = usage_records;
+    persisted.workflow.clone_from(&session.workflow);
+    persisted
+        .completed_workflows
+        .clone_from(&session.completed_workflows);
+    persisted.goal.clone_from(&session.goal);
+    persisted
+        .completed_goals
+        .clone_from(&session.completed_goals);
+    persisted.multi_task.clone_from(&session.multi_task);
+    persisted
+        .completed_multi_tasks
+        .clone_from(&session.completed_multi_tasks);
+    persisted.pending_user_messages = pending_user_messages;
+    persisted.project.clone_from(&session.durable.project);
+    persisted
+        .pending_delivery_proposal
+        .clone_from(&session.durable.pending_delivery_proposal);
+    persisted
+        .pending_goal_proposal
+        .clone_from(&session.durable.pending_goal_proposal);
+    persisted
+        .pending_goal_change
+        .clone_from(&session.durable.pending_goal_change);
+    persisted
 }
 
 fn combined_metrics(records: &[SessionMetricsSnapshot]) -> Option<SessionMetricsSnapshot> {
@@ -7066,8 +7418,30 @@ async fn project_session_snapshot(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let revision = state.project_session_revision.load(Ordering::SeqCst);
+    project_session_snapshot_from_locked(
+        state,
+        &projects,
+        &sessions,
+        &mut usage_windows,
+        &publication,
+        revision,
+        terminal_transition_floor,
+        usage_window,
+    )
+}
+
+fn project_session_snapshot_from_locked(
+    state: &AppState,
+    projects: &[ProjectEntry],
+    sessions: &HashMap<String, SessionState>,
+    usage_windows: &mut ProjectUsageWindowCache,
+    publication: &ProjectSessionPublication,
+    revision: u64,
+    terminal_transition_floor: u64,
+    usage_window: UsageWindow,
+) -> ProjectSessionSnapshot {
     let (overall_usage, project_usage) =
-        usage_summaries(&projects, &sessions, &mut usage_windows, usage_window);
+        usage_summaries(projects, sessions, usage_windows, usage_window);
     ProjectSessionSnapshot {
         stream_id: (*state.project_session_stream_id).clone(),
         revision,
@@ -7082,8 +7456,8 @@ async fn project_session_snapshot(
             })
             .cloned()
             .collect(),
-        projects: projects.clone(),
-        sessions: session_list_items(&sessions),
+        projects: projects.to_vec(),
+        sessions: session_list_items(sessions),
         overall_usage,
         project_usage,
     }
@@ -8145,6 +8519,64 @@ mod workflow_tests {
     }
 
     #[tokio::test]
+    async fn delete_returns_the_exact_committed_collection_projection() {
+        let mut defaults = request(std::path::Path::new("."));
+        defaults.workdir = None;
+        defaults.branch = None;
+        defaults.repository_less = true;
+        let persisted = PersistedSession::from_parts(
+            defaults.session_id.clone(),
+            defaults.clone(),
+            None,
+            None,
+            false,
+            SessionStatus::Completed,
+            Vec::new(),
+        );
+        let (session_id, session) = session_from_persisted(persisted);
+        let (project_session_sender, _) = broadcast::channel(16);
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), session)]))),
+            projects: Arc::new(Mutex::new(Vec::new())),
+            project_usage_windows: Arc::new(Mutex::new(ProjectUsageWindowCache::default())),
+            project_session_stream_id: Arc::new("test-stream".to_string()),
+            project_session_revision: Arc::new(AtomicU64::new(0)),
+            project_session_publication: Arc::new(StdMutex::new(
+                ProjectSessionPublication::default(),
+            )),
+            project_session_sender,
+            sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+            tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
+                8311, 8311, false,
+            ))),
+            web_listen: "127.0.0.1".to_string(),
+        };
+
+        let response = delete_session(
+            Path(session_id.clone()),
+            State((state.clone(), defaults)),
+            Query(ProjectSessionQuery {
+                usage_window_start_ms: 1,
+                usage_window_end_ms: 86_400_001,
+                last_event_id: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(response.deletion.session_id, session_id);
+        assert!(response.deletion.deleted);
+        assert_eq!(response.snapshot.stream_id, "test-stream");
+        assert_eq!(response.snapshot.revision, 1);
+        assert_eq!(response.snapshot.terminal_transition_floor, 1);
+        assert!(response.snapshot.terminal_transitions.is_empty());
+        assert!(response.snapshot.sessions.is_empty());
+        assert_eq!(response.snapshot.overall_usage.total.tokens, 0);
+        assert!(!state.sessions.lock().await.contains_key(&session_id));
+    }
+
+    #[tokio::test]
     async fn cancelled_delete_caller_cannot_split_authoritative_state() {
         let mut request = request(std::path::Path::new("."));
         request.workdir = None;
@@ -8316,6 +8748,236 @@ mod workflow_tests {
             goal_context: None,
             contract: None,
         }
+    }
+
+    fn two_goal_task_run(
+        session_id: &str,
+        workdir: &std::path::Path,
+    ) -> crate::task_queue::MultiTaskRun {
+        let policy = crate::task_queue::TaskConfigDocument::default()
+            .compile()
+            .unwrap();
+        let authority = crate::task_queue::TaskPlanAuthority {
+            source_intent: crate::task_queue::TaskSourceIntent::Build,
+            task_planning_qualified: true,
+            automatic_goal_selection_qualified: true,
+        };
+        let proposal: crate::task_queue::TaskPlanProposal =
+            serde_json::from_value(serde_json::json!({
+                "objective": "Complete two sequential Goals",
+                "requirements": [
+                    {"id": "r1", "description": "First Goal completes"},
+                    {"id": "r2", "description": "Second Goal starts afterwards"}
+                ],
+                "tasks": [
+                    {
+                        "id": "goal-1",
+                        "title": "First Goal",
+                        "description": "Complete the first Goal",
+                        "requirement_ids": ["r1"],
+                        "acceptance_ids": ["a1"],
+                        "scope_hints": ["src/first"],
+                        "effort": "small",
+                        "kind": "goal",
+                        "goal_contract": {
+                            "objective": "Complete the first Goal",
+                            "criteria": [{
+                                "text": "First Goal evidence is accepted",
+                                "verifier": "review_required"
+                            }],
+                            "continuation": "review_plan_then_automatic"
+                        }
+                    },
+                    {
+                        "id": "goal-2",
+                        "title": "Second Goal",
+                        "description": "Complete the second Goal",
+                        "requirement_ids": ["r2"],
+                        "depends_on": ["goal-1"],
+                        "acceptance_ids": ["a2"],
+                        "scope_hints": ["src/second"],
+                        "effort": "small",
+                        "kind": "goal",
+                        "goal_contract": {
+                            "objective": "Complete the second Goal",
+                            "criteria": [{
+                                "text": "Second Goal evidence is accepted",
+                                "verifier": "review_required"
+                            }],
+                            "continuation": "review_plan_then_automatic"
+                        }
+                    }
+                ],
+                "acceptance": [
+                    {"id": "a1", "description": "First Goal is accepted"},
+                    {"id": "a2", "description": "Second Goal is accepted"}
+                ]
+            }))
+            .unwrap();
+        let artifact = proposal.validate_and_compile(authority, &policy).unwrap();
+        let plan = crate::workflow::ArtifactEnvelope::new("two-goal-plan", artifact).unwrap();
+        let review = crate::workflow::ArtifactEnvelope::new(
+            "two-goal-review",
+            crate::task_queue::TaskPlanReviewArtifact {
+                task_plan_sha256: plan.sha256.clone(),
+                verdict: crate::task_queue::TaskPlanReviewVerdict::Pass,
+                request_assessments: Vec::new(),
+                audits: crate::task_queue::passing_task_plan_audits(),
+                challenges: Vec::new(),
+            },
+        )
+        .unwrap();
+        let qualification_digest = "1".repeat(64);
+        let qualification = crate::task_queue::TaskPlannerQualification::new(
+            qualification_digest.clone(),
+            qualification_digest.clone(),
+            qualification_digest.clone(),
+            qualification_digest,
+            true,
+            true,
+        )
+        .unwrap();
+        crate::task_queue::MultiTaskRun::start(
+            "two-goal-task",
+            session_id,
+            "turn-two-goal",
+            plan,
+            review,
+            policy,
+            crate::workflow::WorkflowConfigDocument::default()
+                .compile()
+                .unwrap(),
+            crate::goal::GoalConfigDocument::default()
+                .compile()
+                .unwrap(),
+            32,
+            crate::task_queue::TaskSourceIntent::Build,
+            qualification,
+            workdir.to_string_lossy(),
+            crate::task_queue::TaskRepositoryState::capture(workdir).unwrap(),
+            crate::task_queue::TaskCoordinationCounters::default(),
+            10,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rpc_goal_accept_acknowledges_the_completed_goal_after_next_goal_activation() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .current_dir(repo.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let defaults = request(repo.path());
+        let persisted = PersistedSession::from_parts(
+            defaults.session_id.clone(),
+            defaults.clone(),
+            defaults.branch.clone(),
+            defaults.workdir.clone(),
+            false,
+            SessionStatus::Paused,
+            Vec::new(),
+        );
+        let (session_id, mut session) = session_from_persisted(persisted);
+        let parent = crate::task_queue::MultiTaskCheckpoint::new(two_goal_task_run(
+            &session_id,
+            repo.path(),
+        ))
+        .unwrap();
+        session.status = dispatch_multi_task_active(&mut session, &parent).unwrap();
+        let mut first_goal = session.goal.take().unwrap().run;
+        for criterion in &mut first_goal.criteria {
+            criterion.status = crate::goal::GoalCriterionStatus::EvidenceReady;
+            criterion.evidence_ids = vec!["review:first-goal".to_string()];
+        }
+        for milestone in &mut first_goal.milestones {
+            milestone.status = crate::goal::GoalMilestoneStatus::Completed;
+        }
+        first_goal.active_milestone_id = None;
+        first_goal.stage = crate::goal::GoalStage::AwaitingUserReview;
+        first_goal.updated_at_ms = now_millis();
+        let first_goal = crate::goal::GoalCheckpoint::new(first_goal).unwrap();
+        let first_goal_id = first_goal.run.id.clone();
+        let first_goal_sha256 = first_goal.sha256.clone();
+        session.goal = Some(first_goal);
+        sync_multi_task_goal_checkpoint(&mut session).unwrap();
+
+        let (project_session_sender, _) = broadcast::channel(16);
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::from([(session_id.clone(), session)]))),
+            projects: Arc::new(Mutex::new(Vec::new())),
+            project_usage_windows: Arc::new(Mutex::new(ProjectUsageWindowCache::default())),
+            project_session_stream_id: Arc::new("test-stream".to_string()),
+            project_session_revision: Arc::new(AtomicU64::new(0)),
+            project_session_publication: Arc::new(StdMutex::new(
+                ProjectSessionPublication::default(),
+            )),
+            project_session_sender,
+            sleep_prevention: Arc::new(StdMutex::new(SleepPrevention::new(false))),
+            tailscale: Arc::new(StdMutex::new(crate::tailscale::TailscaleIntegration::new(
+                8311, 8311, false,
+            ))),
+            web_listen: "127.0.0.1".to_string(),
+        };
+        {
+            let sessions = state.sessions.lock().await;
+            sessions[&session_id]
+                .sender
+                .attach_project_session_publisher(state.project_session_change_publisher());
+        }
+
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let rpc_state = state.clone();
+        let rpc_defaults = defaults.clone();
+        let rpc =
+            tokio::spawn(
+                async move { handle_rpc_connection(server, rpc_state, rpc_defaults).await },
+            );
+        let mut client = BufReader::new(client);
+        client
+            .get_mut()
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "id": 41,
+                        "method": "pb.goal.accept",
+                        "params": {
+                            "goal_id": first_goal_id,
+                            "goal_sha256": first_goal_sha256
+                        }
+                    })
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response_line = String::new();
+        client.read_line(&mut response_line).await.unwrap();
+        rpc.await.unwrap().unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response_line).unwrap();
+        assert_eq!(response["id"], 41);
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["goal_id"], first_goal_id);
+
+        let sessions = state.sessions.lock().await;
+        let session = &sessions[&session_id];
+        let completed = session
+            .completed_goals
+            .iter()
+            .find(|goal| goal.run.id == first_goal_id)
+            .unwrap();
+        assert_eq!(response["result"]["goal_sha256"], completed.sha256);
+        assert_ne!(session.goal.as_ref().unwrap().run.id, first_goal_id);
+        assert_eq!(
+            session.goal.as_ref().unwrap().run.objective,
+            "Complete the second Goal"
+        );
     }
 
     #[test]
@@ -8792,9 +9454,50 @@ mod workflow_tests {
             ))),
             web_listen: "127.0.0.1".to_string(),
         };
+        let defaults = request(repo.path());
+        let missing_session = start_goal_inner(
+            state.clone(),
+            defaults.clone(),
+            StartGoalRequest {
+                session_id: Some("missing-session".to_string()),
+                objective: "Do not create an implicit session".to_string(),
+                criteria: Vec::new(),
+                continuation: crate::goal::GoalContinuationPolicy::ReviewPlanThenAutomatic,
+                budget: None,
+                project_id: None,
+                workdir: Some(repo.path().to_string_lossy().into_owned()),
+                model: None,
+            },
+        )
+        .await;
+        let Err(missing_session) = missing_session else {
+            panic!("a targeted goal must not create a missing session");
+        };
+        assert!(missing_session.to_string().contains("session not found"));
+        assert!(state.sessions.lock().await.is_empty());
+        let missing_http = start_session_goal(
+            Path("missing-session".to_string()),
+            State((state.clone(), defaults.clone())),
+            Json(StartGoalRequest {
+                session_id: None,
+                objective: "Do not create an implicit session".to_string(),
+                criteria: Vec::new(),
+                continuation: crate::goal::GoalContinuationPolicy::ReviewPlanThenAutomatic,
+                budget: None,
+                project_id: None,
+                workdir: None,
+                model: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_http.status, StatusCode::NOT_FOUND);
+        assert_eq!(missing_http.code, "session_not_found");
+        assert!(state.sessions.lock().await.is_empty());
+
         let response = start_goal_inner(
             state.clone(),
-            request(repo.path()),
+            defaults.clone(),
             StartGoalRequest {
                 session_id: None,
                 objective: "Ship durable goals".to_string(),
@@ -8818,14 +9521,180 @@ mod workflow_tests {
             .unwrap();
         assert!(details.active_goal);
         assert_eq!(details.status, SessionStatus::Paused);
-        let goal = details.goal.unwrap();
+        let goal = details.goal.as_ref().unwrap();
         assert_eq!(goal.run.stage, crate::goal::GoalStage::AwaitingPlanApproval);
         assert_eq!(goal.run.budget, crate::goal::GoalBudget::standard());
         assert_eq!(goal.sha256, response.goal_sha256);
 
         let stale = mutate_active_goal(&state, &response.goal_id, "stale", |_, _| Ok(())).await;
         assert_eq!(stale.unwrap_err().status, StatusCode::CONFLICT);
-        let unchanged = get_goal(Path(response.goal_id), State((state, request(repo.path()))))
+
+        let before_rejected_mutation = session_details_snapshot(&state, &response.session_id)
+            .await
+            .unwrap();
+        let rejected = mutate_active_goal(
+            &state,
+            &response.goal_id,
+            &response.goal_sha256,
+            |session, run| {
+                session.task = "partially mutated task".to_string();
+                publish_event(
+                    &session.sender,
+                    &session.history,
+                    AgentEvent::GoalPauseRequested {
+                        goal_id: run.id.clone(),
+                        timestamp_ms: Some(now_millis()),
+                    },
+                );
+                bail!("reject the staged mutation")
+            },
+        )
+        .await;
+        assert_eq!(rejected.unwrap_err().status, StatusCode::CONFLICT);
+        let after_rejected_mutation = session_details_snapshot(&state, &response.session_id)
+            .await
+            .unwrap();
+        assert_eq!(after_rejected_mutation.task, before_rejected_mutation.task);
+        assert_eq!(
+            after_rejected_mutation.events.len(),
+            before_rejected_mutation.events.len()
+        );
+        assert_eq!(
+            after_rejected_mutation.revision,
+            before_rejected_mutation.revision
+        );
+        assert_eq!(
+            after_rejected_mutation.goal.as_ref().unwrap().sha256,
+            response.goal_sha256
+        );
+
+        let invalid_checkpoint = mutate_active_goal(
+            &state,
+            &response.goal_id,
+            &response.goal_sha256,
+            |session, run| {
+                run.objective.clear();
+                publish_event(
+                    &session.sender,
+                    &session.history,
+                    AgentEvent::GoalPauseRequested {
+                        goal_id: run.id.clone(),
+                        timestamp_ms: Some(now_millis()),
+                    },
+                );
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(
+            invalid_checkpoint.unwrap_err().status,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let after_invalid_checkpoint = session_details_snapshot(&state, &response.session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_invalid_checkpoint.events.len(),
+            before_rejected_mutation.events.len()
+        );
+        assert_eq!(
+            after_invalid_checkpoint.revision,
+            before_rejected_mutation.revision
+        );
+        assert_eq!(
+            after_invalid_checkpoint.goal.as_ref().unwrap().sha256,
+            response.goal_sha256
+        );
+
+        let invalid_persistence_session_id = "invalid/session".to_string();
+        {
+            let mut sessions = state.sessions.lock().await;
+            let session = sessions.remove(&response.session_id).unwrap();
+            sessions.insert(invalid_persistence_session_id.clone(), session);
+        }
+        let before_persistence_failure =
+            session_details_snapshot(&state, &invalid_persistence_session_id)
+                .await
+                .unwrap();
+        let persistence_failure = mutate_active_goal(
+            &state,
+            &response.goal_id,
+            &response.goal_sha256,
+            |session, run| {
+                session.title = Some("must not become live".to_string());
+                publish_event(
+                    &session.sender,
+                    &session.history,
+                    AgentEvent::GoalPauseRequested {
+                        goal_id: run.id.clone(),
+                        timestamp_ms: Some(now_millis()),
+                    },
+                );
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(
+            persistence_failure.unwrap_err().status,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let after_persistence_failure =
+            session_details_snapshot(&state, &response.session_id).await;
+        assert!(after_persistence_failure.is_none());
+        let after_persistence_failure =
+            session_details_snapshot(&state, &invalid_persistence_session_id)
+                .await
+                .unwrap();
+        assert_eq!(
+            after_persistence_failure.title,
+            before_persistence_failure.title
+        );
+        assert_eq!(
+            after_persistence_failure
+                .events
+                .iter()
+                .map(|event| event.transcript.entry_key.as_str())
+                .collect::<Vec<_>>(),
+            before_persistence_failure
+                .events
+                .iter()
+                .map(|event| event.transcript.entry_key.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            after_persistence_failure.revision,
+            before_persistence_failure.revision
+        );
+        {
+            let mut sessions = state.sessions.lock().await;
+            let session = sessions.remove(&invalid_persistence_session_id).unwrap();
+            sessions.insert(response.session_id.clone(), session);
+        }
+
+        let rejected_accept = accept_goal_inner(
+            &state,
+            &response.goal_id,
+            &GoalDigestRequest {
+                goal_sha256: response.goal_sha256.clone(),
+                plan_sha256: None,
+            },
+        )
+        .await;
+        assert_eq!(rejected_accept.unwrap_err().status, StatusCode::CONFLICT);
+        let after_rejected_accept = session_details_snapshot(&state, &response.session_id)
+            .await
+            .unwrap();
+        assert!(after_rejected_accept.active_goal);
+        assert_eq!(
+            after_rejected_accept.goal.as_ref().unwrap().sha256,
+            response.goal_sha256
+        );
+        assert_eq!(
+            after_rejected_accept.revision,
+            before_rejected_mutation.revision
+        );
+
+        let unchanged = get_goal(Path(response.goal_id), State((state, defaults)))
             .await
             .unwrap()
             .0;
