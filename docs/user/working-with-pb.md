@@ -29,7 +29,7 @@ Goal for the exact current turn, but the resulting milestone plan still waits fo
 Changing the status filter starts that filtered history from its first batch again. No sessions are
 deleted or hidden from the filter totals.
 
-Session notes use v5 session state and v5 event envelopes. A note written with an incompatible
+Session notes use v6 session state and v6 event envelopes. A note written with an incompatible
 development schema, or missing required current state, is ignored during restore. pb does not guess
 at missing teammate speech, reconstruct old transcript metadata, or derive absent status and usage
 records from neighboring events.
@@ -311,16 +311,20 @@ compatibility mode and works in the registered repository itself, so another edi
 change those files while a task is running. Content fingerprints prevent stale review or commit
 evidence from being accepted, but they are conflict detection rather than filesystem isolation.
 
-Persisted sessions and their events must use the current v5 schemas. Incompatible development-era
+Persisted sessions and their events must use the current v6 schemas. Incompatible development-era
 notes are skipped during restoration instead of being migrated or shown with guessed attribution.
 The current schema requires every session-state key explicitly, using `null` rather than omission
-for inactive state and rejecting unknown compatibility fields. It stores the session start time,
+for inactive state and rejecting unknown compatibility fields. Lifecycle is represented only by
+`status`; obsolete `running` and `paused` mirrors are not accepted. It stores the session start time,
 Trinity's complete authored chatter (including the username-addressed request to the local user),
 structured commit summaries, typed check/commit evidence,
 registered-project identity, pending proposals, and Goal
 change requests directly so the terminal and browser show the same team conversation and actions
-without reconstructing them from nearby events. Session snapshots and live events share a monotonic
-revision, preventing a slower snapshot response from reverting a newer title or running state.
+without reconstructing them from nearby events. Every successful session transaction advances a
+persisted session revision, independently of the event transcript sequence, and sends its committed
+events followed by the exact resulting snapshot. This includes changes that do not append an event,
+so a slower snapshot response cannot revert a newer title, lifecycle status, pending control, or
+checkpoint.
 The browser addresses registered projects by durable ID rather than copying their names or filesystem
 paths into session, Goal, usage, notification, or integration requests. The service resolves that ID
 and returns structured failures for invalid or stale mutations. Successful controls for an existing
@@ -328,13 +332,15 @@ session return and apply the same revisioned snapshot used by the session stream
 other clients synchronized. The browser therefore does not guess lifecycle state or wait for SSE before
 clearing a completed control. A requested cancellation is explicit while work winds down, and the
 runner's resolved branch and focus root replace requested workspace values as soon as its `started`
-event is published. Live effects at or below
-the accepted snapshot revision are replay,
-while the SSE service sends revisioned session snapshots after state-changing events. When a browser
+event is published. The browser orders event history by event sequence and session state by session
+revision; it never compares those two clocks. The SSE service sends revisioned session snapshots
+after every successful session transaction. When a browser
 reconnect cursor is no longer retained, the service marks the snapshot as a history reset rather
 than joining non-contiguous transcript windows. Project pages consume a server-sent registry,
 session, usage-summary, and terminal-transition snapshot instead of polling separate endpoints. The
-browser supplies its local calendar-day bounds, and pb returns total and today summaries for all
+integration views likewise validate current server responses, use the installed collection returned
+by each install or removal, and prevent an older initial read from overwriting that committed result.
+The browser supplies its local calendar-day bounds, and pb returns total and today summaries for all
 sessions and for every registered project; the browser does not download per-turn usage records to
 recalculate those cards. Each service process gives that stream a new identity and monotonic
 revision, and only the live stream may
@@ -347,7 +353,12 @@ the CLI therefore appear without a browser reload, a session that finishes while
 is being built still produces one finish notification, and project/session identity and usage cannot
 drift between separate requests.
 
-The browser validates the complete v5 session envelope, event variant fields, authored chatter,
+If a registry update commits but pb cannot immediately persist a renamed or moved project's fields
+into one of its restored sessions, the revisioned project snapshot carries that warning to the page
+and terminal. The registry remains committed, and a successful reconciliation clears the warning in
+a later revision.
+
+The browser validates the complete v6 session envelope, event variant fields, authored chatter,
 evidence, and transcript metadata before applying an update. A replaced EventSource connection no
 longer owns callbacks, so a queued message from the previous calendar-day usage stream cannot roll
 the page back after midnight. A registered project with no session is shown as having “No sessions”;
@@ -366,6 +377,19 @@ history and subscribes, recovers a lagged receiver from sequence-numbered histor
 events before reporting that the session finished. Retention may exceed its nominal event count to
 preserve the prior records required to validate server-authored chatter, evidence, supersession,
 and transcript projections on strict restore.
+
+Terminal RPC messages are explicitly tagged. Ordinary commands receive exactly one response or
+error. A watch first receives one acknowledgement and then only typed, session-scoped session-event,
+session-finished, replay-reset, or stream-error frames. Watch completion is a coordinator-authored stream phase after the
+lifecycle event and exact snapshot, including when work safely pauses without a pending question; it
+is not a periodic status check. A live sequence gap without replay reset or a disconnect before the
+finish phase is reported as an error, while an explicit retained-history reset prints a warning. The terminal consequently renders the same authored teammate and
+Trinity chatter as the browser without guessing whether a late object is another command response.
+Session, Goal, deletion, and project-registry controls also receive the exact committed session or
+project/session snapshot. Project command receipts record a UTC-day usage window; browser project
+controls continue to use the browser's supplied local-day bounds. If an ancillary action fails after
+the durable commit, the terminal prints the same typed warning carried to browser clients rather than
+reporting a false failure or silently dropping it.
 
 If a file is missing, binary, symlinked, stale, oversized, or cannot fit the bounded prompt safely,
 pb does not pretend it was read. The normal model/tool path remains available. Automatic deletion
@@ -475,7 +499,7 @@ roll back repository work. A daemon restart likewise never silently resumes Goal
 work restores paused and requires an explicit Resume.
 
 Goal and session cancellation controls are acknowledged only after pb has saved their exact
-checkpoint and event sequence. If the Git note cannot be written, the control fails and the live
+checkpoint, session revision, and event sequence. If the Git note cannot be written, the control fails and the live
 session remains at its previous digest; the browser and terminal therefore cannot display a control
 as accepted when a restart would restore the older state.
 

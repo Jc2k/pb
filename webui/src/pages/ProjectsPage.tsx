@@ -33,6 +33,9 @@ import {
   apiErrorMessage,
   integrationApiError,
   integrationInstallPayload,
+  parseInstalledIntegrationsJson,
+  parseIntegrationConfigSchemaResponseJson,
+  parseMarketplaceIntegrationsJson,
 } from "../lib/integrationConfig";
 import {
   ensureNotificationPermission,
@@ -49,6 +52,7 @@ import {
   projectSessionUrl,
   useProjectSessionData,
 } from "../lib/hooks";
+import { parseSessionResponseJson } from "../lib/eventContract";
 
 export function ProjectsPage() {
   const {
@@ -308,7 +312,7 @@ export function ProjectPage() {
           await apiErrorMessage(res, "Could not start the session"),
         );
       }
-      const data = (await res.json()) as { session_id: string };
+      const data = parseSessionResponseJson(await res.text());
       if (!startRequest.current.owns(controller)) return;
       navigate(`/sessions/${data.session_id}`);
     } catch (error) {
@@ -793,7 +797,7 @@ export function ProjectSettingsPage() {
         );
       }
       const nextInstalled = projectMcpIntegrations(
-        (await res.json()) as InstalledIntegration[],
+        parseInstalledIntegrationsJson(await res.text()),
       );
       if (!installedRequest.current.owns(controller)) return;
       setInstalled(nextInstalled);
@@ -824,9 +828,9 @@ export function ProjectSettingsPage() {
             ),
           );
         }
-        return res.json();
+        return parseMarketplaceIntegrationsJson(await res.text());
       })
-      .then((entries: MarketplaceIntegration[]) => {
+      .then((entries) => {
         if (!marketplaceRequest.current.owns(controller)) return;
         setMarketplace(
           uniqueIntegrations(entries.filter((entry) => entry.kind === "mcp")),
@@ -962,7 +966,9 @@ export function ProjectSettingsPage() {
           ),
         );
       }
-      const metadata = (await res.json()) as IntegrationConfigSchemaResponse;
+      const metadata = parseIntegrationConfigSchemaResponseJson(
+        await res.text(),
+      );
       if (
         schemaRequest.current.id === requestId && !controller.signal.aborted
       ) {
@@ -988,6 +994,7 @@ export function ProjectSettingsPage() {
     }
     setIntegrationMutationError("");
     setSubmitting(false);
+    installedRequest.current.abort();
     const controller = integrationMutationRequest.current.start();
     try {
       const res = await fetch(
@@ -1002,7 +1009,7 @@ export function ProjectSettingsPage() {
         );
       }
       const nextInstalled = projectMcpIntegrations(
-        (await res.json()) as InstalledIntegration[],
+        parseInstalledIntegrationsJson(await res.text()),
       );
       if (!integrationMutationRequest.current.owns(controller)) return;
       setInstalled(nextInstalled);
@@ -1024,6 +1031,7 @@ export function ProjectSettingsPage() {
     if (!project || !pendingInstall) return;
     setSubmitting(true);
     setSubmitError("");
+    installedRequest.current.abort();
     const controller = integrationMutationRequest.current.start();
     try {
       const res = await fetch(
@@ -1043,7 +1051,7 @@ export function ProjectSettingsPage() {
         );
       }
       const nextInstalled = projectMcpIntegrations(
-        (await res.json()) as InstalledIntegration[],
+        parseInstalledIntegrationsJson(await res.text()),
       );
       if (!integrationMutationRequest.current.owns(controller)) return;
       setInstalled(nextInstalled);

@@ -11,7 +11,9 @@ Deno.test("IntegrationList renders mockup-style MCP store actions", () => {
     name: "mcp-sentry",
     kind: "mcp",
     container_image: "ghcr.io/crunchy-pb/mcp-sentry:latest",
+    env: {},
     disabled: false,
+    status: "ready",
   }];
   const marketplace: MarketplaceIntegration[] = [{
     name: "figma-assets",
@@ -48,7 +50,9 @@ Deno.test("IntegrationList offers an explicit upgrade only when a source is avai
     container_image: "ghcr.io/crunchy-pb/lsp-rust-analyzer@sha256:abc",
     source_container_image: "ghcr.io/crunchy-pb/lsp-rust-analyzer:latest",
     verified_manifest_digest: "sha256:abc",
+    env: {},
     disabled: false,
+    status: "ready",
   }];
   const html = renderToString(
     <IntegrationList
@@ -71,6 +75,7 @@ Deno.test("IntegrationList does not let Configure implicitly upgrade a legacy im
     name: "legacy-lsp",
     kind: "lsp",
     container_image: "ghcr.io/crunchy-pb/legacy-lsp:latest",
+    env: {},
     disabled: false,
     status: "legacy_unverified",
   }];
@@ -99,8 +104,12 @@ Deno.test("IntegrationConfigForm blocks an LSP image without a typed package man
       }}
       schemaResponse={{
         container_image: "ghcr.io/crunchy-pb/legacy-lsp:latest",
+        source_container_image: "ghcr.io/crunchy-pb/legacy-lsp:latest",
+        manifest_digest: "sha256:legacy",
         annotation: "uk.unrtd.pb.integration.config-schema",
+        schema: null,
         lsp_manifest_annotation: "uk.unrtd.pb.integration.lsp-manifest",
+        lsp_manifest: null,
       }}
       loading={false}
       onCancel={() => {}}
@@ -128,6 +137,7 @@ Deno.test("IntegrationConfigForm keeps an upgrade open and displays submit failu
         source_container_image: "ghcr.io/crunchy-pb/lsp-rust-analyzer:latest",
         manifest_digest: "sha256:new",
         annotation: "schema",
+        schema: null,
         lsp_manifest_annotation: "manifest",
         lsp_manifest: {
           version: 1,
@@ -135,6 +145,7 @@ Deno.test("IntegrationConfigForm keeps an upgrade open and displays submit failu
           server: {
             args: [],
             language_ids: ["rust"],
+            initialization_options: null,
             workspace_access: "read_only",
             network_access: "none",
             cache_ids: [],

@@ -511,7 +511,7 @@ Tool schemas are derived from this matrix for every stage. A request-level allow
 policy can narrow the set further. Neither can broaden it.
 The legacy model-owned `todo`, `git_commit`, and `git_revert` schemas are retired from every current
 surface. The accepted plan, typed stage artifacts, checkpoint, deterministic checks, and managed
-commit already own that state and authority. Incompatible pre-v5 sessions are not restored, and no
+commit already own that state and authority. Incompatible pre-v6 sessions are not restored, and no
 current allowlist or policy can revive the retired tools.
 
 ## Agent-tool runtime contract
@@ -796,16 +796,17 @@ repeating actor identity in every row. Character attribution is
 presentation over typed events; it never changes a controller event into a model tool call or
 claims that a model requested an automatic action.
 
-The version-5 event envelope is also the shared conversational boundary. Corrections and workflow
+The version-6 event envelope is also the shared conversational boundary. Corrections and workflow
 stops require producer-authored correction kinds and block causes; team messages require a typed
 purpose and embed their own handoff summary when they report an outcome. Rust projects those events
 into required, ordered `chatter` records containing actor, tone, optional headline, plain-language
 message, technical detail, and explicit team-or-user audience. Required transcript metadata
 separately declares visibility, event kind, stable entry identity, explicit supersession, related
-action, a typed tool-presentation summary, whether a terminal summary repeats earlier event copy,
-and the session refresh/running/title effect for live clients. Supersession links are exact entry
-keys retained and supplied by the producer; projection never guesses a replacement by actor,
-wording, or adjacency.
+action, a typed tool-presentation summary, and whether a terminal summary repeats earlier event copy.
+Session title, lifecycle, pending controls, and other current state live only in the revisioned
+session snapshot rather than in event-side effects. Supersession links are exact entry keys retained
+and supplied by the producer; projection never guesses a replacement by actor, wording, or
+adjacency.
 
 Every tool call and result also carries a required durable call ID and batch ID. Results require a
 typed outcome and measured duration, so replay and browser grouping correlate exact calls without a
@@ -822,11 +823,11 @@ Consumers render that split directly instead of extracting a heading from diagno
 The daemon persists the complete envelope and current session state as authored, and replay treats
 both as authoritative. There is no replay hydration, old projection reconstruction, or recovery of
 missing status, title, metrics, usage windows, pending messages, proposals, or Goal-change requests
-from adjacent events. Persisted sessions carry the v5 session schema alongside v5 event envelopes,
+from adjacent events. Persisted sessions carry the v6 session schema alongside v6 event envelopes,
 and malformed or
 incompatible notes are skipped during restoration rather than migrated. Each session also persists
 its durable registered-project ID and resolved display fields instead of asking the browser to
-compare worktree paths or guess a project name. Every v5 state key is present explicitly, including
+compare worktree paths or guess a project name. Every v6 state key is present explicitly, including
 nullable state, and unknown compatibility fields are rejected. Event envelopes carry server-authored chatter, typed
 embedded check/commit evidence for team messages, structured commit summaries, and a strictly
 increasing transcript sequence. Session restoration validates every projection against its payload
@@ -835,14 +836,28 @@ supersession, and admits only unique entry keys in increasing sequence order.
 Lifecycle mutations publish `SessionStateChanged` even when work remains queued behind another
 session, so terminal and browser consumers observe the accepted transition without a REST refresh.
 
-The live event endpoint subscribes before taking its history snapshot, assigns each SSE record the
-durable transcript entry key, and resumes after `Last-Event-ID`. A lagged subscriber is disconnected
-so the browser's normal EventSource reconnection can replay from that cursor. Session list and detail
-responses carry the same latest transcript sequence as a revision. The React client merges HTTP and
-stream data by entry key and sequence, aborts superseded detail requests, and overlays only stream
-effects newer than the response revision, so neither arrival order nor reconnection can revert
-title or lifecycle state. Explicit lifecycle events are published after terminal state changes.
-Terminal,
+The live event endpoint subscribes before taking its history snapshot, assigns each event SSE record
+the durable transcript entry key, and resumes after `Last-Event-ID`. A lagged subscriber is
+disconnected so the browser's normal EventSource reconnection can replay from that cursor. Session
+state has its own persisted monotonic revision, independent of transcript sequence, and every
+successful transaction increments it even when no event is appended. The coordinator publishes the
+committed event envelopes followed by the exact post-commit session snapshot. The React client
+merges event history by entry key and transcript sequence, orders snapshots only by session revision,
+and uses the snapshot's last event as the watermark when replacing an evicted history window. It
+aborts superseded detail requests, so neither HTTP/SSE arrival order nor reconnection can revert title,
+lifecycle state, or eventless state. Explicit lifecycle events and state are installed before either
+publication becomes visible.
+`SessionStatus` is the only lifecycle value in live state, persistence, lifecycle events, and session
+projections. Obsolete `running` and `paused` mirrors are rejected, so neither handlers nor consumers
+can create contradictory lifecycle state. The coordinator compares status
+before and after every full transaction, appends `SessionStateChanged` whenever it changes, and
+derives dispatch when it enters `Queued`. It also derives aggregate metrics and collection
+publication from authoritative usage records instead of accepting a separately maintained total. If the derived change enters
+`Completed` or `Failed`, it also derives the retained transition key. Independently, the coordinator
+detects an active-to-inactive watch change—including a safe pause without a pending question—and
+publishes a finish phase only after event, snapshot, collection, and post-commit-effect publication.
+Handlers do not emit or label lifecycle/watch phases manually. Terminal attachment drains any missing sequence and then closes
+from the finish phase; it does not poll session status to compensate for a missing protocol message. Terminal,
 harness, and web consumers therefore render the same Trinity-authored messages; the browser owns
 only visual layout and optional local-username addressing. It does not parse raw controller JSON,
 recognize event-name prefixes for cache invalidation, compare diagnostic summary wording, scan later

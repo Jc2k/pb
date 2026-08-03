@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   GoalBudget,
   GoalCheckpoint,
@@ -9,6 +9,7 @@ import type {
 import { VoiceInputButton } from "./VoiceInputButton";
 import { apiErrorMessage } from "../lib/integrationConfig";
 import { parseSessionStreamSnapshotJson } from "../lib/eventContract";
+import { isAbortError, LatestRequest } from "../lib/hooks";
 
 interface Props {
   goal: GoalCheckpoint;
@@ -36,9 +37,14 @@ export function GoalAmendmentSheet({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [voiceInputActive, setVoiceInputActive] = useState(false);
+  const amendmentRequest = useRef(new LatestRequest());
+
+  useEffect(() => () => amendmentRequest.current.abort(), []);
+
   const submit = async () => {
     setBusy(true);
     setError("");
+    const controller = amendmentRequest.current.start();
     try {
       const response = await fetch(
         `/api/goals/${goal.run.id}/${initialDraft ? "draft" : "amendments"}`,
@@ -52,26 +58,39 @@ export function GoalAmendmentSheet({
             continuation,
             budget,
           }),
+          signal: controller.signal,
         },
       );
       if (!response.ok) {
-        setError(await apiErrorMessage(response, "Could not update the goal"));
+        const message = await apiErrorMessage(
+          response,
+          "Could not update the goal",
+        );
+        if (amendmentRequest.current.owns(controller)) setError(message);
         return;
       }
-      onSessionUpdated(
-        parseSessionStreamSnapshotJson(await response.text()),
-      );
+      const snapshot = parseSessionStreamSnapshotJson(await response.text());
+      if (!amendmentRequest.current.owns(controller)) return;
+      onSessionUpdated(snapshot);
       onSubmitted();
     } catch (cause) {
+      if (
+        isAbortError(cause) || !amendmentRequest.current.owns(controller)
+      ) return;
       setError(
         cause instanceof Error ? cause.message : "Could not update the goal",
       );
     } finally {
-      setBusy(false);
+      if (amendmentRequest.current.owns(controller)) setBusy(false);
     }
   };
+
+  const close = () => {
+    amendmentRequest.current.abort();
+    onClose();
+  };
   return (
-    <div className="goal-sheet-backdrop" onMouseDown={onClose}>
+    <div className="goal-sheet-backdrop" onMouseDown={close}>
       <section
         className="goal-sheet"
         role="dialog"
@@ -93,7 +112,7 @@ export function GoalAmendmentSheet({
           <button
             className="btn btn-light btn-icon"
             type="button"
-            onClick={onClose}
+            onClick={close}
             aria-label="Close goal editor"
           >
             <i className="bi bi-x-lg"></i>
@@ -218,7 +237,7 @@ export function GoalAmendmentSheet({
           </small>
         </fieldset>
         <footer className="goal-sheet-actions">
-          <button className="btn btn-light" type="button" onClick={onClose}>
+          <button className="btn btn-light" type="button" onClick={close}>
             Cancel
           </button>
           <button

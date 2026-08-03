@@ -62,6 +62,23 @@ export interface UsageWindow {
   end_ms: number;
 }
 
+export function projectSnapshotMatchesUsageWindow(
+  snapshot: ProjectSessionSnapshot,
+  window: UsageWindow,
+): boolean {
+  return snapshot.usage_window_start_ms === window.start_ms &&
+    snapshot.usage_window_end_ms === window.end_ms;
+}
+
+export function projectSnapshotApplicationScope(
+  snapshot: ProjectSessionSnapshot,
+  window: UsageWindow,
+  allowCollectionAcrossUsageWindow: boolean,
+): "reject" | "collection" | "full" {
+  if (projectSnapshotMatchesUsageWindow(snapshot, window)) return "full";
+  return allowCollectionAcrossUsageWindow ? "collection" : "reject";
+}
+
 export function currentUsageWindow(now = new Date()): UsageWindow {
   const start = new Date(now);
   start.setHours(0, 0, 0, 0);
@@ -169,6 +186,8 @@ export function useProjectSessionData(
   const [dataLoading, setDataLoading] = useState(true);
   const [dataError, setDataError] = useState("");
   const [hasSnapshot, setHasSnapshot] = useState(false);
+  const usageWindowRef = useRef(usageWindow);
+  usageWindowRef.current = usageWindow;
   const dataRequest = useRef(new LatestRequest());
   const streamSubscription = useRef(new LatestSubscription());
   const streamCursor = useRef(new ProjectSessionStreamCursor());
@@ -176,12 +195,17 @@ export function useProjectSessionData(
   const applySnapshot = useCallback((
     text: string,
     source: ProjectSessionSnapshotSource,
+    allowCollectionAcrossUsageWindow = false,
   ) => {
     const snapshot = parseProjectSessionSnapshotJson(text);
+    const scope = projectSnapshotApplicationScope(
+      snapshot,
+      usageWindowRef.current,
+      allowCollectionAcrossUsageWindow,
+    );
+    if (scope === "reject") return;
     const decision = streamCursor.current.accept(snapshot, source);
     if (!decision) return;
-    setDataError("");
-    setDataLoading(false);
     if (finishNotifications) {
       for (const transition of decision.terminalTransitions) {
         void notifySessionFinished(transition).catch((error) => {
@@ -193,15 +217,22 @@ export function useProjectSessionData(
       }
     }
     if (!decision.applyData) return;
+    setDataError(snapshot.warnings.join(" "));
+    setDataLoading(false);
     setHasSnapshot(true);
     setProjects(snapshot.projects);
     setSessions(snapshot.sessions);
-    setOverallUsage(snapshot.overall_usage);
-    setProjectUsage(snapshot.project_usage);
+    if (scope === "full") {
+      setOverallUsage(snapshot.overall_usage);
+      setProjectUsage(snapshot.project_usage);
+    }
   }, [finishNotifications]);
 
   const applyServerSnapshot = useCallback((text: string) => {
-    applySnapshot(text, "http");
+    // A project mutation receipt remains authoritative for its revisioned collection if the local
+    // day rolls over while the request is in flight. Its old-window aggregates are not applied;
+    // the already-open stream supplies the new window without making mutation success depend on it.
+    applySnapshot(text, "http", true);
   }, [applySnapshot]);
 
   const fetchData = useCallback(async () => {

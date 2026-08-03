@@ -309,7 +309,7 @@ and it cannot supply an approval, check result, review judgment, or semantic com
 In user-facing transcripts, Trinity Walker may speak for this deterministic workflow stewardship,
 but the durable event continues to record controller origin, the assisting profile, and its receipt.
 Model-requested actions are attributed to that profile's character. The presentation labels these
-origins **Model** and **Harness**. The v5 event contract requires the producer to identify every
+origins **Model** and **Harness**. The v6 event contract requires the producer to identify every
 model invocation, tool action, controller action, and deterministic correction; consumers never
 borrow a character from adjacent chat. Harness validation messages summarize the teammate mistake
 in plain language and keep the durable structured evidence in a hover-information or
@@ -437,24 +437,45 @@ returns the exact registry it committed, and an independently owned task reconci
 caches, and collection revision under one lock order. There is no fallible post-commit registry
 reload and a disconnected HTTP or RPC caller cannot strand memory behind disk. Project mutations
 return the same revisioned snapshot shape as the stream, so the browser can apply the authoritative
-result even while SSE is reconnecting and can continue displaying its last valid snapshot as stale data.
+result even while SSE is reconnecting and can continue displaying its last valid snapshot as stale
+data. If the registry commits but a restored session projection cannot be persisted, that condition
+is retained as a typed warning in the same collection publication; a later successful reconciliation
+clears it under a new revision instead of hiding the partial repair in a log.
 Existing-session and Goal mutations likewise return the exact revisioned session snapshot used by the
 session stream. New-session creation returns identity for navigation; starting a Goal in an existing
 session uses the session mutation endpoint and returns the session snapshot. Cancellation requests and
 the runner-resolved branch and focus root are explicit session state rather than browser inference or
-event-sink-only persistence. Goal and cancellation mutations publish only after their digest checks,
-checkpoint rebuild, any parent-Task fold, and the exact durable session write all succeed. The durable
-write is serialized with autonomous event snapshots and includes terminal lifecycle events, preventing
-an older writer from replacing an acknowledged checkpoint. A rejected or unpersistable mutation cannot
-leak partial state or transcript events. Terminal RPC results retain the changed Goal's identity and
-committed digest even if the session snapshot has already advanced to another Goal Task. A missing
-session on the session-scoped Goal route is a typed `session_not_found` response rather than Goal-input
-rejection.
-Each session event sender owns the collection publisher, so every state-affecting event appends its
-history entry and publishes the matching collection revision synchronously while the caller holds the
-session lock. There is no asynchronous watcher reconstructing collection transitions after delivery.
-Checkpoint-only projection changes publish through that same boundary. Terminal publication additionally
-captures the immutable task, title, handoff, and registered-project projection at that transition.
+event-sink-only persistence. Durable domain fields are held in `SessionRecord`; process-local senders,
+queues, and cancellation handles are held in `SessionRuntime`. Only the `AppState` coordinator can
+insert, remove, persist, install, revise, or publish a session. Each transaction stages an isolated
+record and transcript, writes their exact persistent projection, installs the complete record, and
+then sends committed events followed by its exact snapshot through a passive session sender. Every
+successful transaction advances an independent persisted session revision, including eventless
+checkpoint changes. A rejected or unpersistable mutation therefore cannot leak
+partial state or transcript events, while cancellation of an HTTP/RPC caller cannot split a transaction
+that is already owned by the coordinator.
+
+Collection publication is derived by comparing the serialized row before and after the transaction,
+plus committed usage or terminal-event effects; endpoint code does not have to remember a publication
+flag. Terminal publication additionally captures the immutable task, title, handoff, and
+registered-project projection at that transition. Post-commit environment cleanup cannot turn the
+authoritative success into an error: its failure is returned and streamed as a typed warning on the
+same exact snapshot. Terminal RPC results retain the changed Goal's identity and committed digest even
+if the session snapshot has already advanced to another Goal Task. A missing session on the
+session-scoped Goal route is a typed `session_not_found` response rather than Goal-input rejection.
+
+The Unix RPC protocol uses a tagged frame enum instead of objects whose meaning depends on field
+presence. Unary calls receive exactly one `response` or `error`. A watch call receives one response
+acknowledgement and then only session-scoped `session_event`, `session_finished`, `replay_reset`, or
+`stream_error` frames. The client requires contiguous live event sequences, validates reset cursors and every frame's session ID,
+and treats EOF before `session_finished` as failure. A replay gap is
+therefore explicit, and a post-ack stream failure cannot be mistaken for a second request response.
+Existing-session, Goal, deletion, and project-registry RPC mutations return typed receipts containing
+the same exact session or collection snapshot as the web boundary, in addition to their command
+identity. Project receipts are captured before the registry transaction releases its lock, rather
+than by a later collection read; terminal-only calls use an explicit UTC-day usage window recorded
+in that snapshot. The CLI prints typed post-commit warnings from session receipts instead of losing
+them at the adapter boundary.
 Session deletion
 does not report failure after removing the authoritative record: a
 durable-record failure leaves the session intact, while later environment or workspace cleanup

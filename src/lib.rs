@@ -33,6 +33,7 @@ pub mod config;
 pub mod container;
 mod control_layers;
 pub mod daemon_client;
+pub mod daemon_protocol;
 pub mod energy;
 pub mod environment;
 pub mod environment_lock;
@@ -2115,7 +2116,7 @@ async fn run_projects_command(command: ProjectsCommand) -> Result<()> {
     match command {
         ProjectsCommand::Add(args) => {
             let socket_path = resolve_socket_path(args.socket_path.clone(), &user_config);
-            let entry = daemon_client::add_project(
+            let receipt = daemon_client::add_project(
                 &socket_path,
                 projects::AddProjectRequest {
                     name: args.name,
@@ -2123,6 +2124,10 @@ async fn run_projects_command(command: ProjectsCommand) -> Result<()> {
                 },
             )
             .await?;
+            for warning in &receipt.snapshot.warnings {
+                eprintln!("warning: {warning}");
+            }
+            let entry = receipt.value;
             println!("added project {}\t{}", entry.name, entry.path);
         }
         ProjectsCommand::List(args) => {
@@ -2138,11 +2143,15 @@ async fn run_projects_command(command: ProjectsCommand) -> Result<()> {
         }
         ProjectsCommand::Rm(args) => {
             let socket_path = resolve_socket_path(args.socket_path.clone(), &user_config);
-            let entry = daemon_client::remove_project(
+            let receipt = daemon_client::remove_project(
                 &socket_path,
                 projects::RemoveProjectRequest { name: args.name },
             )
             .await?;
+            for warning in &receipt.snapshot.warnings {
+                eprintln!("warning: {warning}");
+            }
+            let entry = receipt.value;
             println!("removed project {}\t{}", entry.name, entry.path);
         }
     }
@@ -2154,16 +2163,20 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
     let socket_path = resolve_socket_path(args.socket_path.clone(), &user_config);
 
     if let Some(session_id) = args.delete_session.clone() {
-        let deleted = daemon_client::delete_session(&socket_path, session_id).await?;
-        println!("deleted session {}", deleted.session_id);
-        for warning in deleted.cleanup_warnings {
+        let receipt = daemon_client::delete_session(&socket_path, session_id).await?;
+        println!("deleted session {}", receipt.deletion.session_id);
+        for warning in &receipt.deletion.cleanup_warnings {
+            eprintln!("warning: {warning}");
+        }
+        for warning in &receipt.snapshot.warnings {
             eprintln!("warning: {warning}");
         }
         return Ok(());
     }
 
     if let Some(session_id) = args.resume_session.clone() {
-        daemon_client::resume_session(&socket_path, session_id.clone()).await?;
+        let receipt = daemon_client::resume_session(&socket_path, session_id.clone()).await?;
+        print_session_warnings(&receipt.snapshot);
         println!("resumed queued session {session_id}");
         if !args.no_follow {
             daemon_client::watch_session(&socket_path, session_id).await?;
@@ -2180,7 +2193,7 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
             .answer
             .clone()
             .context("--answer-question requires --answer <text>")?;
-        daemon_client::answer_question(
+        let receipt = daemon_client::answer_question(
             &socket_path,
             session_id.clone(),
             web::AnswerQuestionRequest {
@@ -2189,6 +2202,7 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
             },
         )
         .await?;
+        print_session_warnings(&receipt.snapshot);
         println!("answered question for session {session_id}");
         return Ok(());
     }
@@ -2203,13 +2217,7 @@ async fn run_queue(args: QueueArgs) -> Result<()> {
             let status = match session.status {
                 session_store::SessionStatus::Queued => "queued",
                 session_store::SessionStatus::Running => "running",
-                session_store::SessionStatus::Paused => {
-                    if session.paused {
-                        "paused"
-                    } else {
-                        "paused-restored"
-                    }
-                }
+                session_store::SessionStatus::Paused => "paused",
                 session_store::SessionStatus::Completed => "completed",
                 session_store::SessionStatus::Failed => "failed",
             };
@@ -2295,7 +2303,7 @@ async fn run_goal_command(command: GoalCommand) -> Result<()> {
             } else {
                 goal::GoalContinuationPolicy::ReviewPlanThenAutomatic
             };
-            let response = daemon_client::start_goal(
+            let receipt = daemon_client::start_goal(
                 &socket_path,
                 web::StartGoalRequest {
                     session_id: None,
@@ -2316,6 +2324,8 @@ async fn run_goal_command(command: GoalCommand) -> Result<()> {
                 },
             )
             .await?;
+            print_session_warnings(&receipt.snapshot);
+            let response = receipt.response;
             println!(
                 "goal {} created in session {}; review and approve plan {}",
                 response.goal_id, response.session_id, response.goal_sha256
@@ -2326,26 +2336,43 @@ async fn run_goal_command(command: GoalCommand) -> Result<()> {
         }
         GoalCommand::Pause { goal_id } => {
             let checkpoint = daemon_client::get_goal(&socket_path, goal_id.clone()).await?;
-            daemon_client::pause_goal(&socket_path, goal_id.clone(), checkpoint.sha256).await?;
+            let receipt =
+                daemon_client::pause_goal(&socket_path, goal_id.clone(), checkpoint.sha256).await?;
+            print_session_warnings(&receipt.snapshot);
             println!("pause requested for goal {goal_id}");
         }
         GoalCommand::Resume { goal_id } => {
             let checkpoint = daemon_client::get_goal(&socket_path, goal_id.clone()).await?;
-            daemon_client::resume_goal(&socket_path, goal_id.clone(), checkpoint.sha256).await?;
+            let receipt =
+                daemon_client::resume_goal(&socket_path, goal_id.clone(), checkpoint.sha256)
+                    .await?;
+            print_session_warnings(&receipt.snapshot);
             println!("resumed goal {goal_id}");
         }
         GoalCommand::Cancel { goal_id } => {
             let checkpoint = daemon_client::get_goal(&socket_path, goal_id.clone()).await?;
-            daemon_client::cancel_goal(&socket_path, goal_id.clone(), checkpoint.sha256).await?;
+            let receipt =
+                daemon_client::cancel_goal(&socket_path, goal_id.clone(), checkpoint.sha256)
+                    .await?;
+            print_session_warnings(&receipt.snapshot);
             println!("stopped goal {goal_id}; repository work was preserved");
         }
         GoalCommand::Accept { goal_id } => {
             let checkpoint = daemon_client::get_goal(&socket_path, goal_id.clone()).await?;
-            daemon_client::accept_goal(&socket_path, goal_id.clone(), checkpoint.sha256).await?;
+            let receipt =
+                daemon_client::accept_goal(&socket_path, goal_id.clone(), checkpoint.sha256)
+                    .await?;
+            print_session_warnings(&receipt.snapshot);
             println!("accepted goal {goal_id}");
         }
     }
     Ok(())
+}
+
+fn print_session_warnings(snapshot: &web::SessionStreamSnapshot) {
+    for warning in &snapshot.warnings {
+        eprintln!("warning: {warning}");
+    }
 }
 
 fn resolve_socket_path(cli_path: Option<PathBuf>, user_config: &UserConfig) -> PathBuf {

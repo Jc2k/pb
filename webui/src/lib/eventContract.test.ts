@@ -4,8 +4,10 @@ import {
   eventFields,
   parseDeleteSessionMutationResponseJson,
   parseEventEnvelopeJson,
+  parseGoalResponseJson,
   parseProjectSessionSnapshotJson,
   parseSessionDetailsJson,
+  parseSessionResponseJson,
   parseSessionStreamSnapshotJson,
 } from "./eventContract.ts";
 
@@ -287,7 +289,6 @@ Deno.test("Rust and TypeScript expose the same event and profile variants", asyn
       "entry_key: string",
       "supersedes: string[]",
       "summary_redundant: boolean",
-      "session_effect: SessionEffect",
       "cause: WorkflowBlockCause",
       "purpose: TeamMessagePurpose",
       "kind: CorrectionKind",
@@ -300,6 +301,7 @@ Deno.test("Rust and TypeScript expose the same event and profile variants", asyn
       "started_at_ms: number",
       "usage_records: SessionMetricsSnapshot[]",
       "reset_history: boolean",
+      "warnings: string[]",
       "id: string",
       "stream_id: string",
       "terminal_transition_floor: number",
@@ -311,24 +313,63 @@ Deno.test("Rust and TypeScript expose the same event and profile variants", asyn
       "revision: number",
       "overall_usage: ProjectUsageSummary",
       "project_usage: Record<string, ProjectUsageSummary>",
+      "warnings: string[]",
       "total: ProjectUsageStats",
       "today: ProjectUsageStats",
     ]
   ) {
     if (!types.includes(required)) {
-      throw new Error(`missing required v5 event field: ${required}`);
+      throw new Error(`missing required v6 event field: ${required}`);
     }
   }
 });
 
-Deno.test("v5 browser parsing rejects obsolete event envelopes", () => {
+Deno.test("v6 browser parsing rejects obsolete event envelopes", () => {
   throws(
     () => parseEventEnvelopeJson('{"version":"v4"}'),
-    /unsupported event schema 'v4'; expected 'v5'/,
+    /unsupported event schema 'v4'; expected 'v6'/,
   );
 });
 
-Deno.test("v5 session stream parsing rejects wrapper drift", () => {
+Deno.test("session and goal start responses have exact runtime contracts", () => {
+  deepEqual(parseSessionResponseJson('{"session_id":"session-1"}'), {
+    session_id: "session-1",
+  });
+  deepEqual(
+    parseGoalResponseJson(
+      '{"session_id":"session-1","goal_id":"goal-1","goal_sha256":"abc"}',
+    ),
+    {
+      session_id: "session-1",
+      goal_id: "goal-1",
+      goal_sha256: "abc",
+    },
+  );
+  throws(
+    () => parseSessionResponseJson('{"session_id":"session-1","running":true}'),
+    /session start response contains unknown field running/,
+  );
+  throws(
+    () => parseSessionResponseJson("{}"),
+    /session start response is missing field session_id/,
+  );
+  throws(
+    () =>
+      parseGoalResponseJson(
+        '{"session_id":"session-1","goal_id":"goal-1"}',
+      ),
+    /goal start response is missing field goal_sha256/,
+  );
+  throws(
+    () =>
+      parseGoalResponseJson(
+        '{"session_id":"session-1","goal_id":"goal-1","goal_sha256":"abc","refresh":true}',
+      ),
+    /goal start response contains unknown field refresh/,
+  );
+});
+
+Deno.test("v6 session stream parsing rejects wrapper drift", () => {
   throws(
     () =>
       parseSessionStreamSnapshotJson(
@@ -340,11 +381,18 @@ Deno.test("v5 session stream parsing rejects wrapper drift", () => {
     () => parseSessionStreamSnapshotJson(JSON.stringify({ session: {} })),
     /session stream snapshot is missing field reset_history/,
   );
+  throws(
+    () =>
+      parseSessionStreamSnapshotJson(
+        JSON.stringify({ session: {}, reset_history: false }),
+      ),
+    /session stream snapshot is missing field warnings/,
+  );
 });
 
-Deno.test("v5 browser parsing rejects incomplete event and session projections", () => {
+Deno.test("v6 browser parsing rejects incomplete event and session projections", () => {
   const envelope = {
-    version: "v5",
+    version: "v6",
     event: { type: "session_metrics" },
     chatter: [],
     evidence: [],
@@ -355,7 +403,6 @@ Deno.test("v5 browser parsing rejects incomplete event and session projections",
       entry_key: "session_metrics:1",
       supersedes: [],
       summary_redundant: false,
-      session_effect: { running: "unchanged", reset_intent: false },
     },
   };
   throws(
@@ -413,6 +460,17 @@ Deno.test("v5 browser parsing rejects incomplete event and session projections",
       parseSessionDetailsJson('{"session_id":"s","revision":0,"events":[]}'),
     /session snapshot is missing field task/,
   );
+  envelope.event = {
+    type: "session_state_changed",
+    status: "completed",
+    running: true,
+    paused: false,
+  } as typeof envelope.event;
+  envelope.chatter = [];
+  throws(
+    () => parseEventEnvelopeJson(JSON.stringify(envelope)),
+    /event payload session_state_changed contains unknown field running/,
+  );
 });
 
 Deno.test("project snapshot parsing validates terminal transition semantics", () => {
@@ -447,8 +505,6 @@ Deno.test("project snapshot parsing validates terminal transition semantics", ()
       session_id: "session-1",
       task: "finish the event boundary",
       title: "Boundary complete",
-      running: false,
-      paused: false,
       status: "completed",
       intent: "deliver",
       branch: "feature/boundary",
@@ -481,10 +537,18 @@ Deno.test("project snapshot parsing validates terminal transition semantics", ()
         today: { tokens: 2, runtime_ms: 3, tool_calls: 1 },
       },
     },
+    warnings: [],
   };
   deepEqual(
     parseProjectSessionSnapshotJson(JSON.stringify(snapshot)),
     snapshot,
+  );
+  const contradictoryLifecycle = structuredClone(snapshot);
+  Object.assign(contradictoryLifecycle.sessions[0], { running: true });
+  throws(
+    () =>
+      parseProjectSessionSnapshotJson(JSON.stringify(contradictoryLifecycle)),
+    /session 0 contains unknown field running/,
   );
   const deletionResponse = {
     deletion: {
@@ -576,6 +640,12 @@ Deno.test("project snapshot parsing validates terminal transition semantics", ()
     () => parseProjectSessionSnapshotJson(JSON.stringify(missingProjectUsage)),
     /contain every project exactly once/,
   );
+  const invalidWarnings = structuredClone(snapshot);
+  (invalidWarnings as { warnings: unknown[] }).warnings = [42];
+  throws(
+    () => parseProjectSessionSnapshotJson(JSON.stringify(invalidWarnings)),
+    /project session warnings must be strings/,
+  );
   const invalidSession = structuredClone(snapshot);
   invalidSession.sessions[0].status = "finished";
   throws(
@@ -605,6 +675,9 @@ Deno.test("Rust and TypeScript collection structs keep exact fields", async () =
       "ProjectSessionSnapshot",
       "ProjectSessionTerminalTransition",
       "ProjectUsageSummary",
+      "SessionStreamSnapshot",
+      "SessionResponse",
+      "GoalResponse",
       "DeleteSessionResponse",
       "DeleteSessionMutationResponse",
     ]
@@ -639,6 +712,7 @@ Deno.test("session and project stream boundaries are server-authored", async () 
     const required of [
       'event("session_snapshot")',
       "reset_history: bool",
+      "warnings: Vec<String>",
       'route("/api/sessions/{id}/goal", post(start_session_goal))',
       "pub struct ProjectSessionSnapshot",
       "pub stream_id: String",
@@ -646,6 +720,7 @@ Deno.test("session and project stream boundaries are server-authored", async () 
       "pub usage_window_end_ms: u64",
       "pub terminal_transition_floor: u64",
       "pub terminal_transitions: Vec<ProjectSessionTerminalTransition>",
+      "pub warnings: Vec<String>",
       'route("/api/project-sessions", get(list_project_sessions))',
       '"/api/project-sessions/events"',
       '.event("project_session_snapshot")',
@@ -660,6 +735,7 @@ Deno.test("session and project stream boundaries are server-authored", async () 
     const required of [
       "export interface SessionStreamSnapshot",
       "reset_history: boolean",
+      "warnings: string[]",
       "cancel_requested: boolean",
       "export interface ProjectSessionSnapshot",
     ]
@@ -679,6 +755,19 @@ Deno.test("session and project stream boundaries are server-authored", async () 
   if (!hooks.includes('projectSessionUrl("/api/project-sessions"')) {
     throw new Error("project pages do not consume the atomic server snapshot");
   }
+  const notificationMutation = server.slice(
+    server.indexOf("async fn update_project_notifications("),
+    server.indexOf("async fn get_settings("),
+  );
+  if (
+    !notificationMutation.includes(".commit_project_registry_owned(") ||
+    !notificationMutation.includes("usage_window") ||
+    notificationMutation.includes("project_session_snapshot(&state")
+  ) {
+    throw new Error(
+      "project notification mutation reconstructs its collection receipt after commit",
+    );
+  }
   if (
     !hooks.includes('"/api/project-sessions/events"') ||
     !hooks.includes("projectSessionUrl(") ||
@@ -697,7 +786,259 @@ Deno.test("session and project stream boundaries are server-authored", async () 
   }
 });
 
-Deno.test("v5 consumers do not reconstruct omitted server state", async () => {
+Deno.test("session writes and terminal frames have one type-enforced boundary", async () => {
+  const [server, store, protocol, client, events, sessionPage] = await Promise
+    .all([
+      Deno.readTextFile("src/web.rs"),
+      Deno.readTextFile("src/session_store.rs"),
+      Deno.readTextFile("src/daemon_protocol.rs"),
+      Deno.readTextFile("src/daemon_client.rs"),
+      Deno.readTextFile("src/events.rs"),
+      Deno.readTextFile("webui/src/pages/SessionPage.tsx"),
+    ]);
+  for (
+    const required of [
+      "struct SessionRecord",
+      "struct SessionRuntime",
+      "session.record = staged.record;",
+      "commit_session_change_owned",
+      "commit_session_change_owned_after",
+      "create_session_owned",
+      "claim_next_session_owned",
+      "delete_session_owned",
+      "pub struct ProjectMutationReceipt",
+      "commit_project_registry_owned",
+      "publish_project_session_reconciliation",
+      "SessionPersistenceError",
+      "pub struct SessionMutationReceipt",
+      "pub struct GoalMutationReceipt",
+      "dispatch_unary_rpc",
+      "enum SessionStreamPublication",
+      "SessionStreamPublication::Finished",
+      "publish_committed",
+    ]
+  ) {
+    if (!server.includes(required)) {
+      throw new Error(`missing atomic session boundary: ${required}`);
+    }
+  }
+  for (
+    const obsolete of [
+      "persist_session_snapshot",
+      "persist_live_session",
+      "persist_authoritative_session",
+      "project_session_publisher",
+      "CollectionPublication",
+      "struct RpcResponse",
+      "struct RpcNotification",
+      "fn publish_collection(mut self)",
+      "StagedSessionChange::terminal",
+      ".dispatch()",
+      "fn publish_session_state_changed",
+    ]
+  ) {
+    if (server.includes(obsolete)) {
+      throw new Error(`obsolete protocol workaround returned: ${obsolete}`);
+    }
+  }
+  const coordinatorEnd = server.indexOf(
+    "// `deno task build:web` refreshes these assets",
+  );
+  const testsStart = server.indexOf("#[cfg(test)]");
+  if (coordinatorEnd < 0 || testsStart < 0) {
+    throw new Error("could not locate the server coordinator boundary");
+  }
+  const productionOutsideCoordinator = server.slice(coordinatorEnd, testsStart);
+  if (
+    /sessions\s*\.\s*(?:get_mut|values_mut|insert|remove)\b/.test(
+      productionOutsideCoordinator,
+    )
+  ) {
+    throw new Error(
+      "production session collection mutation bypasses AppState's coordinator",
+    );
+  }
+  if (!store.includes("pub(crate) trait SessionRepository")) {
+    throw new Error("session persistence is not injectable");
+  }
+  if (
+    store.includes("pub fn save_session") ||
+    store.includes("pub fn delete_session")
+  ) {
+    throw new Error(
+      "direct production session persistence entry point returned",
+    );
+  }
+  const sessionStream = server.slice(
+    server.indexOf("async fn session_events("),
+    server.indexOf("fn session_event_sse_event("),
+  );
+  if (
+    sessionStream.includes("session_details_snapshot") ||
+    !sessionStream.includes("SessionStreamPublication::Snapshot")
+  ) {
+    throw new Error(
+      "session SSE reconstructs state after publication instead of carrying the committed receipt",
+    );
+  }
+  if (
+    events.includes("session_effect") ||
+    sessionPage.includes("transcript.session_effect")
+  ) {
+    throw new Error(
+      "the browser event contract is reconstructing lifecycle state outside the committed snapshot",
+    );
+  }
+  if (/transcript\.sequence\s*[<>]=?\s*details\.revision/.test(sessionPage)) {
+    throw new Error(
+      "the browser is comparing the event and session revision clocks",
+    );
+  }
+  const answerTransaction = server.slice(
+    server.indexOf("async fn answer_question_inner("),
+    server.indexOf("fn session_history_summary("),
+  );
+  if (
+    !answerTransaction.includes("commit_session_change_owned_after") ||
+    answerTransaction.includes("let (responder, answer) = commit.value")
+  ) {
+    throw new Error(
+      "question delivery escaped the cancellation-safe commit owner",
+    );
+  }
+  const registryReload = server.slice(
+    server.indexOf("async fn reload_projects("),
+    server.indexOf("async fn reconcile_project_registry("),
+  );
+  if (
+    !registryReload.includes(".commit_project_registry_owned(") ||
+    registryReload.includes("state.projects.lock().await")
+  ) {
+    throw new Error(
+      "project registry reload bypasses the cancellation-safe coordinator",
+    );
+  }
+  for (
+    const required of [
+      '#[serde(tag = "frame", rename_all = "snake_case", deny_unknown_fields)]',
+      "SessionEvent",
+      "SessionFinished",
+      "ReplayReset",
+      "StreamError",
+    ]
+  ) {
+    if (!protocol.includes(required)) {
+      throw new Error(`missing tagged daemon protocol contract: ${required}`);
+    }
+  }
+  const sessionEventFrame = protocol.slice(
+    protocol.indexOf("SessionEvent {"),
+    protocol.indexOf("SessionFinished {"),
+  );
+  if (
+    protocol.includes("Notification {") ||
+    !sessionEventFrame.includes("session_id: String") ||
+    !client.includes("RpcFrame::SessionEvent") ||
+    !client.includes("RpcFrame::SessionFinished") ||
+    !client.includes("RpcFrame::ReplayReset") ||
+    !client.includes("RpcFrame::StreamError") ||
+    !client.includes("daemon streamed session") ||
+    !client.includes("before session_finished") ||
+    !client.includes("without replay_reset")
+  ) {
+    throw new Error(
+      "terminal client does not consume replay and stream phases",
+    );
+  }
+  const terminalWatch = server.slice(
+    server.indexOf("async fn stream_session_watch("),
+    server.indexOf("async fn write_session_event("),
+  );
+  if (
+    !terminalWatch.includes("SessionStreamPublication::Finished") ||
+    terminalWatch.includes("tokio::time::sleep")
+  ) {
+    throw new Error("terminal watch is polling around a missing finish phase");
+  }
+  if (
+    !server.includes("warnings: publication.warnings.clone()") ||
+    !server.includes(
+      "project_reconciliation_failure_is_revisioned_until_a_retry_clears_it",
+    ) ||
+    !client.includes("ProjectMutationReceipt<ProjectEntry>")
+  ) {
+    throw new Error(
+      "project reconciliation warnings are not retained across adapters",
+    );
+  }
+  const sessionRecord = server.slice(
+    server.indexOf("struct SessionRecord"),
+    server.indexOf("struct SessionRuntime"),
+  );
+  const persistedSession = store.slice(
+    store.indexOf("pub struct PersistedSession"),
+    store.indexOf("impl PersistedSession"),
+  );
+  const sessionListItem = server.slice(
+    server.indexOf("pub struct SessionListItem"),
+    server.indexOf("pub struct ProjectSessionSnapshot"),
+  );
+  const sessionDetails = server.slice(
+    server.indexOf("pub struct SessionDetails"),
+    server.indexOf("pub struct SessionStreamSnapshot"),
+  );
+  const lifecycleEvent = events.slice(
+    events.indexOf("SessionStateChanged {"),
+    events.indexOf("LlmInvocation {"),
+  );
+  if (
+    sessionRecord.includes("running:") ||
+    sessionRecord.includes("paused:") ||
+    persistedSession.includes("running:") ||
+    persistedSession.includes("paused:") ||
+    sessionListItem.includes("running:") ||
+    sessionListItem.includes("paused:") ||
+    sessionDetails.includes("running:") ||
+    sessionDetails.includes("paused:") ||
+    lifecycleEvent.includes("running:") ||
+    lifecycleEvent.includes("paused:") ||
+    !server.includes("change.effects.dispatch |=") ||
+    !server.includes("change.effects.publish_collection |= usage_changed") ||
+    !server.includes(
+      "staged.metrics = combined_metrics(&staged_usage_records)",
+    ) ||
+    !server.includes("let lifecycle_changed =") ||
+    !server.includes(
+      "lifecycle_changed.then(|| stage_session_state_changed(&staged))",
+    ) ||
+    !server.includes("let became_terminal = !was_terminal") ||
+    !server.includes("let terminal_entry_key = became_terminal.then(||") ||
+    !server.includes(
+      "let watch_finished = watch_active_before && !session_watch_active(&staged)",
+    ) ||
+    !server.includes("publish_finished: commit.watch_finished")
+  ) {
+    throw new Error(
+      "lifecycle event, terminal transition, or watch finish ordering still depends on handlers",
+    );
+  }
+  for (
+    const receipt of [
+      "Result<SessionMutationReceipt>",
+      "Result<GoalMutationReceipt>",
+      "Result<DeleteSessionMutationResponse>",
+      "Result<ProjectMutationReceipt<ProjectEntry>>",
+    ]
+  ) {
+    if (!client.includes(receipt)) {
+      throw new Error(
+        `terminal mutation dropped its committed receipt: ${receipt}`,
+      );
+    }
+  }
+});
+
+Deno.test("v6 consumers do not reconstruct omitted server state", async () => {
   const [helpers, hooks, session, sessionPage, projectsPage, energy] =
     await Promise
       .all([
@@ -734,13 +1075,13 @@ Deno.test("v5 consumers do not reconstruct omitted server state", async () => {
       sessionPage.includes(workaround) || projectsPage.includes(workaround)
     ) {
       throw new Error(
-        `v5 UI still reconstructs server state with: ${workaround}`,
+        `v6 UI still reconstructs server state with: ${workaround}`,
       );
     }
   }
   if (energy.includes("legacy") || energy.includes("llm_energy_kwh ??")) {
     throw new Error(
-      "v5 energy totals still contain a legacy snapshot fallback",
+      "v6 energy totals still contain a legacy snapshot fallback",
     );
   }
 });

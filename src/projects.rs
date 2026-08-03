@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static PROJECT_ID_FALLBACK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectEntry {
     #[serde(default)]
     pub id: String,
@@ -20,23 +21,27 @@ pub struct ProjectEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct ProjectRegistry {
     #[serde(default)]
     projects: Vec<ProjectEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddProjectRequest {
     pub name: Option<String>,
     pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemoveProjectRequest {
     pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateProjectNotificationsRequest {
     pub notify_on_finish: bool,
 }

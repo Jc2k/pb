@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { PageShell } from "../components/PageShell";
 import { IntentControl } from "../components/IntentControl";
@@ -15,18 +15,28 @@ import {
 } from "../components/SessionDashboard";
 import type { ComposerMode, SessionAttachment } from "../types";
 import { relativeTime } from "../lib/helpers";
-import { useProjectSessionData } from "../lib/hooks";
+import {
+  isAbortError,
+  LatestRequest,
+  useProjectSessionData,
+} from "../lib/hooks";
+import { apiErrorMessage } from "../lib/integrationConfig";
+import { parseSessionResponseJson } from "../lib/eventContract";
 
 export function HomePage() {
   const [task, setTask] = useState("");
   const [intent, setIntent] = useState<ComposerMode>("discuss");
   const [goalOpen, setGoalOpen] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState("");
   const [voiceInputActive, setVoiceInputActive] = useState(false);
   const [images, setImages] = useState<SessionAttachment[]>([]);
   const [filter, setFilter] = useState<SessionFilter>("all");
   const { sessions, projects, overallUsage } = useProjectSessionData();
+  const startRequest = useRef(new LatestRequest());
   const navigate = useNavigate();
+
+  useEffect(() => () => startRequest.current.abort(), []);
 
   const counts = useMemo(() => sessionCounts(sessions), [sessions]);
   const visibleSessions = filter === "all"
@@ -46,6 +56,8 @@ export function HomePage() {
       return;
     }
     setIsSubmitting(true);
+    setSubmitError("");
+    const controller = startRequest.current.start();
     try {
       const res = await fetch("/api/sessions", {
         method: "POST",
@@ -55,12 +67,23 @@ export function HomePage() {
           intent,
           attachments: images,
         }),
+        signal: controller.signal,
       });
-      if (!res.ok) return;
-      const data = (await res.json()) as { session_id: string };
+      if (!res.ok) {
+        throw new Error(
+          await apiErrorMessage(res, "Could not start the session"),
+        );
+      }
+      const data = parseSessionResponseJson(await res.text());
+      if (!startRequest.current.owns(controller)) return;
       navigate(`/sessions/${data.session_id}`);
+    } catch (error) {
+      if (isAbortError(error) || !startRequest.current.owns(controller)) return;
+      setSubmitError(
+        error instanceof Error ? error.message : "Could not start the session",
+      );
     } finally {
-      setIsSubmitting(false);
+      if (startRequest.current.owns(controller)) setIsSubmitting(false);
     }
   };
 
@@ -87,6 +110,11 @@ export function HomePage() {
             }}
           >
             <div className="card-body">
+              {submitError && (
+                <div className="alert alert-danger" role="alert">
+                  {submitError}
+                </div>
+              )}
               <textarea
                 className="form-control composer-input"
                 value={task}

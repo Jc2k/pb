@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   GoalBudget,
   GoalContinuationPolicy,
@@ -6,8 +6,12 @@ import type {
   SessionStreamSnapshot,
 } from "../types";
 import { apiErrorMessage } from "../lib/integrationConfig";
-import { parseSessionStreamSnapshotJson } from "../lib/eventContract";
+import {
+  parseGoalResponseJson,
+  parseSessionStreamSnapshotJson,
+} from "../lib/eventContract";
 import { VoiceInputButton } from "./VoiceInputButton";
+import { isAbortError, LatestRequest } from "../lib/hooks";
 
 interface GoalStartSheetBaseProps {
   open: boolean;
@@ -91,9 +95,12 @@ export function GoalStartSheet({
   );
   const [submitting, setSubmitting] = useState(false);
   const [voiceInputActive, setVoiceInputActive] = useState(false);
+  const startRequest = useRef(new LatestRequest());
   const [error, setError] = useState("");
 
   useEffect(() => {
+    startRequest.current.abort();
+    setSubmitting(false);
     if (!open) return;
     setObjective(initialObjective);
     setCriteria(initialCriteria?.length ? initialCriteria : [""]);
@@ -109,12 +116,15 @@ export function GoalStartSheet({
     projectOptionsKey,
   ]);
 
+  useEffect(() => () => startRequest.current.abort(), []);
+
   if (!open) return null;
 
   const submit = async () => {
     if (!objective.trim() || (!sessionId && !selectedProjectId)) return;
     setSubmitting(true);
     setError("");
+    const controller = startRequest.current.start();
     try {
       const response = await fetch(
         sessionId ? `/api/sessions/${sessionId}/goal` : "/api/goals",
@@ -133,35 +143,46 @@ export function GoalStartSheet({
               .filter(Boolean)
               .map((text) => ({ text, verifier: "review_required" })),
           }),
+          signal: controller.signal,
         },
       );
       if (!response.ok) {
-        setError(
-          await apiErrorMessage(response, "pb could not create this goal."),
+        const message = await apiErrorMessage(
+          response,
+          "pb could not create this goal.",
         );
+        if (startRequest.current.owns(controller)) setError(message);
         return;
       }
       if (sessionId) {
         const snapshot = parseSessionStreamSnapshotJson(await response.text());
+        if (!startRequest.current.owns(controller)) return;
         onSessionUpdated(snapshot);
         onStarted(snapshot.session.session_id);
       } else {
-        const result = (await response.json()) as { session_id: string };
+        const result = parseGoalResponseJson(await response.text());
+        if (!startRequest.current.owns(controller)) return;
         onStarted(result.session_id);
       }
     } catch (cause) {
+      if (isAbortError(cause) || !startRequest.current.owns(controller)) return;
       setError(
         cause instanceof Error
           ? cause.message
           : "pb could not create this goal.",
       );
     } finally {
-      setSubmitting(false);
+      if (startRequest.current.owns(controller)) setSubmitting(false);
     }
   };
 
+  const close = () => {
+    startRequest.current.abort();
+    onClose();
+  };
+
   return (
-    <div className="goal-sheet-backdrop" onMouseDown={onClose}>
+    <div className="goal-sheet-backdrop" onMouseDown={close}>
       <section
         className="goal-sheet"
         role="dialog"
@@ -177,7 +198,7 @@ export function GoalStartSheet({
           <button
             className="btn btn-light btn-icon"
             type="button"
-            onClick={onClose}
+            onClick={close}
             aria-label="Close goal setup"
           >
             <i className="bi bi-x-lg"></i>
@@ -406,7 +427,7 @@ export function GoalStartSheet({
           ? <p className="text-danger small" role="alert">{error}</p>
           : null}
         <footer className="goal-sheet-actions">
-          <button className="btn btn-light" type="button" onClick={onClose}>
+          <button className="btn btn-light" type="button" onClick={close}>
             Cancel
           </button>
           <button

@@ -12,5 +12,11 @@ Deno.test("global integration mutations apply their authoritative response", asy
 
   equal(mutations.match(/uniqueInstalledIntegrations/g)?.length, 2);
   equal(mutations.match(/setInstalled\(nextInstalled\)/g)?.length, 2);
+  equal(mutations.match(/installedRequest\.current\.abort\(\)/g)?.length, 2);
+  equal(
+    mutations.match(/parseInstalledIntegrationsJson/g)?.length,
+    2,
+  );
   ok(!mutations.includes("fetchInstalledIntegrations"));
+  ok(!mutations.includes(".json()"));
 });

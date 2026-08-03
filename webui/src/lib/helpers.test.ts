@@ -31,10 +31,6 @@ function eventEnvelopeDefaults(): Pick<
       entry_key: `test-event-${testEventIndex}`,
       supersedes: [],
       summary_redundant: false,
-      session_effect: {
-        running: "unchanged",
-        reset_intent: false,
-      },
     },
   };
 }
@@ -44,8 +40,6 @@ function currentSession(values: Partial<SessionItem>): SessionItem {
     session_id: "session",
     task: "Task",
     title: null,
-    running: false,
-    paused: false,
     status: "completed",
     intent: null,
     branch: null,
@@ -71,7 +65,7 @@ Deno.test("buildChatPresentation groups consecutive speakers and marks time gaps
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "reasoning",
         content: "First thought",
@@ -81,7 +75,7 @@ Deno.test("buildChatPresentation groups consecutive speakers and marks time gaps
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "llm_invocation",
         step: 1,
@@ -95,7 +89,7 @@ Deno.test("buildChatPresentation groups consecutive speakers and marks time gaps
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "final",
         content: "Same speaker",
@@ -105,7 +99,7 @@ Deno.test("buildChatPresentation groups consecutive speakers and marks time gaps
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "correction",
         kind: "artifact_validation",
@@ -117,7 +111,7 @@ Deno.test("buildChatPresentation groups consecutive speakers and marks time gaps
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "correction",
         kind: "artifact_validation",
@@ -237,12 +231,12 @@ Deno.test("groupActionEvents separates profile and steward actions", () => {
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: { type: "reasoning", content: "thinking", profile: "build" },
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "tool_call",
         tool: "read_file",
@@ -254,7 +248,7 @@ Deno.test("groupActionEvents separates profile and steward actions", () => {
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "tool_result",
         tool: "read_file",
@@ -268,7 +262,7 @@ Deno.test("groupActionEvents separates profile and steward actions", () => {
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "controller_closure",
         workflow_id: "workflow-1",
@@ -280,7 +274,7 @@ Deno.test("groupActionEvents separates profile and steward actions", () => {
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: { type: "final", content: "done", profile: "build" },
     },
   ];
@@ -311,7 +305,7 @@ Deno.test("groupActionEvents presents proactive LSP work as Trinity's routine ac
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "tool_call",
         tool: "lsp_proactive_diagnostics",
@@ -323,7 +317,7 @@ Deno.test("groupActionEvents presents proactive LSP work as Trinity's routine ac
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "tool_result",
         tool: "lsp_proactive_diagnostics",
@@ -348,7 +342,7 @@ Deno.test("groupActionEvents folds adjacent tool-only inferences by the same tea
   const actor = { kind: "agent", id: "plan" } as const;
   const inference = (step: number): EventEnvelope => ({
     ...eventEnvelopeDefaults(),
-    version: "v5",
+    version: "v6",
     event: {
       type: "llm_invocation",
       step,
@@ -363,7 +357,7 @@ Deno.test("groupActionEvents folds adjacent tool-only inferences by the same tea
     inference(1),
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "tool_call",
         tool: "glob",
@@ -375,7 +369,7 @@ Deno.test("groupActionEvents folds adjacent tool-only inferences by the same tea
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "tool_result",
         tool: "glob",
@@ -389,7 +383,7 @@ Deno.test("groupActionEvents folds adjacent tool-only inferences by the same tea
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "tool_batch",
         call_count: 1,
@@ -402,7 +396,7 @@ Deno.test("groupActionEvents folds adjacent tool-only inferences by the same tea
     inference(2),
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "tool_call",
         tool: "read_file",
@@ -414,7 +408,7 @@ Deno.test("groupActionEvents folds adjacent tool-only inferences by the same tea
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "tool_result",
         tool: "read_file",
@@ -428,7 +422,7 @@ Deno.test("groupActionEvents folds adjacent tool-only inferences by the same tea
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "correction",
         kind: "artifact_validation",
@@ -455,7 +449,7 @@ Deno.test("groupActionEvents folds adjacent tool-only inferences by the same tea
 Deno.test("groupActionEvents places inference timing after chat-only model work", () => {
   const inference: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v5",
+    version: "v6",
     event: {
       type: "llm_invocation",
       step: 1,
@@ -468,7 +462,7 @@ Deno.test("groupActionEvents places inference timing after chat-only model work"
   };
   const reasoning: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v5",
+    version: "v6",
     event: {
       type: "reasoning",
       content: "I found the issue.",
@@ -477,7 +471,7 @@ Deno.test("groupActionEvents places inference timing after chat-only model work"
   };
   const final: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v5",
+    version: "v6",
     event: {
       type: "final",
       content: "The issue is confirmed.",
@@ -497,7 +491,7 @@ Deno.test("groupActionEvents hides timing when a model call produced no visible 
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "llm_invocation",
         step: 4,
@@ -510,7 +504,7 @@ Deno.test("groupActionEvents hides timing when a model call produced no visible 
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "correction",
         kind: "artifact_validation",
@@ -532,7 +526,7 @@ Deno.test("groupActionEvents keeps teammate reasoning visible before its action 
   const events: EventEnvelope[] = [
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "llm_invocation",
         step: 1,
@@ -545,7 +539,7 @@ Deno.test("groupActionEvents keeps teammate reasoning visible before its action 
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "reasoning",
         content: "I will inspect the exact target first.",
@@ -554,7 +548,7 @@ Deno.test("groupActionEvents keeps teammate reasoning visible before its action 
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "tool_call",
         tool: "read_file",
@@ -566,7 +560,7 @@ Deno.test("groupActionEvents keeps teammate reasoning visible before its action 
     },
     {
       ...eventEnvelopeDefaults(),
-      version: "v5",
+      version: "v6",
       event: {
         type: "tool_result",
         tool: "read_file",
@@ -596,7 +590,7 @@ Deno.test("groupActionEvents correlates reordered identical tools across interve
   const actor = { kind: "agent", id: "build" } as const;
   const callA: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v5",
+    version: "v6",
     event: {
       type: "tool_call",
       tool: "read_file",
@@ -608,7 +602,7 @@ Deno.test("groupActionEvents correlates reordered identical tools across interve
   };
   const callB: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v5",
+    version: "v6",
     event: {
       type: "tool_call",
       tool: "read_file",
@@ -620,7 +614,7 @@ Deno.test("groupActionEvents correlates reordered identical tools across interve
   };
   const correction: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v5",
+    version: "v6",
     event: {
       type: "correction",
       kind: "artifact_validation",
@@ -631,7 +625,7 @@ Deno.test("groupActionEvents correlates reordered identical tools across interve
   };
   const resultB: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v5",
+    version: "v6",
     event: {
       type: "tool_result",
       tool: "read_file",
@@ -645,7 +639,7 @@ Deno.test("groupActionEvents correlates reordered identical tools across interve
   };
   const resultA: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v5",
+    version: "v6",
     event: {
       type: "tool_result",
       tool: "read_file",

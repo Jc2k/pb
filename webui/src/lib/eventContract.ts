@@ -1,11 +1,13 @@
 import type {
   DeleteSessionMutationResponse,
   EventEnvelope,
+  GoalResponse,
   ProjectEntry,
   ProjectSessionSnapshot,
   ProjectSessionTerminalTransition,
   SessionDetails,
   SessionItem,
+  SessionResponse,
   SessionStreamSnapshot,
 } from "../types";
 
@@ -266,7 +268,7 @@ export const eventFields = {
     "timestamp_ms",
   ]],
   session_title: [["title"], ["timestamp_ms"]],
-  session_state_changed: [["status", "running", "paused"], ["timestamp_ms"]],
+  session_state_changed: [["status"], ["timestamp_ms"]],
   session_summary: [[
     "branch",
     "commits",
@@ -588,8 +590,6 @@ function sessionItem(value: unknown, index: number): SessionItem {
       "session_id",
       "task",
       "title",
-      "running",
-      "paused",
       "status",
       "intent",
       "branch",
@@ -613,11 +613,6 @@ function sessionItem(value: unknown, index: number): SessionItem {
   requiredString(session.session_id, `${label} id`);
   requiredString(session.task, `${label} task`);
   nullableString(session.title, `${label} title`);
-  if (
-    typeof session.running !== "boolean" || typeof session.paused !== "boolean"
-  ) {
-    throw new Error(`${label} running and paused state must be boolean`);
-  }
   enumValue(session.status, sessionStatuses, `${label} status`);
   nullableEnum(session.intent, turnIntents, `${label} intent`);
   nullableString(session.branch, `${label} branch`);
@@ -752,7 +747,6 @@ const transcriptKinds = new Set([
   "workflow_blocked",
   "session_summary",
 ]);
-const sessionRunningEffects = new Set(["unchanged", "running", "stopped"]);
 
 function requiredKeys(
   value: Record<string, unknown>,
@@ -872,7 +866,6 @@ function transcriptMetadata(value: unknown): void {
       "dedupe_key",
       "related_action_key",
       "summary_redundant",
-      "session_effect",
     ],
     "event transcript",
   );
@@ -885,7 +878,6 @@ function transcriptMetadata(value: unknown): void {
       "entry_key",
       "supersedes",
       "summary_redundant",
-      "session_effect",
     ],
     "event transcript",
   );
@@ -907,18 +899,6 @@ function transcriptMetadata(value: unknown): void {
   if (typeof transcript.summary_redundant !== "boolean") {
     throw new Error("event summary_redundant must be boolean");
   }
-  const effect = record(transcript.session_effect, "event session effect");
-  exactKeys(
-    effect,
-    ["running", "reset_intent", "title"],
-    "event session effect",
-  );
-  requiredKeys(effect, ["running", "reset_intent"], "event session effect");
-  enumValue(effect.running, sessionRunningEffects, "event running effect");
-  if (typeof effect.reset_intent !== "boolean") {
-    throw new Error("event reset intent must be boolean");
-  }
-  optionalString(effect.title, "event title effect");
 }
 
 function agentEvent(value: unknown): void {
@@ -954,11 +934,6 @@ function agentEvent(value: unknown): void {
   }
   if (event.type === "session_state_changed") {
     enumValue(event.status, sessionStatuses, "session state status");
-    if (
-      typeof event.running !== "boolean" || typeof event.paused !== "boolean"
-    ) {
-      throw new Error("session state flags must be boolean");
-    }
   } else if (event.type === "session_metrics") {
     const metrics = { ...event };
     Reflect.deleteProperty(metrics, "type");
@@ -977,9 +952,9 @@ function eventEnvelope(value: unknown): EventEnvelope {
     ["version", "event", "chatter", "evidence", "transcript"],
     "event envelope",
   );
-  if (envelope.version !== "v5") {
+  if (envelope.version !== "v6") {
     throw new Error(
-      `unsupported event schema '${String(envelope.version)}'; expected 'v5'`,
+      `unsupported event schema '${String(envelope.version)}'; expected 'v6'`,
     );
   }
   requiredKeys(envelope, [
@@ -1327,8 +1302,6 @@ function sessionDetails(value: unknown): SessionDetails {
     "session_id",
     "task",
     "title",
-    "running",
-    "paused",
     "cancel_requested",
     "status",
     "intent",
@@ -1362,12 +1335,10 @@ function sessionDetails(value: unknown): SessionDetails {
   requiredString(session.task, "session task");
   nullableString(session.title, "session title");
   if (
-    typeof session.running !== "boolean" ||
-    typeof session.paused !== "boolean" ||
     typeof session.cancel_requested !== "boolean"
   ) {
     throw new Error(
-      "session running, paused, and cancellation state must be boolean",
+      "session cancellation state must be boolean",
     );
   }
   enumValue(session.status, sessionStatuses, "session status");
@@ -1472,6 +1443,53 @@ export function parseSessionDetailsJson(text: string): SessionDetails {
   return sessionDetails(json(text, "session snapshot"));
 }
 
+export function parseSessionResponseJson(
+  text: string,
+): SessionResponse {
+  const response = record(
+    json(text, "session start response"),
+    "session start response",
+  );
+  exactKeys(response, ["session_id"], "session start response");
+  requiredKeys(response, ["session_id"], "session start response");
+  return {
+    session_id: requiredString(
+      response.session_id,
+      "session start response session_id",
+    ),
+  };
+}
+
+export function parseGoalResponseJson(
+  text: string,
+): GoalResponse {
+  const response = record(
+    json(text, "goal start response"),
+    "goal start response",
+  );
+  exactKeys(
+    response,
+    ["session_id", "goal_id", "goal_sha256"],
+    "goal start response",
+  );
+  requiredKeys(
+    response,
+    ["session_id", "goal_id", "goal_sha256"],
+    "goal start response",
+  );
+  return {
+    session_id: requiredString(
+      response.session_id,
+      "goal start response session_id",
+    ),
+    goal_id: requiredString(response.goal_id, "goal start response goal_id"),
+    goal_sha256: requiredString(
+      response.goal_sha256,
+      "goal start response goal_sha256",
+    ),
+  };
+}
+
 export function parseSessionStreamSnapshotJson(
   text: string,
 ): SessionStreamSnapshot {
@@ -1481,20 +1499,30 @@ export function parseSessionStreamSnapshotJson(
   );
   exactKeys(
     snapshot,
-    ["session", "reset_history"],
+    ["session", "reset_history", "warnings"],
     "session stream snapshot",
   );
   requiredKeys(
     snapshot,
-    ["session", "reset_history"],
+    ["session", "reset_history", "warnings"],
     "session stream snapshot",
   );
   if (typeof snapshot.reset_history !== "boolean") {
     throw new Error("session reset_history must be a boolean");
   }
+  if (!Array.isArray(snapshot.warnings)) {
+    throw new Error("session warnings must be an array");
+  }
+  const warnings = snapshot.warnings.map((warning) => {
+    if (typeof warning !== "string") {
+      throw new Error("session warnings must be strings");
+    }
+    return warning;
+  });
   return {
     session: sessionDetails(snapshot.session),
     reset_history: snapshot.reset_history,
+    warnings,
   };
 }
 
@@ -1524,6 +1552,7 @@ function projectSessionSnapshot(value: unknown): ProjectSessionSnapshot {
       "sessions",
       "overall_usage",
       "project_usage",
+      "warnings",
     ],
     "project session snapshot",
   );
@@ -1614,10 +1643,20 @@ function projectSessionSnapshot(value: unknown): ProjectSessionSnapshot {
     }
     projectUsageSummary(projectUsage[projectId], `project ${projectId} usage`);
   }
+  if (!Array.isArray(snapshot.warnings)) {
+    throw new Error("project session warnings must be an array");
+  }
+  const warnings = snapshot.warnings.map((warning) => {
+    if (typeof warning !== "string") {
+      throw new Error("project session warnings must be strings");
+    }
+    return warning;
+  });
   return {
     ...snapshot,
     projects,
     sessions,
+    warnings,
   } as unknown as ProjectSessionSnapshot;
 }
 

@@ -5,6 +5,8 @@ import {
   LatestRequest,
   LatestSubscription,
   ProjectSessionStreamCursor,
+  projectSnapshotApplicationScope,
+  projectSnapshotMatchesUsageWindow,
 } from "../lib/hooks.ts";
 import type {
   ProjectSessionSnapshot,
@@ -89,6 +91,7 @@ function projectSnapshot(
       today: { tokens: 0, runtime_ms: 0, tool_calls: 0 },
     },
     project_usage: {},
+    warnings: [],
   };
 }
 
@@ -159,6 +162,18 @@ Deno.test("project stream trusts server-authored per-connection terminal deltas"
   equal(replay?.terminalTransitions[0].entry_key, "reconnected");
 });
 
+Deno.test("stale project snapshots cannot replace revisioned data or warnings", () => {
+  const cursor = new ProjectSessionStreamCursor();
+  equal(
+    cursor.accept(projectSnapshot("process-a", 7), "stream")?.applyData,
+    true,
+  );
+  equal(
+    cursor.accept(projectSnapshot("process-a", 6), "http")?.applyData,
+    false,
+  );
+});
+
 Deno.test("project usage windows follow the browser's local calendar day", () => {
   const window = currentUsageWindow(new Date(2026, 5, 26, 12));
   const start = new Date(window.start_ms);
@@ -166,6 +181,33 @@ Deno.test("project usage windows follow the browser's local calendar day", () =>
   equal(start.getHours(), 0);
   equal(end.getHours(), 0);
   equal(end.getDate(), start.getDate() + 1);
+});
+
+Deno.test("project snapshots cannot cross the requested usage window", () => {
+  const snapshot = projectSnapshot("process-a", 4);
+  equal(
+    projectSnapshotMatchesUsageWindow(snapshot, {
+      start_ms: snapshot.usage_window_start_ms,
+      end_ms: snapshot.usage_window_end_ms,
+    }),
+    true,
+  );
+  equal(
+    projectSnapshotMatchesUsageWindow(snapshot, {
+      start_ms: snapshot.usage_window_start_ms + 86_400_000,
+      end_ms: snapshot.usage_window_end_ms + 86_400_000,
+    }),
+    false,
+  );
+  const nextWindow = {
+    start_ms: snapshot.usage_window_start_ms + 86_400_000,
+    end_ms: snapshot.usage_window_end_ms + 86_400_000,
+  };
+  equal(projectSnapshotApplicationScope(snapshot, nextWindow, false), "reject");
+  equal(
+    projectSnapshotApplicationScope(snapshot, nextWindow, true),
+    "collection",
+  );
 });
 
 Deno.test("project settings recovery clears the presented mutation error before refresh", async () => {
@@ -325,6 +367,11 @@ Deno.test("project pages distinguish loading and API failures from empty state",
   ok(!hooks.includes("setInterval"));
   ok(hooks.includes("dataLoading"));
   ok(hooks.includes("dataError"));
+  ok(hooks.includes('setDataError(snapshot.warnings.join(" "))'));
+  ok(
+    hooks.indexOf("if (!decision.applyData) return;") <
+      hooks.indexOf('setDataError(snapshot.warnings.join(" "))'),
+  );
   ok(hooks.includes("refresh: fetchData"));
   ok(!hooks.includes("sessionsLoading"));
   ok(!hooks.includes("projectsLoading"));
@@ -359,5 +406,11 @@ Deno.test("project integration mutations apply their authoritative response", as
 
   equal(mutations.match(/projectMcpIntegrations/g)?.length, 2);
   equal(mutations.match(/setInstalled\(nextInstalled\)/g)?.length, 2);
+  equal(mutations.match(/installedRequest\.current\.abort\(\)/g)?.length, 2);
+  equal(
+    mutations.match(/parseInstalledIntegrationsJson/g)?.length,
+    2,
+  );
   ok(!mutations.includes("fetchInstalledIntegrations"));
+  ok(!mutations.includes(".json()"));
 });

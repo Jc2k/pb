@@ -76,3 +76,20 @@ Deno.test("goal mobile surfaces use safe areas and retain a details route to con
   ok(css.includes(".goal-mobile-actions"));
   ok(css.includes("@media (max-width: 767px)"));
 });
+
+Deno.test("goal mutation sheets reject callbacks from closed request owners", async () => {
+  for (const file of ["GoalStartSheet.tsx", "GoalAmendmentSheet.tsx"]) {
+    const source = await Deno.readTextFile(
+      new URL(file, import.meta.url),
+    );
+    ok(source.includes("LatestRequest"), `${file} has no request owner`);
+    ok(
+      source.includes(".current.owns(controller)"),
+      `${file} accepts a stale callback`,
+    );
+    ok(
+      source.includes(".current.abort()"),
+      `${file} does not abort when closed`,
+    );
+  }
+});

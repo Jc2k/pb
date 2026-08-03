@@ -688,8 +688,6 @@ export type AgentEvent =
   | {
     type: "session_state_changed";
     status: SessionStatus;
-    running: boolean;
-    paused: boolean;
     timestamp_ms?: number;
   }
   | {
@@ -847,15 +845,6 @@ export interface TranscriptMetadata {
   dedupe_key?: string;
   related_action_key?: string;
   summary_redundant: boolean;
-  session_effect: SessionEffect;
-}
-
-export type SessionRunningEffect = "unchanged" | "running" | "stopped";
-
-export interface SessionEffect {
-  running: SessionRunningEffect;
-  reset_intent: boolean;
-  title?: string;
 }
 
 export type HandoffOutcome =
@@ -924,7 +913,7 @@ export interface SessionMetricsSnapshot {
 }
 
 export interface EventEnvelope {
-  version: "v5";
+  version: "v6";
   event: AgentEvent;
   chatter: EventChatter[];
   evidence: EventEvidence[];
@@ -1405,8 +1394,6 @@ export interface SessionItem {
   session_id: string;
   task: string;
   title: string | null;
-  running: boolean;
-  paused: boolean;
   status: SessionStatus;
   intent: TurnIntent | null;
   branch: string | null;
@@ -1434,8 +1421,6 @@ export interface SessionDetails {
   session_id: string;
   task: string;
   title: string | null;
-  running: boolean;
-  paused: boolean;
   cancel_requested: boolean;
   status: SessionStatus;
   intent: TurnIntent | null;
@@ -1470,6 +1455,17 @@ export interface SessionDetails {
 export interface SessionStreamSnapshot {
   session: SessionDetails;
   reset_history: boolean;
+  warnings: string[];
+}
+
+export interface SessionResponse {
+  session_id: string;
+}
+
+export interface GoalResponse {
+  session_id: string;
+  goal_id: string;
+  goal_sha256: string;
 }
 
 export interface SessionProject {
@@ -1518,6 +1514,7 @@ export interface ProjectSessionSnapshot {
   sessions: SessionItem[];
   overall_usage: ProjectUsageSummary;
   project_usage: Record<string, ProjectUsageSummary>;
+  warnings: string[];
 }
 
 export interface DeleteSessionResponse {
@@ -1572,17 +1569,17 @@ export interface InstalledIntegration {
   container_image: string;
   source_container_image?: string;
   verified_manifest_digest?: string;
-  env?: Record<string, string>;
+  env: Record<string, string>;
   disabled: boolean;
-  status?: "ready" | "disabled" | "unavailable" | "legacy_unverified";
+  status: "ready" | "disabled" | "unavailable" | "legacy_unverified";
 }
 
 export type JsonSchemaProperty = {
   type?: string | string[];
   title?: string;
   description?: string;
-  default?: string | number | boolean;
-  enum?: Array<string | number | boolean>;
+  default?: string | number | boolean | null;
+  enum?: Array<string | number | boolean | null>;
   minLength?: number;
   maxLength?: number;
   pattern?: string;
@@ -1599,7 +1596,7 @@ export type IntegrationJsonSchema = {
 export interface LspPackageServerConfig {
   args: string[];
   language_ids: string[];
-  initialization_options?: unknown;
+  initialization_options: unknown;
   workspace_access: "read_only";
   network_access: "none";
   cache_ids: string[];
@@ -1613,12 +1610,12 @@ export interface LspPackageManifest {
 
 export interface IntegrationConfigSchemaResponse {
   container_image: string;
-  source_container_image?: string;
-  manifest_digest?: string;
+  source_container_image: string;
+  manifest_digest: string;
   annotation: string;
-  schema?: IntegrationJsonSchema | null;
+  schema: IntegrationJsonSchema | null;
   lsp_manifest_annotation: string;
-  lsp_manifest?: LspPackageManifest | null;
+  lsp_manifest: LspPackageManifest | null;
 }
 
 export interface PendingIntegrationInstall {

@@ -15,8 +15,6 @@ function session(status: SessionItem["status"]): SessionItem {
     session_id: `${status}-${Math.random()}`,
     task: "Test session",
     title: null,
-    running: status === "running",
-    paused: status === "paused",
     status,
     intent: null,
     branch: "main",

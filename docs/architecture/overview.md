@@ -32,20 +32,31 @@ snapshot to live delivery without a publication gap. A lagged terminal receiver 
 missing sequence from history before continuing, and terminal completion is announced only after
 the final replay. History retention is dependency-aware: the nominal bound is soft when a retained
 projection needs an earlier tool call, superseded entry, final/block reason, check, or commit.
-The browser SSE stream begins with a revisioned session snapshot and sends another snapshot after
-state-changing events. A reconnect cursor that has fallen outside retained history produces an
+The browser SSE stream begins with a revisioned session snapshot and sends another exact snapshot
+after every successful session transaction, including eventless changes. Session revision and event
+sequence are independent clocks. A reconnect cursor that has fallen outside retained history produces an
 explicit history reset instead of silently splicing two non-contiguous transcript windows.
-Every durable lifecycle transition, including queued follow-up and recovery work, publishes a typed
-state event before its mutation response completes. Existing-session mutations also return the exact
+`SessionStatus` is the only lifecycle value in the live record, persistence, events, and API
+projections; obsolete `running` and `paused` mirrors are rejected rather than normalized. The
+coordinator compares staged and committed status, appends every lifecycle event itself, and
+derives queue dispatch whenever a transaction enters `Queued`. Usage records are the sole accounting
+authority; aggregate metrics and collection publication are derived from their staged before/after
+value. A terminal lifecycle change also derives the retained project transition, while
+any active-to-inactive watch change—including a safe pause without a pending question—publishes event,
+snapshot, collection/effect finalization, and finish phases in that order. Handlers therefore cannot
+omit a phase, and terminal attachment does not poll shared lifecycle state to discover completion. Every durable lifecycle
+transition, including queued follow-up and recovery work, therefore publishes a typed state event before
+its mutation response completes. Existing-session mutations also return the exact
 revisioned session snapshot shape used by SSE, so the initiating browser applies the committed state
 immediately and never has to refetch or wait for stream delivery to discover it. A running cancellation
 remains `running` with an explicit server-authored cancellation-requested flag until the terminal event.
-Goal and cancellation controls stage checkpoint changes and their events away from the live sender
+Goal and cancellation controls stage checkpoint changes and their events away from the passive live sender
 until every fallible validation and parent-Task fold has succeeded. The daemon rebases that staged
 history over any concurrent transcript-only events, saves the exact resulting session projection,
 and only then installs and broadcasts it. Snapshot capture and Git-note writes share one persistence
 lock, so an older autonomous snapshot cannot overwrite an acknowledged control. Validation or
-persistence failure therefore leaves the live checkpoint and transcript unchanged. A terminal Goal
+persistence failure therefore leaves the live checkpoint and transcript unchanged. Post-commit
+cleanup failure remains a successful mutation with typed warnings. A terminal Goal
 response identifies the Goal checkpoint that the caller changed even when completing it advances the
 session to a following Goal Task.
 The `started` event projects the runner's resolved branch and focus root into live session state before
@@ -59,6 +70,9 @@ its reconciled session list while project pages remain open.
 Mutating HTTP responses use a typed error code and server-authored message, so the web adapter does
 not infer domain state from bare HTTP status numbers. Integration mutations return the full
 authoritative installed collection rather than requiring a second read after a successful write.
+The browser validates current marketplace, installed, and image-metadata response shapes at runtime;
+an integration mutation invalidates any older installed-collection read before applying its response,
+so a slow initial request cannot roll back a completed install or removal.
 
 ## Component responsibilities
 

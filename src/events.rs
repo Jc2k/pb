@@ -12,7 +12,7 @@ pub use crate::inference::StageRootAuthorityClass as PromptRootAuthorityClass;
 use crate::session_store::now_millis;
 pub use crate::workflow::WorkflowBlockCause;
 
-pub const EVENT_SCHEMA_VERSION: &str = "v5";
+pub const EVENT_SCHEMA_VERSION: &str = "v6";
 static LAST_EVENT_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
 
 fn next_event_timestamp_ms() -> u64 {
@@ -276,7 +276,6 @@ pub struct TranscriptMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub related_action_key: Option<String>,
     pub summary_redundant: bool,
-    pub session_effect: SessionEffect,
 }
 
 impl TranscriptMetadata {
@@ -291,21 +290,8 @@ impl TranscriptMetadata {
             dedupe_key: None,
             related_action_key: None,
             summary_redundant: false,
-            session_effect: SessionEffect {
-                running: SessionRunningEffect::Unchanged,
-                reset_intent: false,
-                title: None,
-            },
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionRunningEffect {
-    Unchanged,
-    Running,
-    Stopped,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -332,15 +318,6 @@ impl std::fmt::Display for GoalChangeKind {
             Self::Budget => "budget",
         })
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SessionEffect {
-    pub running: SessionRunningEffect,
-    pub reset_intent: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1274,8 +1251,6 @@ pub enum AgentEvent {
     },
     SessionStateChanged {
         status: SessionLifecycleStatus,
-        running: bool,
-        paused: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp_ms: Option<u64>,
     },
@@ -1481,7 +1456,6 @@ impl EventEnvelope {
             || self.transcript.dedupe_key != expected.dedupe_key
             || self.transcript.related_action_key != expected.related_action_key
             || self.transcript.summary_redundant != expected.summary_redundant
-            || self.transcript.session_effect != expected.session_effect
         {
             return Err("event transcript metadata does not match its payload".to_string());
         }
@@ -1531,25 +1505,6 @@ impl EventEnvelope {
         {
             return Err("session metrics end before they start".to_string());
         }
-        if let AgentEvent::SessionStateChanged {
-            status,
-            running,
-            paused,
-            ..
-        } = &self.event
-        {
-            let expected = match status {
-                SessionLifecycleStatus::Running => (true, false),
-                SessionLifecycleStatus::Paused => (false, true),
-                SessionLifecycleStatus::Queued
-                | SessionLifecycleStatus::Completed
-                | SessionLifecycleStatus::Failed => (false, false),
-            };
-            if (*running, *paused) != expected {
-                return Err("session lifecycle flags do not match its status".to_string());
-            }
-        }
-
         let AgentEvent::TeamMessage { evidence, .. } = &self.event else {
             if !self.evidence.is_empty() {
                 return Err("event type does not support evidence projections".to_string());
@@ -2661,20 +2616,13 @@ impl EventEnvelope {
                     timestamp_ms: Some(now),
                 },
             },
-            AgentEvent::SessionStateChanged {
-                status,
-                running,
-                paused,
-                ..
-            } => Self {
+            AgentEvent::SessionStateChanged { status, .. } => Self {
                 version: EVENT_SCHEMA_VERSION.to_string(),
                 chatter: Vec::new(),
                 evidence: Vec::new(),
                 transcript: TranscriptMetadata::pending(),
                 event: AgentEvent::SessionStateChanged {
                     status,
-                    running,
-                    paused,
                     timestamp_ms: Some(now),
                 },
             },
@@ -2863,7 +2811,6 @@ fn transcript_metadata_for_event(
         dedupe_key,
         related_action_key,
         summary_redundant,
-        session_effect: session_effect_for_event(event),
     }
 }
 
@@ -2914,33 +2861,6 @@ fn event_requires_session_snapshot(event: &AgentEvent) -> bool {
             | AgentEvent::UserQuestion { .. }
             | AgentEvent::UserAnswer { .. }
     )
-}
-
-fn session_effect_for_event(event: &AgentEvent) -> SessionEffect {
-    let running = match event {
-        AgentEvent::Started { .. }
-        | AgentEvent::UserAnswer { .. }
-        | AgentEvent::SessionStateChanged { running: true, .. } => SessionRunningEffect::Running,
-        AgentEvent::UserQuestion { .. }
-        | AgentEvent::SessionStateChanged { running: false, .. } => SessionRunningEffect::Stopped,
-        _ => SessionRunningEffect::Unchanged,
-    };
-    SessionEffect {
-        running,
-        reset_intent: matches!(
-            event,
-            AgentEvent::Final { .. }
-                | AgentEvent::SessionSummary { .. }
-                | AgentEvent::SessionStateChanged {
-                    status: SessionLifecycleStatus::Completed | SessionLifecycleStatus::Failed,
-                    ..
-                }
-        ),
-        title: match event {
-            AgentEvent::SessionTitle { title, .. } => Some(title.clone()),
-            _ => None,
-        },
-    }
 }
 
 fn tool_summary_for_event(event: &AgentEvent, history: &[EventEnvelope]) -> Option<String> {
@@ -3937,21 +3857,26 @@ mod tests {
     }
 
     #[test]
-    fn v1_envelopes_without_server_projections_are_rejected() {
-        let mut value = serde_json::to_value(EventEnvelope::new(AgentEvent::Final {
+    fn obsolete_envelopes_are_rejected_without_migration() {
+        let value = serde_json::to_value(EventEnvelope::new(AgentEvent::Final {
             content: "done".to_string(),
             profile: AgentProfile::Build,
             nesting_depth: None,
             timestamp_ms: None,
         }))
         .unwrap();
-        value["version"] = Value::String("v1".to_string());
-
-        assert!(serde_json::from_value::<EventEnvelope>(value).is_err());
+        for version in ["v1", "v2", "v3", "v4", "v5"] {
+            let mut obsolete = value.clone();
+            obsolete["version"] = Value::String(version.to_string());
+            assert!(
+                serde_json::from_value::<EventEnvelope>(obsolete).is_err(),
+                "obsolete event schema {version} was accepted"
+            );
+        }
     }
 
     #[test]
-    fn v5_envelopes_reject_unknown_compatibility_fields() {
+    fn v6_envelopes_reject_unknown_compatibility_fields() {
         let value = serde_json::to_value(EventEnvelope::new(AgentEvent::Final {
             content: "done".to_string(),
             profile: AgentProfile::Build,
@@ -3997,7 +3922,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_errors_require_summary_and_detail() {
+    fn v6_errors_require_summary_and_detail() {
         let value = serde_json::to_value(EventEnvelope::new(AgentEvent::Error {
             summary: "Model setup failed".to_string(),
             detail: "llama.cpp failed to load the configured model".to_string(),
@@ -4011,13 +3936,13 @@ mod tests {
             missing["event"].as_object_mut().unwrap().remove(field);
             assert!(
                 serde_json::from_value::<EventEnvelope>(missing).is_err(),
-                "v5 error unexpectedly accepted without {field}"
+                "v6 error unexpectedly accepted without {field}"
             );
         }
     }
 
     #[test]
-    fn v5_tool_results_require_exact_correlation_and_outcome() {
+    fn v6_tool_results_require_exact_correlation_and_outcome() {
         let value = serde_json::to_value(EventEnvelope::new(AgentEvent::ToolResult {
             tool: "read_file".to_string(),
             result: "contents".to_string(),
@@ -4040,7 +3965,7 @@ mod tests {
             missing["event"].as_object_mut().unwrap().remove(field);
             assert!(
                 serde_json::from_value::<EventEnvelope>(missing).is_err(),
-                "v5 tool result unexpectedly accepted without {field}"
+                "v6 tool result unexpectedly accepted without {field}"
             );
         }
     }
@@ -4563,12 +4488,11 @@ mod tests {
 
     #[test]
     fn persisted_event_metadata_and_metric_interval_are_authoritative() {
-        let mut title = EventEnvelope::new(AgentEvent::SessionTitle {
+        let title = EventEnvelope::new(AgentEvent::SessionTitle {
             title: "A stronger boundary".to_string(),
             timestamp_ms: Some(1),
         });
-        title.transcript.session_effect.title = None;
-        assert!(title.validate_persisted().is_err());
+        title.validate_persisted().unwrap();
 
         let metrics = EventEnvelope::new(AgentEvent::SessionMetrics {
             llm_invocations: 1,
@@ -4607,7 +4531,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_effects_are_published_only_after_state_transitions() {
+    fn lifecycle_events_require_authoritative_session_snapshots() {
         let started = EventEnvelope::new(AgentEvent::Started {
             task: "review the boundary".to_string(),
             model: "local".to_string(),
@@ -4644,32 +4568,13 @@ mod tests {
             nesting_depth: None,
             timestamp_ms: Some(1),
         });
-        assert_eq!(
-            final_message.transcript.session_effect.running,
-            SessionRunningEffect::Unchanged
-        );
         assert!(!final_message.requires_session_snapshot());
-        assert!(final_message.transcript.session_effect.reset_intent);
 
         let state = EventEnvelope::new(AgentEvent::SessionStateChanged {
             status: SessionLifecycleStatus::Completed,
-            running: false,
-            paused: false,
             timestamp_ms: Some(2),
         });
-        assert_eq!(
-            state.transcript.session_effect.running,
-            SessionRunningEffect::Stopped
-        );
         assert!(state.requires_session_snapshot());
-
-        let contradictory = EventEnvelope::new(AgentEvent::SessionStateChanged {
-            status: SessionLifecycleStatus::Completed,
-            running: true,
-            paused: false,
-            timestamp_ms: Some(3),
-        });
-        assert!(contradictory.validate_persisted().is_err());
     }
 
     #[test]
@@ -4916,11 +4821,6 @@ mod tests {
             dedupe_key: None,
             related_action_key: None,
             summary_redundant: false,
-            session_effect: SessionEffect {
-                running: SessionRunningEffect::Unchanged,
-                reset_intent: false,
-                title: None,
-            },
         };
         let events = vec![
             serde_json::from_str::<EventEnvelope>(&serde_json::to_string(&envelope).unwrap())

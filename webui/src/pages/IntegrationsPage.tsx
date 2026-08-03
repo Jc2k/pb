@@ -18,7 +18,11 @@ import {
 import {
   integrationApiError,
   integrationInstallPayload,
+  parseInstalledIntegrationsJson,
+  parseIntegrationConfigSchemaResponseJson,
+  parseMarketplaceIntegrationsJson,
 } from "../lib/integrationConfig";
+import { isAbortError, LatestRequest } from "../lib/hooks";
 
 export function IntegrationsPage() {
   const [marketplace, setMarketplace] = useState<MarketplaceIntegration[]>([]);
@@ -38,16 +42,25 @@ export function IntegrationsPage() {
     id: number;
     controller?: AbortController;
   }>({ id: 0 });
+  const marketplaceRequest = useRef(new LatestRequest());
+  const installedRequest = useRef(new LatestRequest());
+  const integrationMutationRequest = useRef(new LatestRequest());
 
   const invalidateSchemaRequest = () => {
     schemaRequest.current.controller?.abort();
     schemaRequest.current = { id: schemaRequest.current.id + 1 };
   };
 
-  useEffect(() => () => invalidateSchemaRequest(), []);
+  useEffect(() => () => {
+    invalidateSchemaRequest();
+    marketplaceRequest.current.abort();
+    installedRequest.current.abort();
+    integrationMutationRequest.current.abort();
+  }, []);
 
   useEffect(() => {
-    void fetch("/api/integrations/marketplace")
+    const controller = marketplaceRequest.current.start();
+    void fetch("/api/integrations/marketplace", { signal: controller.signal })
       .then(async (res) => {
         if (!res.ok) {
           throw new Error(
@@ -57,26 +70,37 @@ export function IntegrationsPage() {
             ),
           );
         }
-        return res.json();
+        return parseMarketplaceIntegrationsJson(await res.text());
       })
-      .then((entries: MarketplaceIntegration[]) =>
+      .then((entries) => {
+        if (!marketplaceRequest.current.owns(controller)) return;
         setMarketplace(
           uniqueIntegrations(entries.filter((entry) => entry.kind === "lsp")),
-        )
-      )
-      .catch((error) =>
+        );
+      })
+      .catch((error) => {
+        if (
+          isAbortError(error) || !marketplaceRequest.current.owns(controller)
+        ) return;
         setPageError(
           error instanceof Error
             ? error.message
             : "Could not load the integration marketplace",
-        )
-      );
+        );
+      });
     void fetchInstalledIntegrations();
+    return () => {
+      marketplaceRequest.current.abort();
+      installedRequest.current.abort();
+    };
   }, []);
 
   const fetchInstalledIntegrations = async () => {
+    const controller = installedRequest.current.start();
     try {
-      const res = await fetch("/api/integrations/lsp");
+      const res = await fetch("/api/integrations/lsp", {
+        signal: controller.signal,
+      });
       if (!res.ok) {
         throw new Error(
           await integrationApiError(
@@ -85,12 +109,15 @@ export function IntegrationsPage() {
           ),
         );
       }
-      setInstalled(
-        uniqueInstalledIntegrations(
-          (await res.json()) as InstalledIntegration[],
-        ),
+      const nextInstalled = uniqueInstalledIntegrations(
+        parseInstalledIntegrationsJson(await res.text()),
       );
+      if (!installedRequest.current.owns(controller)) return;
+      setInstalled(nextInstalled);
     } catch (error) {
+      if (isAbortError(error) || !installedRequest.current.owns(controller)) {
+        return;
+      }
       setPageError(
         error instanceof Error
           ? error.message
@@ -110,6 +137,8 @@ export function IntegrationsPage() {
       : "install",
   ) => {
     if (!containerImage.trim()) return;
+    integrationMutationRequest.current.abort();
+    setSubmitting(false);
     const pending = {
       kind: "lsp" as IntegrationKind,
       containerImage: containerImage.trim(),
@@ -143,7 +172,9 @@ export function IntegrationsPage() {
           ),
         );
       }
-      const metadata = (await res.json()) as IntegrationConfigSchemaResponse;
+      const metadata = parseIntegrationConfigSchemaResponseJson(
+        await res.text(),
+      );
       if (
         schemaRequest.current.id === requestId && !controller.signal.aborted
       ) {
@@ -168,11 +199,15 @@ export function IntegrationsPage() {
       return;
     }
     setPageError("");
+    setSubmitting(false);
+    installedRequest.current.abort();
+    const controller = integrationMutationRequest.current.start();
     try {
       const res = await fetch(
         `/api/integrations/lsp/${encodeURIComponent(item.name)}`,
         {
           method: "DELETE",
+          signal: controller.signal,
         },
       );
       if (!res.ok) {
@@ -181,10 +216,15 @@ export function IntegrationsPage() {
         );
       }
       const nextInstalled = uniqueInstalledIntegrations(
-        (await res.json()) as InstalledIntegration[],
+        parseInstalledIntegrationsJson(await res.text()),
       );
+      if (!integrationMutationRequest.current.owns(controller)) return;
       setInstalled(nextInstalled);
     } catch (error) {
+      if (
+        isAbortError(error) ||
+        !integrationMutationRequest.current.owns(controller)
+      ) return;
       setPageError(
         error instanceof Error
           ? error.message
@@ -197,6 +237,8 @@ export function IntegrationsPage() {
     if (!pendingInstall) return;
     setSubmitting(true);
     setSubmitError("");
+    installedRequest.current.abort();
+    const controller = integrationMutationRequest.current.start();
     try {
       const res = await fetch("/api/integrations/lsp", {
         method: "POST",
@@ -204,6 +246,7 @@ export function IntegrationsPage() {
         body: JSON.stringify(
           integrationInstallPayload(pendingInstall, env, configSchema),
         ),
+        signal: controller.signal,
       });
       if (!res.ok) {
         throw new Error(
@@ -211,30 +254,39 @@ export function IntegrationsPage() {
         );
       }
       const nextInstalled = uniqueInstalledIntegrations(
-        (await res.json()) as InstalledIntegration[],
+        parseInstalledIntegrationsJson(await res.text()),
       );
+      if (!integrationMutationRequest.current.owns(controller)) return;
       setInstalled(nextInstalled);
       invalidateSchemaRequest();
       setPendingInstall(null);
       setConfigSchema(null);
       setSchemaError("");
     } catch (error) {
+      if (
+        isAbortError(error) ||
+        !integrationMutationRequest.current.owns(controller)
+      ) return;
       setSubmitError(
         error instanceof Error
           ? error.message
           : "Could not install the integration",
       );
     } finally {
-      setSubmitting(false);
+      if (integrationMutationRequest.current.owns(controller)) {
+        setSubmitting(false);
+      }
     }
   };
 
   const cancelIntegration = () => {
+    integrationMutationRequest.current.abort();
     invalidateSchemaRequest();
     setPendingInstall(null);
     setConfigSchema(null);
     setSchemaError("");
     setSubmitError("");
+    setSubmitting(false);
   };
 
   return (

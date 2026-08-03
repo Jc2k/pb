@@ -51,13 +51,6 @@ import {
   parseSessionStreamSnapshotJson,
 } from "../lib/eventContract";
 
-export function isNewerThanSnapshot(
-  sequence: number,
-  revision: number | null,
-): boolean {
-  return revision !== null && sequence > revision;
-}
-
 export function workflowRecoveryPresentation(
   workflow?: WorkflowSummary | null,
 ): {
@@ -120,13 +113,23 @@ export function mergeEventHistory(
   );
 }
 
+export function mergeResetEventHistory(
+  snapshotEvents: EventEnvelope[],
+  previous: EventEnvelope[],
+): EventEnvelope[] {
+  const eventWatermark = snapshotEvents.at(-1)?.transcript.sequence ?? 0;
+  const newer = previous.filter((envelope) =>
+    envelope.transcript.sequence > eventWatermark
+  );
+  return mergeEventHistory(snapshotEvents, newer);
+}
+
 export function SessionPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
   const navigate = useNavigate();
   const [session, setSession] = useState<SessionDetails | null>(null);
   const [sessionError, setSessionError] = useState("");
   const [events, setEvents] = useState<EventEnvelope[]>([]);
-  const [sessionRunning, setSessionRunning] = useState(false);
   const [followUp, setFollowUp] = useState("");
   const [runningMessage, setRunningMessage] = useState("");
   const [runningMessageError, setRunningMessageError] = useState("");
@@ -149,12 +152,6 @@ export function SessionPage() {
   const actionRequestRef = useRef(new LatestRequest());
   const messageRequestRef = useRef(new LatestRequest());
   const snapshotRevisionRef = useRef<number | null>(null);
-  const latestTitleEffectRef = useRef<
-    { sequence: number; title: string } | null
-  >(null);
-  const latestRunningEffectRef = useRef<
-    { sequence: number; running: boolean } | null
-  >(null);
   const chatRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
   const messageTimePullStartRef = useRef<{ x: number; y: number } | null>(null);
@@ -162,31 +159,19 @@ export function SessionPage() {
   const applySessionSnapshot = (
     details: SessionDetails,
     resetHistory = false,
+    warnings: string[] = [],
   ) => {
+    if (warnings.length > 0) setActionError(warnings.join(" "));
     if (
       snapshotRevisionRef.current !== null &&
       details.revision < snapshotRevisionRef.current
     ) return;
     snapshotRevisionRef.current = details.revision;
-    const titleEffect = latestTitleEffectRef.current;
-    const runningEffect = latestRunningEffectRef.current;
-    setSession(
-      titleEffect && titleEffect.sequence > details.revision
-        ? { ...details, title: titleEffect.title }
-        : details,
-    );
+    setSession(details);
     setEvents((previous) => {
       if (!resetHistory) return mergeEventHistory(details.events, previous);
-      const newer = previous.filter((envelope) =>
-        envelope.transcript.sequence > details.revision
-      );
-      return mergeEventHistory(details.events, newer);
+      return mergeResetEventHistory(details.events, previous);
     });
-    setSessionRunning(
-      runningEffect && runningEffect.sequence > details.revision
-        ? runningEffect.running
-        : details.running,
-    );
     setSessionError("");
   };
 
@@ -200,7 +185,11 @@ export function SessionPage() {
         const parsed = parseSessionStreamSnapshotJson(
           (message as MessageEvent<string>).data,
         );
-        applySessionSnapshot(parsed.session, parsed.reset_history);
+        applySessionSnapshot(
+          parsed.session,
+          parsed.reset_history,
+          parsed.warnings,
+        );
       } catch (error) {
         console.error(error);
       }
@@ -210,58 +199,6 @@ export function SessionPage() {
       try {
         const parsed = parseEventEnvelopeJson(msg.data);
         setEvents((previous) => mergeEventHistory(previous, [parsed]));
-        const effect = parsed.transcript.session_effect;
-        const sequence = parsed.transcript.sequence;
-        const newerThanSnapshot = isNewerThanSnapshot(
-          sequence,
-          snapshotRevisionRef.current,
-        );
-        if (effect.title) {
-          const title = effect.title;
-          const currentEffect = latestTitleEffectRef.current;
-          if (
-            !currentEffect ||
-            sequence > currentEffect.sequence
-          ) {
-            latestTitleEffectRef.current = {
-              sequence,
-              title,
-            };
-            if (newerThanSnapshot) {
-              setSession((current) =>
-                current ? { ...current, title } : current
-              );
-            }
-          }
-        }
-        if (effect.running === "running") {
-          const currentEffect = latestRunningEffectRef.current;
-          if (
-            !currentEffect ||
-            sequence > currentEffect.sequence
-          ) {
-            latestRunningEffectRef.current = {
-              sequence,
-              running: true,
-            };
-            if (newerThanSnapshot) setSessionRunning(true);
-          }
-        } else if (effect.running === "stopped") {
-          const currentEffect = latestRunningEffectRef.current;
-          if (
-            !currentEffect ||
-            sequence > currentEffect.sequence
-          ) {
-            latestRunningEffectRef.current = {
-              sequence,
-              running: false,
-            };
-            if (newerThanSnapshot) setSessionRunning(false);
-          }
-        }
-        if (effect.reset_intent && newerThanSnapshot) {
-          setIntent("discuss");
-        }
       } catch (err) {
         console.error(err);
       }
@@ -320,8 +257,13 @@ export function SessionPage() {
       }
       const snapshot = parseSessionStreamSnapshotJson(await response.text());
       if (!actionRequestRef.current.owns(controller)) return;
-      applySessionSnapshot(snapshot.session, snapshot.reset_history);
+      applySessionSnapshot(
+        snapshot.session,
+        snapshot.reset_history,
+        snapshot.warnings,
+      );
       setFollowUp("");
+      setIntent("discuss");
     } catch (error) {
       if (isAbortError(error) || !actionRequestRef.current.owns(controller)) {
         return;
@@ -353,7 +295,11 @@ export function SessionPage() {
       }
       const snapshot = parseSessionStreamSnapshotJson(await response.text());
       if (!messageRequestRef.current.owns(controller)) return;
-      applySessionSnapshot(snapshot.session, snapshot.reset_history);
+      applySessionSnapshot(
+        snapshot.session,
+        snapshot.reset_history,
+        snapshot.warnings,
+      );
       setRunningMessage("");
     } catch (error) {
       if (isAbortError(error) || !messageRequestRef.current.owns(controller)) {
@@ -388,7 +334,11 @@ export function SessionPage() {
       }
       const snapshot = parseSessionStreamSnapshotJson(await response.text());
       if (!actionRequestRef.current.owns(controller)) return false;
-      applySessionSnapshot(snapshot.session, snapshot.reset_history);
+      applySessionSnapshot(
+        snapshot.session,
+        snapshot.reset_history,
+        snapshot.warnings,
+      );
       return true;
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
@@ -460,7 +410,11 @@ export function SessionPage() {
       }
       const snapshot = parseSessionStreamSnapshotJson(await response.text());
       if (!actionRequestRef.current.owns(controller)) return;
-      applySessionSnapshot(snapshot.session, snapshot.reset_history);
+      applySessionSnapshot(
+        snapshot.session,
+        snapshot.reset_history,
+        snapshot.warnings,
+      );
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
         setWorkflowRecoveryError(
@@ -493,7 +447,11 @@ export function SessionPage() {
       }
       const snapshot = parseSessionStreamSnapshotJson(await response.text());
       if (!actionRequestRef.current.owns(controller)) return;
-      applySessionSnapshot(snapshot.session, snapshot.reset_history);
+      applySessionSnapshot(
+        snapshot.session,
+        snapshot.reset_history,
+        snapshot.warnings,
+      );
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
         setActionError(
@@ -523,7 +481,11 @@ export function SessionPage() {
       }
       const snapshot = parseSessionStreamSnapshotJson(await response.text());
       if (!actionRequestRef.current.owns(controller)) return;
-      applySessionSnapshot(snapshot.session, snapshot.reset_history);
+      applySessionSnapshot(
+        snapshot.session,
+        snapshot.reset_history,
+        snapshot.warnings,
+      );
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
         setActionError(
@@ -588,7 +550,11 @@ export function SessionPage() {
       }
       const snapshot = parseSessionStreamSnapshotJson(await response.text());
       if (!actionRequestRef.current.owns(controller)) return;
-      applySessionSnapshot(snapshot.session, snapshot.reset_history);
+      applySessionSnapshot(
+        snapshot.session,
+        snapshot.reset_history,
+        snapshot.warnings,
+      );
       setAnswer("");
     } catch (error) {
       if (!isAbortError(error) && actionRequestRef.current.owns(controller)) {
@@ -649,8 +615,6 @@ export function SessionPage() {
     setRunningMessageError("");
     setAnswer("");
     setIntent("discuss");
-    latestTitleEffectRef.current = null;
-    latestRunningEffectRef.current = null;
     snapshotRevisionRef.current = null;
     openEvents(sessionId);
     void fetchSession();
@@ -685,7 +649,7 @@ export function SessionPage() {
     return () => window.clearTimeout(timer);
   }, [shareMessage]);
 
-  const isRunning = sessionRunning;
+  const isRunning = session?.status === "running";
   const activeGoal = session?.active_goal ? session.goal : undefined;
   const goalControlsBusy = goalBusy || session?.cancel_requested === true;
   const activeGoalBanner = activeGoal
@@ -1396,6 +1360,7 @@ export function SessionPage() {
                 applySessionSnapshot(
                   snapshot.session,
                   snapshot.reset_history,
+                  snapshot.warnings,
                 )}
             />
           )
@@ -1413,7 +1378,11 @@ export function SessionPage() {
             setFollowUp("");
           }}
           onSessionUpdated={(snapshot) =>
-            applySessionSnapshot(snapshot.session, snapshot.reset_history)}
+            applySessionSnapshot(
+              snapshot.session,
+              snapshot.reset_history,
+              snapshot.warnings,
+            )}
         />
       </section>
     </div>

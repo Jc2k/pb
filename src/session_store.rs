@@ -13,7 +13,31 @@ const NOTES_NAMESPACE: &str = "refs/notes/pb/sessions";
 const MAX_RESTORED_HISTORY_EVENTS: usize = 1_000;
 const SESSION_GIT_NAME: &str = "pb";
 const SESSION_GIT_EMAIL: &str = "pb@localhost";
-pub const SESSION_SCHEMA_VERSION: &str = "v5";
+pub const SESSION_SCHEMA_VERSION: &str = "v6";
+
+/// Durable storage used by the live session boundary.
+///
+/// The production implementation writes Git notes. Keeping the storage operation behind this
+/// small interface lets the coordinator prove its publication ordering under deterministic
+/// failures instead of relying on malformed identifiers or filesystem accidents in tests.
+pub(crate) trait SessionRepository: std::fmt::Debug + Send + Sync {
+    fn save(&self, session: &PersistedSession) -> Result<()>;
+
+    fn delete(&self, workdir: &Path, session_id: &str) -> Result<()>;
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct GitNoteSessionRepository;
+
+impl SessionRepository for GitNoteSessionRepository {
+    fn save(&self, session: &PersistedSession) -> Result<()> {
+        save_session_to_git_notes(session)
+    }
+
+    fn delete(&self, workdir: &Path, session_id: &str) -> Result<()> {
+        delete_session_from_git_notes(workdir, session_id)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -53,8 +77,8 @@ pub struct PersistedSession {
     pub pending_goal_proposal: Option<crate::goal::GoalProposal>,
     pub pending_goal_change: Option<PendingGoalChange>,
     pub request_template: AgentRequest,
-    pub running: bool,
     pub status: SessionStatus,
+    pub revision: u64,
     pub started_at_ms: u64,
     pub updated_at_ms: u64,
     pub metrics: Option<SessionMetricsSnapshot>,
@@ -75,7 +99,6 @@ impl PersistedSession {
         mut request_template: AgentRequest,
         branch: Option<String>,
         workdir: Option<PathBuf>,
-        running: bool,
         status: SessionStatus,
         mut events: Vec<EventEnvelope>,
     ) -> Self {
@@ -116,8 +139,8 @@ impl PersistedSession {
             pending_goal_proposal: None,
             pending_goal_change: None,
             request_template,
-            running,
             status,
+            revision: 0,
             started_at_ms,
             updated_at_ms: now,
             metrics: latest_session_metrics(&events),
@@ -134,7 +157,12 @@ impl PersistedSession {
     }
 }
 
-pub fn save_session(session: &PersistedSession) -> Result<()> {
+#[cfg(test)]
+fn save_session(session: &PersistedSession) -> Result<()> {
+    GitNoteSessionRepository.save(session)
+}
+
+fn save_session_to_git_notes(session: &PersistedSession) -> Result<()> {
     let Some(workspace_root) = workspace_root(session) else {
         return Ok(());
     };
@@ -160,7 +188,12 @@ pub fn save_session(session: &PersistedSession) -> Result<()> {
     result.map(|_| ())
 }
 
-pub fn delete_session(workdir: &Path, session_id: &str) -> Result<()> {
+#[cfg(test)]
+fn delete_session(workdir: &Path, session_id: &str) -> Result<()> {
+    GitNoteSessionRepository.delete(workdir, session_id)
+}
+
+fn delete_session_from_git_notes(workdir: &Path, session_id: &str) -> Result<()> {
     let workspace_root = find_git_root(workdir).unwrap_or_else(|| workdir.to_path_buf());
     let note_ref = session_note_ref(session_id)?;
     run_git(&workspace_root, ["update-ref", "-d", note_ref.as_str()]).map(|_| ())
@@ -272,7 +305,6 @@ pub fn restore_project_sessions(workspace_root: &Path) -> Result<Vec<PersistedSe
                     SessionStatus::Completed => SessionStatus::Completed,
                     SessionStatus::Failed => SessionStatus::Failed,
                 };
-                session.running = false;
                 session.events = trim_events(session.events);
                 sessions.push(session);
             }
@@ -381,9 +413,6 @@ fn validate_authoritative_session_state(session: &PersistedSession) -> Result<()
         || session.request_template.session_id != session.session_id
     {
         bail!("session identity does not match its request template");
-    }
-    if session.running != (session.status == SessionStatus::Running) {
-        bail!("session running flag does not match its status");
     }
     if let Some(project) = session.project.as_ref()
         && (project.id.trim().is_empty()
@@ -903,7 +932,6 @@ mod tests {
             request(repo.path()),
             Some("pb/test".to_string()),
             Some(repo.path().to_path_buf()),
-            true,
             SessionStatus::Running,
             Vec::new(),
         );
@@ -968,7 +996,6 @@ mod tests {
             request.clone(),
             None,
             Some(repo.path().to_path_buf()),
-            false,
             SessionStatus::Paused,
             Vec::new(),
         );
@@ -989,7 +1016,6 @@ mod tests {
             request,
             None,
             Some(repo.path().to_path_buf()),
-            true,
             SessionStatus::Running,
             Vec::new(),
         );
@@ -1046,7 +1072,6 @@ mod tests {
             request(dir.path()),
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
-            false,
             SessionStatus::Completed,
             events,
         );
@@ -1092,7 +1117,6 @@ mod tests {
             request(&managed_path),
             Some("pb/test".to_string()),
             Some(managed_path.clone()),
-            false,
             SessionStatus::Completed,
             Vec::new(),
         );
@@ -1142,7 +1166,6 @@ mod tests {
             request,
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
-            true,
             SessionStatus::Running,
             vec![EventEnvelope::new(AgentEvent::SessionTitle {
                 title: " Tool supplied title ".to_string(),
@@ -1161,7 +1184,6 @@ mod tests {
             request(dir.path()),
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
-            false,
             SessionStatus::Completed,
             Vec::new(),
         );
@@ -1173,14 +1195,13 @@ mod tests {
     }
 
     #[test]
-    fn persisted_v5_session_requires_authoritative_state_fields() {
+    fn persisted_v6_session_requires_authoritative_state_fields() {
         let dir = init_repo();
         let session = PersistedSession::from_parts(
             "malformed-session".to_string(),
             request(dir.path()),
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
-            false,
             SessionStatus::Completed,
             Vec::new(),
         );
@@ -1191,6 +1212,7 @@ mod tests {
             "branch",
             "workdir",
             "status",
+            "revision",
             "started_at_ms",
             "usage_records",
             "pending_user_messages",
@@ -1220,12 +1242,11 @@ mod tests {
             request(dir.path()),
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
-            false,
             SessionStatus::Completed,
             Vec::new(),
         );
         let value = serde_json::to_value(session).unwrap();
-        for version in ["v2", "v3"] {
+        for version in ["v2", "v3", "v4", "v5"] {
             let mut old = value.clone();
             old["schema_version"] = serde_json::Value::String(version.to_string());
             let error = parse_session(&serde_json::to_string(&old).unwrap()).unwrap_err();
@@ -1255,7 +1276,6 @@ mod tests {
             request(dir.path()),
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
-            false,
             SessionStatus::Completed,
             vec![started],
         );
@@ -1355,7 +1375,6 @@ mod tests {
             request(dir.path()),
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
-            false,
             SessionStatus::Completed,
             trimmed,
         );
@@ -1379,7 +1398,6 @@ mod tests {
             request(dir.path()),
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
-            false,
             SessionStatus::Completed,
             vec![correction.clone()],
         );
@@ -1408,7 +1426,6 @@ mod tests {
             request(dir.path()),
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
-            false,
             SessionStatus::Completed,
             vec![title],
         );
@@ -1426,7 +1443,6 @@ mod tests {
             request(dir.path()),
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
-            false,
             SessionStatus::Completed,
             vec![
                 EventEnvelope::new(AgentEvent::SessionTitle {
@@ -1449,22 +1465,21 @@ mod tests {
     }
 
     #[test]
-    fn session_parser_rejects_contradictory_authoritative_state() {
+    fn session_parser_rejects_duplicate_lifecycle_state() {
         let dir = init_repo();
-        let mut status = PersistedSession::from_parts(
+        let status = PersistedSession::from_parts(
             "contradictory-state".to_string(),
             request(dir.path()),
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
-            false,
             SessionStatus::Completed,
             Vec::new(),
         );
-        status.running = true;
-        assert!(parse_session(&serde_json::to_string(&status).unwrap()).is_err());
+        let mut duplicate_status = serde_json::to_value(&status).unwrap();
+        duplicate_status["running"] = serde_json::json!(true);
+        assert!(parse_session(&serde_json::to_string(&duplicate_status).unwrap()).is_err());
 
         let mut project = status;
-        project.running = false;
         project.project = Some(SessionProject {
             id: "project-pb".to_string(),
             name: "pb".to_string(),
@@ -1477,7 +1492,6 @@ mod tests {
             request(dir.path()),
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
-            false,
             SessionStatus::Completed,
             vec![metrics_event(1, 1.0, 1_000)],
         );
@@ -1489,7 +1503,6 @@ mod tests {
             request(dir.path()),
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
-            false,
             SessionStatus::Completed,
             Vec::new(),
         );
@@ -1505,7 +1518,6 @@ mod tests {
             request(dir.path()),
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
-            false,
             SessionStatus::Completed,
             Vec::new(),
         ))
@@ -1558,7 +1570,6 @@ mod tests {
             request,
             Some("pb/test".to_string()),
             Some(dir.path().to_path_buf()),
-            true,
             SessionStatus::Running,
             vec![
                 EventEnvelope::new(AgentEvent::Final {
@@ -1576,7 +1587,7 @@ mod tests {
         let restored = restore_project_sessions(dir.path()).unwrap();
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].session_id, "session-123");
-        assert!(!restored[0].running);
+        assert_eq!(restored[0].status, SessionStatus::Paused);
         assert!(!restored[0].request_template.legacy_prompt_owned_delivery);
         assert_eq!(restored[0].events.len(), 3);
         assert!(matches!(

@@ -2,8 +2,8 @@
 import { ok } from "node:assert/strict";
 import { equal } from "node:assert/strict";
 import {
-  isNewerThanSnapshot,
   mergeEventHistory,
+  mergeResetEventHistory,
   readyEvidenceLabel,
   workflowOutcomeLabel,
   workflowProgressLabel,
@@ -29,10 +29,6 @@ function eventEnvelopeDefaults(): Pick<
       entry_key: `test-event-${testEventIndex}`,
       supersedes: [],
       summary_redundant: false,
-      session_effect: {
-        running: "unchanged",
-        reset_intent: false,
-      },
     },
   };
 }
@@ -48,7 +44,7 @@ function cssRule(css: string, selector: string): string {
 Deno.test("event history merges stream and snapshot data by stable entry key", () => {
   const started: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v5",
+    version: "v6",
     event: {
       type: "started",
       task: "Review the boundary",
@@ -62,7 +58,7 @@ Deno.test("event history merges stream and snapshot data by stable entry key", (
   };
   const streamed: EventEnvelope = {
     ...eventEnvelopeDefaults(),
-    version: "v5",
+    version: "v6",
     event: {
       type: "user_message",
       message_id: "message-1",
@@ -82,6 +78,37 @@ Deno.test("event history merges stream and snapshot data by stable entry key", (
   equal(merged.length, 2);
   equal(merged[0], started);
   equal(merged[1], corrected);
+});
+
+Deno.test("history reset uses the event watermark, never the session revision", () => {
+  const retained: EventEnvelope = {
+    ...eventEnvelopeDefaults(),
+    version: "v6",
+    event: {
+      type: "user_message",
+      message_id: "retained",
+      message: "retained",
+    },
+  };
+  retained.transcript.sequence = 40;
+  const racingLive: EventEnvelope = {
+    ...eventEnvelopeDefaults(),
+    version: "v6",
+    event: {
+      type: "user_message",
+      message_id: "racing-live",
+      message: "racing live event",
+    },
+  };
+  racingLive.transcript.sequence = 41;
+
+  const merged = mergeResetEventHistory(
+    [retained],
+    [retained, racingLive],
+  );
+
+  equal(merged.length, 2);
+  equal(merged[1]?.transcript.entry_key, racingLive.transcript.entry_key);
 });
 
 Deno.test("strict workflow stages and outcomes use compact truthful labels", () => {
@@ -429,20 +456,35 @@ Deno.test("session mutations apply the authoritative stream snapshot response", 
   );
 
   ok(!mutations.includes("setSessionRunning"));
-  ok(!mutations.includes('setIntent("discuss")'));
+  ok(mutations.includes('setFollowUp("");\n      setIntent("discuss");'));
   ok(
     (mutations.match(/parseSessionStreamSnapshotJson/g)?.length ?? 0) >= 7,
   );
   ok(
-    (mutations.match(/applySessionSnapshot\(snapshot\.session/g)?.length ??
+    (mutations.match(/applySessionSnapshot\(/g)?.length ??
       0) >= 7,
   );
+  ok((mutations.match(/snapshot\.warnings/g)?.length ?? 0) >= 7);
   ok(
     page.includes(
       "goalControlsBusy = goalBusy || session?.cancel_requested === true",
     ),
   );
-  equal(page.match(/setSessionRunning/g)?.length, 4);
+  ok(!page.includes("setSessionRunning"));
+  ok(page.includes('const isRunning = session?.status === "running"'));
+  ok(!page.includes("session?.running"));
+});
+
+Deno.test("committed warnings survive a newer session revision", async () => {
+  const source = await Deno.readTextFile("webui/src/pages/SessionPage.tsx");
+  const applyStart = source.indexOf("const applySessionSnapshot = (");
+  const applyEnd = source.indexOf("const openEvents", applyStart);
+  const apply = source.slice(applyStart, applyEnd);
+  equal(
+    apply.indexOf('setActionError(warnings.join(" "))') <
+      apply.indexOf("details.revision < snapshotRevisionRef.current"),
+    true,
+  );
 });
 
 Deno.test("session workspace prioritizes chat and shows work details only when useful", async () => {
@@ -533,17 +575,19 @@ Deno.test("session transport opens first and lets EventSource reconnect with ded
       routeEffect.indexOf("void fetchSession();"),
   );
   ok(page.includes("mergeEventHistory(previous, [parsed])"));
-  ok(page.includes("mergeEventHistory(details.events, previous)"));
+  ok(page.includes("mergeResetEventHistory(details.events, previous)"));
   ok(page.includes("if (sourceRef.current !== src) return;"));
   ok(page.includes("new LatestRequest()"));
   ok(page.includes("sessionRequestRef.current.owns(controller)"));
-  ok(page.includes("titleEffect.sequence > details.revision"));
-  ok(page.includes("runningEffect.sequence > details.revision"));
-  ok(page.includes("sequence > currentEffect.sequence"));
+  ok(page.includes("setSession(details)"));
+  ok(!page.includes("setSessionRunning"));
+  ok(!page.includes("session_effect"));
   ok(page.includes("snapshotRevisionRef.current = details.revision"));
   ok(page.includes('addEventListener("session_snapshot"'));
   ok(page.includes("parsed.reset_history"));
-  ok(page.includes("envelope.transcript.sequence > details.revision"));
+  ok(page.includes("const eventWatermark"));
+  ok(!page.includes("envelope.transcript.sequence > details.revision"));
+  ok(page.includes('setActionError(warnings.join(" "))'));
   ok(!page.includes("sessionRefreshRequestedRef"));
   ok(!page.includes("latestRefreshEffectRef"));
   equal(page.match(/fetchSession\(\)/g)?.length, 3);
@@ -555,10 +599,4 @@ Deno.test("session transport opens first and lets EventSource reconnect with ded
   ok(!page.includes("latestPendingGoalProposal"));
   ok(!page.includes("latestGoalChangeRequest"));
   ok(!page.includes("src.onerror"));
-});
-
-Deno.test("stream effects apply only beyond an accepted snapshot revision", () => {
-  equal(isNewerThanSnapshot(11, null), false);
-  equal(isNewerThanSnapshot(11, 11), false);
-  equal(isNewerThanSnapshot(12, 11), true);
 });
