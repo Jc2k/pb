@@ -1608,6 +1608,10 @@ article.user div.message-container {
         background: transparent;
         box-shadow: none;
     }
+
+    .teammate-message.chat-event-message {
+        background: transparent;
+    }
     .chat-event-message > .message-container > .thought-bubble {
         width: 100%;
         max-width: 100%;
