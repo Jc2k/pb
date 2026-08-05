@@ -298,10 +298,6 @@ Deno.test("iPhone transcript keeps chat bubbles instead of card wrappers", async
   ok(mobileChatEventRule.includes("border: 0;"));
   ok(mobileChatEventRule.includes("background: transparent;"));
 
-  const mobileChatBubbleRule = cssRule(
-    css,
-    ".chat-event-message > .message-container > .thought-bubble",
-  );
   const mobileChatBubbleMediaRule = cssRuleAfter(
     css,
     ".chat-event-message > .message-container > .thought-bubble",
@@ -313,7 +309,11 @@ Deno.test("iPhone transcript keeps chat bubbles instead of card wrappers", async
   const mobileUserContainerRule = cssRule(css, ".user-message .message-container");
   ok(mobileUserContainerRule.includes("max-width: min(88%, 28rem);"));
 
-  const mobileUserBubbleRule = cssRule(css, ".user-bubble");
+  const mobileUserBubbleRule = cssRuleAfter(
+    css,
+    ".user-bubble",
+    "@media (max-width: 575.98px)",
+  );
   ok(mobileUserBubbleRule.includes("max-width: 100%;"));
 });
 
