@@ -1570,7 +1570,7 @@ article.user div.message-container {
     }
     .bubble {
         font-size: 0.92rem;
-        padding: 0.78rem 0.85rem 0.35rem;
+        padding: 0.72rem 0.85rem;
         border-radius: 16px;
     }
     .thought-bubble {
@@ -1602,23 +1602,16 @@ article.user div.message-container {
     }
     .chat-event-message {
         gap: 0.7rem;
-        padding: 0.9rem;
-        border: 1px solid var(--line);
-        border-radius: 16px;
-        background: #fff;
-    }
-    .teammate-message.chat-event-message {
-        border-color: var(--teammate-border);
-        box-shadow: inset 3px 0 0 var(--teammate-edge);
-    }
-    .chat-event-message > .message-container > .thought-bubble {
-        width: 100%;
-        max-width: 100%;
         padding: 0;
         border: 0;
         border-radius: 0;
         background: transparent;
         box-shadow: none;
+    }
+    .chat-event-message > .message-container > .thought-bubble {
+        width: 100%;
+        max-width: 100%;
+        padding: 0.72rem 0.85rem;
     }
     .chat-event-message .author-line {
         flex-wrap: wrap;
@@ -1643,17 +1636,18 @@ article.user div.message-container {
     .chat-stream {
         background: #f2f2f7;
     }
-    .user-bubble {
+    .user-message {
+        align-items: flex-end;
+    }
+    .user-message .message-container {
         max-width: min(88%, 28rem);
     }
-    .user-message .author-line {
-        order: 2;
-        justify-content: flex-end;
-        margin: 0.35rem 0 0;
+    .user-bubble {
+        max-width: 100%;
     }
-    .user-message .author-line strong,
-    .user-message .author-line span {
-        display: none;
+    .user-message .author-line {
+        justify-content: flex-end;
+        margin: 0 0 0.35rem;
     }
     .composer {
         padding-inline: 0.7rem;

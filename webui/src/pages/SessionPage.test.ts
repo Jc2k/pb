@@ -280,6 +280,28 @@ Deno.test("session chat groups speakers and reveals useful message times", async
   ok(css.includes(".speaker-continuation > .bot-avatar"));
 });
 
+Deno.test("iPhone transcript keeps chat bubbles instead of card wrappers", async () => {
+  const css = await Deno.readTextFile("webui/src/session.css");
+
+  const mobileChatEventRule = cssRule(css, ".chat-event-message");
+  ok(mobileChatEventRule.includes("padding: 0;"));
+  ok(mobileChatEventRule.includes("border: 0;"));
+  ok(mobileChatEventRule.includes("background: transparent;"));
+
+  const mobileChatBubbleRule = cssRule(
+    css,
+    ".chat-event-message > .message-container > .thought-bubble",
+  );
+  ok(mobileChatBubbleRule.includes("padding: 0.72rem 0.85rem;"));
+  ok(!mobileChatBubbleRule.includes("border: 0;"));
+
+  const mobileUserContainerRule = cssRule(css, ".user-message .message-container");
+  ok(mobileUserContainerRule.includes("max-width: min(88%, 28rem);"));
+
+  const mobileUserBubbleRule = cssRule(css, ".user-bubble");
+  ok(mobileUserBubbleRule.includes("max-width: 100%;"));
+});
+
 Deno.test("assistant and Trinity prose share safe inline Markdown rendering", async () => {
   const component = await Deno.readTextFile("webui/src/components/Session.tsx");
 
