@@ -51,6 +51,26 @@ function cssRuleAfter(css: string, selector: string, after: string): string {
   return css.slice(start, end);
 }
 
+function cssRuleNthAfter(
+  css: string,
+  selector: string,
+  after: string,
+  occurrence: number,
+): string {
+  ok(occurrence >= 1, "CSS occurrence must be >= 1");
+  let searchStart = css.indexOf(after);
+  ok(searchStart >= 0, `missing CSS anchor ${after}`);
+  let start = -1;
+  for (let index = 0; index < occurrence; index += 1) {
+    start = css.indexOf(`${selector} {`, searchStart);
+    ok(start >= 0, `missing CSS rule ${selector} occurrence ${occurrence} after ${after}`);
+    searchStart = start + selector.length + 2;
+  }
+  const end = css.indexOf("}", start);
+  ok(end > start, `unterminated CSS rule for ${selector}`);
+  return css.slice(start, end);
+}
+
 Deno.test("event history merges stream and snapshot data by stable entry key", () => {
   const started: EventEnvelope = {
     ...eventEnvelopeDefaults(),
@@ -314,7 +334,14 @@ Deno.test("iPhone transcript keeps chat bubbles instead of card wrappers", async
     ".user-bubble",
     "@media (max-width: 575.98px)",
   );
-  ok(mobileUserBubbleRule.includes("max-width: 100%;"));
+  const mobileUserWidthRule = cssRuleNthAfter(
+    css,
+    ".user-bubble",
+    "@media (max-width: 575.98px)",
+    2,
+  );
+  ok(mobileUserBubbleRule.includes("border-bottom-right-radius: 6px;"));
+  ok(mobileUserWidthRule.includes("max-width: 100%;"));
 });
 
 Deno.test("assistant and Trinity prose share safe inline Markdown rendering", async () => {
