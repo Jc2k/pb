@@ -41,6 +41,36 @@ function cssRule(css: string, selector: string): string {
   return css.slice(start, end);
 }
 
+function cssRuleAfter(css: string, selector: string, after: string): string {
+  const afterIndex = css.indexOf(after);
+  ok(afterIndex >= 0, `missing CSS anchor ${after}`);
+  const start = css.indexOf(`${selector} {`, afterIndex);
+  ok(start >= 0, `missing CSS rule for ${selector} after ${after}`);
+  const end = css.indexOf("}", start);
+  ok(end > start, `unterminated CSS rule for ${selector}`);
+  return css.slice(start, end);
+}
+
+function cssRuleNthAfter(
+  css: string,
+  selector: string,
+  after: string,
+  occurrence: number,
+): string {
+  ok(occurrence >= 1, "CSS occurrence must be >= 1");
+  let searchStart = css.indexOf(after);
+  ok(searchStart >= 0, `missing CSS anchor ${after}`);
+  let start = -1;
+  for (let index = 0; index < occurrence; index += 1) {
+    start = css.indexOf(`${selector} {`, searchStart);
+    ok(start >= 0, `missing CSS rule ${selector} occurrence ${occurrence} after ${after}`);
+    searchStart = start + selector.length + 2;
+  }
+  const end = css.indexOf("}", start);
+  ok(end > start, `unterminated CSS rule for ${selector}`);
+  return css.slice(start, end);
+}
+
 Deno.test("event history merges stream and snapshot data by stable entry key", () => {
   const started: EventEnvelope = {
     ...eventEnvelopeDefaults(),
@@ -288,18 +318,30 @@ Deno.test("iPhone transcript keeps chat bubbles instead of card wrappers", async
   ok(mobileChatEventRule.includes("border: 0;"));
   ok(mobileChatEventRule.includes("background: transparent;"));
 
-  const mobileChatBubbleRule = cssRule(
+  const mobileChatBubbleMediaRule = cssRuleAfter(
     css,
     ".chat-event-message > .message-container > .thought-bubble",
+    "@media (max-width: 575.98px)",
   );
-  ok(mobileChatBubbleRule.includes("padding: 0.72rem 0.85rem;"));
-  ok(!mobileChatBubbleRule.includes("border: 0;"));
+  ok(mobileChatBubbleMediaRule.includes("padding: 0.72rem 0.85rem;"));
+  ok(!mobileChatBubbleMediaRule.includes("border: 0;"));
 
   const mobileUserContainerRule = cssRule(css, ".user-message .message-container");
   ok(mobileUserContainerRule.includes("max-width: min(88%, 28rem);"));
 
-  const mobileUserBubbleRule = cssRule(css, ".user-bubble");
-  ok(mobileUserBubbleRule.includes("max-width: 100%;"));
+  const mobileUserBubbleRule = cssRuleAfter(
+    css,
+    ".user-bubble",
+    "@media (max-width: 575.98px)",
+  );
+  const mobileUserWidthRule = cssRuleNthAfter(
+    css,
+    ".user-bubble",
+    "@media (max-width: 575.98px)",
+    2,
+  );
+  ok(mobileUserBubbleRule.includes("border-bottom-right-radius: 6px;"));
+  ok(mobileUserWidthRule.includes("max-width: 100%;"));
 });
 
 Deno.test("assistant and Trinity prose share safe inline Markdown rendering", async () => {
