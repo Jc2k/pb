@@ -9,6 +9,11 @@ Use **Discuss** in the web interface for explanation, brainstorming, repository 
 planning. A discussion is read-only. It can consult bounded advisory agents and it can propose a
 delivery, but it cannot edit the project or start delivery on its own.
 
+Build-shaped wording is still safe and useful in Discuss. pb investigates it as a conversation,
+answers with what it found, and may show a **Build this** action. The answer and optional proposal
+arrive together; pb then waits for you. Choosing Build starts fresh snapshot-bound planning and
+review, so a conversational suggestion is not silently treated as an accepted implementation plan.
+
 Discussion is useful when the important output is understanding:
 
 - explain a subsystem or unfamiliar diff;

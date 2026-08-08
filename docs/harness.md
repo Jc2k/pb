@@ -14,7 +14,11 @@ pb harness agent "Build a small Rust CLI that prints a greeting"
 
 `--intent deliver` is the default and runs the strict workflow. Use `--intent discuss` for a
 read-only conversational experiment or `--intent auto` to allow a read-only turn to request an
-explicit transition into delivery.
+explicit transition into delivery. A root Discuss conversation returns through the typed `answer`
+action, which contains the user-visible content and may attach one Build or Goal proposal. Auto can
+instead end with `start_delivery` or `start_goal`. After an exact repeated tool warning the
+controller exposes only `answer`; on an untouched Auto turn's last step it requires exactly one of
+the three terminal actions. Evidence gathering therefore cannot consume the terminal reply.
 
 The command blocks until `agent_core::run_agent` completes or fails. Existing web and `pb queue`
 session paths continue to use their normal daemon lifecycle. `journal.md` is initialized before model

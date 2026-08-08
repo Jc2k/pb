@@ -229,6 +229,7 @@ impl StageCapabilities {
                 self.terminal_action == TerminalActionKind::SubmitImplementation
             }
             "submit_code_review" => self.terminal_action == TerminalActionKind::SubmitCodeReview,
+            "answer" => self.terminal_action == TerminalActionKind::DiscussFinal,
             "propose_delivery" | "start_delivery" | "propose_goal" | "start_goal" => {
                 self.terminal_action == TerminalActionKind::DiscussFinal
             }
@@ -275,6 +276,7 @@ mod tests {
         assert!(!plan.allows_tool("apply_patch"));
         assert!(!plan.allows_tool("session_title"));
         assert!(!plan.allows_tool("session_changes"));
+        assert!(!plan.allows_tool("answer"));
 
         let review = StageCapabilities::for_stage(WorkflowStage::CodeReview);
         assert!(review.allows_tool("inspect_change"));
@@ -284,7 +286,10 @@ mod tests {
         assert!(!review.allows_tool("session_title"));
         assert!(!review.allows_tool("session_changes"));
 
-        assert!(StageCapabilities::discuss().allows_tool("session_title"));
+        let discuss = StageCapabilities::discuss();
+        assert!(discuss.allows_tool("session_title"));
+        assert!(discuss.allows_tool("answer"));
+        assert!(!discuss.allows_tool("apply_patch"));
     }
 
     #[test]

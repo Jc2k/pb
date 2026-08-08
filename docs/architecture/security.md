@@ -294,11 +294,11 @@ Durable Goal mode adds a Rust-owned controller above strict workflows, not a bro
 network/path/tool expansion, secrets, or publication. The controller snapshots its policy and a
 local-repository/no-publication authority envelope into every hashed Goal checkpoint.
 
-Discussion `propose_goal` is read-only. `start_goal` is exposed only to the internal Auto intent,
-must cite the current harness turn, and can create only an awaiting-approval Goal. During a Goal,
-the model can read bounded status or request pause, amendment, or budget review. Those calls pause
-for controller/user handling; they cannot resume, cancel, accept, rewrite the Goal, apply a budget
-increase, or grant publishing authority.
+The optional Goal proposal attached to conversation `answer` is read-only. `start_goal` is exposed
+only to the internal Auto intent, must cite the current harness turn, and can create only an
+awaiting-approval Goal. During a Goal, the model can read bounded status or request pause,
+amendment, or budget review. Those calls pause for controller/user handling; they cannot resume,
+cancel, accept, rewrite the Goal, apply a budget increase, or grant publishing authority.
 
 All mutating user/API operations use optimistic Goal-checkpoint digests. Initial and replacement
 plan approval also names the exact plan digest. Child workflows retain the ordinary stage

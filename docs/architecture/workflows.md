@@ -7,15 +7,29 @@ understanding. Delivery can change a repository, but only through an enforced, r
 
 A discussion starts with read-only capabilities. The model can inspect repository evidence, use
 public research tools, consult bounded read-only advisors, answer, or propose delivery. It cannot
-edit, run project commands, or commit.
+edit, run project commands, or commit. When a caller has not explicitly selected a read-only
+specialist, the controller assigns the Ask profile to the conversation and does not run
+mutation-oriented profile inference; an imperative such as "change this" therefore remains a
+request to investigate, answer, and optionally offer Build rather than a contradictory read-only
+Build invocation.
 
 ```text
-user message → read-only investigation → answer
-                                  └────→ delivery proposal → user chooses Build
+user message → read-only investigation → answer(content, optional proposal) → wait
+                                                    └────→ user chooses Build or Goal
 ```
 
-The proposal is not self-authorization. The transition happens only after explicit user intent is
-recorded by the calling surface.
+`answer` is the one typed terminal action for a root conversation turn. It publishes the
+user-visible content and can atomically attach either one Build task summary or one Goal objective
+and criteria set. It cannot attach both. Standalone proposal calls are not exposed to the root
+conversation, so a proposal cannot consume a turn and leave the user without an answer. A prose
+final is redirected to an answer-only turn, and the first exact repeated tool warning likewise
+closes evidence gathering and exposes only `answer`. A Discuss turn's last ordinary step is
+answer-only. An untouched Auto turn's last step instead requires exactly one terminal choice:
+`answer`, `start_delivery`, or `start_goal`.
+
+The proposal is not self-authorization or an accepted implementation plan. The transition happens
+only after explicit user intent is recorded by the calling surface. Build creates a fresh,
+repository-snapshot-bound strict plan and critique from the proposal handoff.
 
 ### In-flight user messages
 
@@ -35,12 +49,12 @@ invalidates the stale downstream artifacts and restarts planning from the curren
 snapshot. The next authoring stage then takes the message as ordinary user conversation input.
 
 Every stage artifact and successful task-finalization boundary performs the same pending-message
-check. This includes prose `final`, typed stage submissions, deterministic checks-to-review
-transitions, review-to-commit, and the no-change or commit success path. Immediately before an
-irreversible final response or managed commit, the daemon atomically closes that run's message
-window. A message either wins that boundary and is routed, or its POST is rejected with conflict;
-pb never acknowledges a message that the completed run cannot see. A containing Goal or multi-Task
-controller reopens the window when it starts its next model stage.
+check. This includes the typed conversation `answer`, legacy prose `final`, typed stage submissions,
+deterministic checks-to-review transitions, review-to-commit, and the no-change or commit success
+path. Immediately before an irreversible final response or managed commit, the daemon atomically
+closes that run's message window. A message either wins that boundary and is routed, or its POST is
+rejected with conflict; pb never acknowledges a message that the completed run cannot see. A
+containing Goal or multi-Task controller reopens the window when it starts its next model stage.
 Workflow stage capabilities, accepted-plan scope, checks, review, commit ownership, Goal controls,
 budgets, and publication authority remain controller-owned; user conversation content alone cannot
 mutate or widen those state machines.
@@ -476,7 +490,7 @@ resume can return there.
 
 The model-facing Goal tools are deliberately asymmetric:
 
-- `propose_goal` records a read-only discussion artifact;
+- conversation `answer` can attach a read-only Goal proposal while publishing its user-visible reply;
 - `start_goal` exists only in an explicit Auto turn, must cite that exact turn, and creates an
   approval-gated Goal rather than mutation authority;
 - `goal_status` returns a bounded controller-owned brief;

@@ -24,7 +24,11 @@ cannot redefine the user's acceptance criteria.
 
 Discussion is read-only. Delivery starts only from explicit Build intent in the web surface or a
 delivery-oriented CLI entry point such as `pb queue`. A discussion can propose work but cannot
-silently promote itself.
+silently promote itself. A root conversation ends through one typed `answer` action whose content
+and optional Build or Goal proposal share the same terminal boundary. An action-shaped prompt in
+Discuss is owned by the read-only answer profile rather than inferred as Build. The proposal is a
+bounded handoff, not an accepted delivery plan; explicit Build still creates and critiques a fresh
+snapshot-bound plan.
 
 Goal creation is a separate explicit lifecycle action, not a third serialized `TurnIntent`. A
 discussion model may propose a Goal. Only the user's Goal action, the Goal API/CLI, or an explicit

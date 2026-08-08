@@ -375,8 +375,8 @@
     "review_missing_check"
   ],
   "workflow_fixtures": [
-    {"id":"workflow_discussion_no_branch","hypothesis":"Discussion answers without creating or switching a task branch.","assertion":"discussion_no_branch"},
-    {"id":"workflow_discussion_no_mutation","hypothesis":"Discussion cannot mutate through built-in tools or a mutating teammate.","assertion":"discussion_no_mutation"},
+    {"id":"workflow_discussion_no_branch","hypothesis":"A typed Discussion answer completes without creating or switching a task branch.","assertion":"discussion_no_branch"},
+    {"id":"workflow_discussion_no_mutation","hypothesis":"Discussion cannot mutate through built-in tools or a mutating teammate and still closes with a typed answer.","assertion":"discussion_no_mutation"},
     {"id":"workflow_explicit_delivery_plans","hypothesis":"Explicit delivery starts at harness-owned planning.","assertion":"explicit_delivery_starts_planning"},
     {"id":"workflow_planning_requires_submission","hypothesis":"Planning prose cannot skip the structured plan submission.","assertion":"planning_requires_submission"},
     {"id":"workflow_planning_read_only","hypothesis":"Planning cannot mutate through direct tools, shell, or delegation.","assertion":"planning_authority_is_read_only"},
@@ -402,7 +402,7 @@
   ],
   "goal_fixtures": [
     {"id":"goal_exact_plan_approval","hypothesis":"Only the exact current Goal plan digest can start exactly one milestone.","assertion":"exact_plan_approval"},
-    {"id":"goal_model_tool_authority","hypothesis":"Proposal and Auto tools remain read-only requests bound to the exact current turn.","assertion":"model_tool_authority_bound"},
+    {"id":"goal_model_tool_authority","hypothesis":"Answer proposals and Auto tools remain read-only requests bound to the exact current turn.","assertion":"model_tool_authority_bound"},
     {"id":"goal_sequential_milestones","hypothesis":"A Goal runs one strict milestone workflow at a time and closes only after all criteria pass.","assertion":"sequential_milestones"},
     {"id":"goal_pause_checkpoint_resume","hypothesis":"Safe-boundary pause and resume preserve the exact child workflow and effective budget counters.","assertion":"pause_checkpoint_resume"},
     {"id":"goal_amendment_evidence","hypothesis":"An approved amendment retains history and carries forward only compatible current evidence.","assertion":"amendment_preserves_evidence"},

@@ -570,6 +570,7 @@ fn workflow_fixture_request(root: &Path) -> Result<AgentRequest> {
             "write_file".to_string(),
             "run_command".to_string(),
             "sub_agent".to_string(),
+            "answer".to_string(),
         ]),
         workflow_tool_exclusions: Vec::new(),
         observation_rendering: crate::workflow::ObservationRendering::Native,
@@ -876,9 +877,7 @@ fn execute_workflow_assertion(
             let outcome = run_scripted_agent_steps(
                 &request,
                 vec![ScriptedCompletion {
-                    content:
-                        r#"{"type":"final","content":"We can discuss this without building."}"#
-                            .to_string(),
+                    content: r#"{"type":"tool_call","tool":"answer","arguments":{"content":"We can discuss this without building.","proposal_kind":"none"}}"#.to_string(),
                     truncated: false,
                 }],
                 state.scratch.path(),
@@ -906,7 +905,7 @@ fn execute_workflow_assertion(
                         truncated: false,
                     },
                     ScriptedCompletion {
-                        content: r#"{"type":"final","content":"No repository mutation was performed."}"#.to_string(),
+                        content: r#"{"type":"tool_call","tool":"answer","arguments":{"content":"No repository mutation was performed.","proposal_kind":"none"}}"#.to_string(),
                         truncated: false,
                     },
                 ],
@@ -1355,7 +1354,7 @@ fn execute_workflow_assertion_tail(
                         truncated: false,
                     },
                     ScriptedCompletion {
-                        content: r#"{"type":"final","content":"No mutating teammate was started."}"#.to_string(),
+                        content: r#"{"type":"tool_call","tool":"answer","arguments":{"content":"No mutating teammate was started.","proposal_kind":"none"}}"#.to_string(),
                         truncated: false,
                     },
                 ],
@@ -1824,25 +1823,18 @@ fn execute_goal_assertion(assertion: GoalControlAssertion) -> Result<GoalAsserti
             let mut discuss = workflow_fixture_request(state.scratch.path())?;
             discuss.intent = Some(crate::workflow::TurnIntent::Discuss);
             discuss.max_steps = 2;
-            discuss.tool_allowlist =
-                Some(vec!["propose_goal".to_string(), "start_goal".to_string()]);
+            discuss.tool_allowlist = Some(vec!["answer".to_string(), "start_goal".to_string()]);
             let proposed = run_scripted_agent_steps(
                 &discuss,
-                vec![
-                    workflow_tool_completion(
-                        "propose_goal",
-                        serde_json::json!({
-                            "objective": "Qualify Goal mode",
-                            "criteria": ["Keep activation explicit"]
-                        }),
-                    ),
-                    ScriptedCompletion {
-                        content:
-                            r#"{"type":"final","content":"The Goal still requires user review."}"#
-                                .to_string(),
-                        truncated: false,
-                    },
-                ],
+                vec![workflow_tool_completion(
+                    "answer",
+                    serde_json::json!({
+                        "content": "The Goal still requires user review.",
+                        "proposal_kind": "goal",
+                        "objective": "Qualify Goal mode",
+                        "criteria": ["Keep activation explicit"]
+                    }),
+                )],
                 state.scratch.path(),
                 &mut |_| {},
             )?;
@@ -3901,7 +3893,7 @@ mod tests {
         let baseline: BaselineReport = serde_json::from_str(BASELINE).unwrap();
 
         assert_eq!(baseline.fixture_version, corpus.version);
-        assert_eq!(baseline.captured_at, "2026-07-14");
+        assert_eq!(baseline.captured_at, "2026-08-08");
         let fixture_ids = corpus
             .fixtures
             .iter()
