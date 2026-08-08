@@ -201,6 +201,7 @@ pub async fn exchange_code(
     code_verifier: &str,
     redirect_uri: &str,
 ) -> Result<String> {
+    crate::tls::install_default_crypto_provider();
     let response = reqwest::Client::new()
         .post(TOKEN_URL)
         .header(reqwest::header::ACCEPT, "application/json")

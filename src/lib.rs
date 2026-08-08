@@ -71,6 +71,7 @@ pub mod sleep_prevention;
 mod state_lock;
 pub mod tailscale;
 pub mod task_queue;
+mod tls;
 pub mod tray;
 pub mod user;
 pub mod web;
@@ -1376,6 +1377,7 @@ struct HfModelInfo {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
+    tls::install_default_crypto_provider();
     match cli.command {
         Commands::SelfCmd { command } => match command {
             SelfCommand::Install => run_self_install(),
@@ -1877,6 +1879,7 @@ async fn run_mcp_command(command: McpCommand) -> Result<()> {
     }
 }
 
+#[cfg(target_os = "macos")]
 const SAFARI_TECHNOLOGY_PREVIEW_MCP_DRIVER: &str =
     "/Applications/Safari Technology Preview.app/Contents/MacOS/safaridriver";
 
@@ -2043,6 +2046,7 @@ fn github_mcp_server_config(runtime: &str, token_path: &Path) -> McpServerConfig
     }
 }
 
+#[cfg(target_os = "macos")]
 fn safari_mcp_server_config(driver_path: &Path) -> McpServerConfig {
     McpServerConfig {
         command: Some(driver_path.to_string_lossy().into_owned()),
@@ -2479,6 +2483,7 @@ fn run_self_uninstall(args: &SelfUninstallArgs) -> Result<()> {
 }
 
 fn run_self_update() -> Result<()> {
+    tls::install_default_crypto_provider();
     let target = release_target();
     let status = self_update::backends::github::Update::configure()
         .repo_owner("Jc2k")
@@ -4282,6 +4287,7 @@ fn env_status(args: EnvWorkdirArgs) -> Result<()> {
 }
 
 pub async fn pull_model(args: &PullArgs) -> Result<()> {
+    tls::install_default_crypto_provider();
     if args.batch_size == 0 {
         bail!("batch-size must be greater than 0");
     }
@@ -6363,6 +6369,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn safari_mcp_server_config_uses_preview_driver_directly() {
         let driver =
             Path::new("/Applications/Safari Technology Preview.app/Contents/MacOS/safaridriver");

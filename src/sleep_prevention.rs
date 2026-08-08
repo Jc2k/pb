@@ -238,7 +238,9 @@ mod macos {
 
 #[cfg(test)]
 mod tests {
-    use super::{SleepPrevention, desired_assertion};
+    #[cfg(target_os = "macos")]
+    use super::SleepPrevention;
+    use super::desired_assertion;
 
     #[test]
     fn assertion_requires_support_setting_and_active_work() {

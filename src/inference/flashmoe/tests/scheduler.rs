@@ -18,9 +18,11 @@ use crate::inference::flashmoe::runtime::ExpertPhaseInput;
 use crate::inference::flashmoe::state::{
     FlashMoeExpertPhaseApplication, FlashMoeGpuBufferDescriptor, FlashMoeTokenState,
 };
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use crate::inference::flashmoe::weights::ResidentMmapMatvecProjection;
 use crate::inference::flashmoe::weights::{
-    DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, ResidentMmapMatvecProjection,
-    ResidentStaticDtype, RouterScoreProjectionBinding, RouterScoreProjectionDescriptor,
+    DenseMmapMatvecProjection, DenseQ4MmapMatvecProjection, ResidentStaticDtype,
+    RouterScoreProjectionBinding, RouterScoreProjectionDescriptor,
     SharedExpertPhaseResidentProjections, SharedExpertPhaseWeights,
 };
 use crate::inference::flashmoe::{GROUP_SIZE, QWEN35_MODEL, QwenModelConfig, QwenMoeModelLayout};

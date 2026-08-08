@@ -9,7 +9,9 @@ use std::ptr;
 use std::sync::{Arc, Mutex};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::time::Instant;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod deepseek_execution;
@@ -23,6 +25,7 @@ mod resources;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod synchronization;
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) use diagnostics::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use ffi::*;
@@ -46,11 +49,11 @@ pub(super) struct MetalExecutionFacade {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::deepseek_metal::DEEPSEEK_V4_METAL_SHADERS;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 use super::deepseek_metal::DEEPSEEK_V4_REQUIRED_METAL_KERNELS;
-use super::state::{
-    FlashMoeExpertPhaseOutput, FlashMoeGpuBufferDescriptor, FlashMoeGpuMatrixDescriptor,
-    FlashMoeStateBufferRole,
-};
+use super::state::{FlashMoeExpertPhaseOutput, FlashMoeGpuBufferDescriptor};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::state::{FlashMoeGpuMatrixDescriptor, FlashMoeStateBufferRole};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::types::FlashMoeMetalResourceSnapshot;
 

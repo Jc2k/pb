@@ -1506,6 +1506,7 @@ pub async fn run_server_with_ready(
         .context("failed to inspect the pb HTTP listener")?;
     let source = match acquired.source {
         crate::http_listener::ListenerSource::Direct => "direct bind",
+        #[cfg(target_os = "macos")]
         crate::http_listener::ListenerSource::Launchd => "launchd socket activation",
     };
     println!("pb serve listening on http://{bound_addr} ({source})");

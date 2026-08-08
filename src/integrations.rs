@@ -295,6 +295,7 @@ struct GithubOwner {
 }
 
 pub async fn list_marketplace() -> Result<Vec<MarketplaceIntegration>> {
+    crate::tls::install_default_crypto_provider();
     let url = format!("https://api.github.com/orgs/{MARKETPLACE_ORG}/repos?per_page=100");
     let repos = reqwest::Client::new()
         .get(url)
@@ -781,6 +782,7 @@ fn send_public_registry_get(
     accept: Option<&str>,
     bearer_token: Option<&str>,
 ) -> Result<reqwest::blocking::Response> {
+    crate::tls::install_default_crypto_provider();
     let authenticated_origin = bearer_token.and_then(|_| registry_origin(&url));
     for redirect_count in 0..=MAX_REGISTRY_REDIRECTS {
         validate_registry_url(&url)?;

@@ -26297,6 +26297,7 @@ async fn run_web_fetch(url: &str) -> Result<String> {
 const MAX_WEB_REDIRECTS: usize = 5;
 
 async fn send_public_web_get(mut url: Url) -> Result<reqwest::Response> {
+    crate::tls::install_default_crypto_provider();
     for redirect_count in 0..=MAX_WEB_REDIRECTS {
         validate_public_web_url(&url)?;
         let (host, address) = resolve_public_web_target(&url).await?;

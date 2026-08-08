@@ -260,6 +260,10 @@ names, and any DNS set containing a private or special-use address. Each connect
 validated address, ambient proxies are bypassed, redirects are revalidated and bounded, and a
 bearer token is forwarded only within the origin for which it was obtained.
 
+Outbound HTTPS clients share one process-wide rustls cryptography provider backed by Graviola and
+the platform certificate verifier. The selected dependency features exclude both `ring` and
+`aws-lc`, so TLS does not add an external C or assembly toolchain to pb's build graph.
+
 Marketplace metadata and executed code share one immutable OCI identity. Installation resolves the
 tag, records the registry manifest digest plus the original display tag, re-reads the typed manifest
 through that digest, and pulls that exact image when a runtime is available. Registry and repository

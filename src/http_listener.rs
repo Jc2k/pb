@@ -3,12 +3,14 @@
 use anyhow::{Context, Result};
 use std::net::{IpAddr, SocketAddr};
 
+#[cfg(target_os = "macos")]
 pub(crate) const LAUNCHD_SOCKET_NAME: &str = "HttpListener";
 pub(crate) const BONJOUR_SERVICE_TYPE: &str = "_http._tcp";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ListenerSource {
     Direct,
+    #[cfg(target_os = "macos")]
     Launchd,
 }
 
@@ -31,6 +33,7 @@ pub(crate) fn socket_addr(host: &str, port: u16) -> Result<SocketAddr> {
     Ok(SocketAddr::new(ip, port))
 }
 
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn is_network_visible(addr: SocketAddr) -> bool {
     !addr.ip().is_loopback()
 }
@@ -269,7 +272,9 @@ mod macos {
 
 #[cfg(test)]
 mod tests {
-    use super::{ListenerSource, acquire, is_network_visible, socket_addr};
+    #[cfg(target_os = "macos")]
+    use super::{ListenerSource, acquire};
+    use super::{is_network_visible, socket_addr};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     #[test]

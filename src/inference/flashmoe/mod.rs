@@ -1,7 +1,16 @@
+#![cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+
 //! Flash-MoE inspired inference backend facade.
 //!
 //! The stable public surface is composed from capability, storage, scheduling,
 //! execution, and adapter owners. Historical `legacy` code is test-only.
+
+// Artifact planning and cache conversion remain available cross-platform, while the execution
+// graph is intentionally dormant without Apple Silicon Metal. Keep those shared graph types in
+// the non-Metal build without weakening warning enforcement for the rest of the crate.
 
 mod artifact;
 mod cache;

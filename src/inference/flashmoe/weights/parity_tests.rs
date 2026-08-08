@@ -4,8 +4,10 @@ use super::*;
 use crate::inference::flashmoe::cache::*;
 use crate::inference::flashmoe::capabilities::*;
 use crate::inference::flashmoe::math::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::inference::flashmoe::metal::*;
 use crate::inference::flashmoe::model_family::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::inference::flashmoe::planning::*;
 use crate::inference::flashmoe::scheduler::*;
 use crate::inference::flashmoe::state::*;
@@ -1536,6 +1538,7 @@ fn dense_q4_store_projects_synthetic_tensor_like_runtime_cache() {
 }
 
 #[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[ignore = "requires a local Metal device"]
 fn arm_macos_dense_q4_mmap_batch_matches_cpu_reference() {
     struct BatchTensor {

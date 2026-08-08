@@ -237,6 +237,7 @@ mod deepseek_prefill_tests {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::metal::MetalObjcId as ObjcId;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::scheduler::ScheduledSharedExpertPhaseRef as SharedExpertPhaseRef;
 
 #[derive(Debug)]
@@ -245,10 +246,10 @@ pub(super) enum ExpertPhaseInput {
     MetalPostAttention(MetalPostAttentionPrep),
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 enum MlaAttentionOutput {
     Values(Vec<f32>),
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     MetalPostAttention(MetalPostAttentionPrep),
 }
 
@@ -268,10 +269,6 @@ impl ScheduledCmd3Input for ExpertPhaseInput {
         }
     }
 }
-
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-#[derive(Debug, Clone, Copy)]
-struct GlmMlaPostAttentionRequest<'a>(std::marker::PhantomData<&'a ()>);
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 type ScheduledExpertCommand<'a> =
@@ -2214,6 +2211,7 @@ impl FlashMoeEngine {
         )
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn full_attention_output_values(
         &self,
         layer: usize,
@@ -2777,6 +2775,7 @@ impl FlashMoeEngine {
         Ok(layer_output)
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn mla_attention_output_values(
         &self,
         layer: usize,
@@ -2945,6 +2944,7 @@ impl FlashMoeEngine {
         Ok(MlaAttentionOutput::Values(output))
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn forward_glm_dense_layer(
         &self,
         layer: usize,

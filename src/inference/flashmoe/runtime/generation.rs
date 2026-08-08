@@ -1520,11 +1520,12 @@ impl FlashMoeEngine {
         chunk_tokens: usize,
         kv_cache: &mut KvCache,
         record_prefill_state: bool,
-        mut timing: Option<&mut FlashMoeGenerationTiming>,
+        timing: Option<&mut FlashMoeGenerationTiming>,
         progress: GenerationProgress<'_>,
     ) -> Result<Vec<f32>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
+            let mut timing = timing;
             let mut last_hidden = None;
             let mut chunk_start = start_position;
             while chunk_start < end_position {

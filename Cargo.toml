@@ -43,9 +43,11 @@ pb-control-collar = { path = "crates/pb-control-collar" }
 pb-control-python = { path = "crates/pb-control-python" }
 pb-control-rust = { path = "crates/pb-control-rust" }
 regex = "1.12.4"
-reqwest = { version = "0.12.5", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "form", "json", "rustls-no-provider", "stream"] }
 rust-embed = "8.9.0"
-self_update = { version = "1.0.0-rc.6", default-features = false, features = ["archive-tar", "compression-tar-gz", "github", "progress-bar", "reqwest", "rustls"] }
+rustls = { version = "0.23.40", default-features = false, features = ["std", "tls12"] }
+rustls-graviola = "0.4.0"
+self_update = { version = "1.0.0-rc.6", default-features = false, features = ["archive-tar", "compression-tar-gz", "github", "progress-bar", "reqwest"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3.10.1"
